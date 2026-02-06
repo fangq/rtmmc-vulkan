@@ -11,7 +11,7 @@
 # ==================== Configuration ====================
 
 CXX      ?= g++
-CXXFLAGS  = -std=c++11 -O2 -Wall -I.
+CXXFLAGS  = -std=c++11 -O2 -Wall -I. -Iminiz
 LDFLAGS   = -lvulkan
 
 GLSLC    ?= glslangValidator
@@ -19,7 +19,7 @@ GLSLFLAGS = --target-env vulkan1.2 -e main
 
 BINARY    = vkmmc
 SHADER    = vkmmc_core.spv
-SOURCES   = vkmmc.cpp miniz.c
+SOURCES   = vkmmc.cpp miniz/miniz.c
 HEADERS   = vkmmc_io.h nlohmann/json.hpp
 COMP_SRC  = vkmmc_core.comp
 
@@ -89,10 +89,11 @@ clean:
 
 # ---- Dependencies ----
 
-miniz.c:
+miniz/miniz.c:
 	@echo "Error: miniz.c not found. Download from https://github.com/richgel999/miniz"
-	@echo "  curl -sL https://raw.githubusercontent.com/richgel999/miniz/master/miniz.c -o miniz.c"
-	@echo "  curl -sL https://raw.githubusercontent.com/richgel999/miniz/master/miniz.h -o miniz.h"
+	@echo "  mkdir -p miniz"
+	@echo "  curl -sL https://raw.githubusercontent.com/richgel999/miniz/master/miniz.c -o miniz/miniz.c"
+	@echo "  curl -sL https://raw.githubusercontent.com/richgel999/miniz/master/miniz.h -o miniz/miniz.h"
 	@exit 1
 
 nlohmann/json.hpp:
@@ -120,7 +121,6 @@ pretty:
 	    --suffix=none \
 	    --formatted \
 	    --break-blocks \
-	    --exclude=mmc_bench.c \
-	   "*.c" "*.h" "*.cpp" "*.cu" "*.cl"
+	   "*.h" "*.cpp" "*.comp"
 
 .PHONY: clean
