@@ -1,0 +1,206 @@
+/*
+ * vkmmc_core.comp — Monte Carlo photon transport via Vulkan ray query
+ * Direct port of mmc_optix_core.cu (Single-AS RT-MMC)
+ *
+ * For NVIDIA GPUs: uncomment the next line for native atomicAdd(float)
+ * For AMD/Intel:   keep it commented out (uses CAS fallback)
+ *
+ * Compile: glslangValidator --target-env vulkan1.2 -e main -o vkmmc_core.spv vkmmc_core.comp
+ */
+#version 460
+#extension GL_EXT_ray_query : require
+
+// Uncomment for NVIDIA (Turing+) — ~10x faster atomic accumulation
+//#define USE_ATOMIC_FLOAT
+
+#ifdef USE_ATOMIC_FLOAT
+#extension GL_EXT_shader_atomic_float : require
+#endif
+
+layout(local_size_x = 256) in;
+
+layout(set=0,binding=0) uniform accelerationStructureEXT tlas;
+layout(std430,set=0,binding=1) readonly buffer FB { vec4 fnorm[]; };
+struct Medium { float mua,mus,g,n; };
+layout(std430,set=0,binding=2) readonly buffer MB { Medium med[]; };
+
+#ifdef USE_ATOMIC_FLOAT
+layout(std430,set=0,binding=3) buffer OB { float obuf[]; };
+#else
+layout(std430,set=0,binding=3) buffer OB { uint obuf[]; };
+#endif
+layout(std140,set=0,binding=4) uniform P {
+    int srctype; int _p0,_p1,_p2;
+    vec4 srcpos,srcdir,srcparam1,srcparam2;
+    vec4 nmin,nmax; uvec4 crop0;
+    float dstep,tstart,tend,Rtstep;
+    int maxgate; uint mediumid0,isreflect; int outputtype;
+    int threadphoton,oddphoton; uint total_threads,num_media,seed_val,_pad;
+};
+layout(std430,set=0,binding=5) readonly buffer SB { uvec4 seedbuf[]; };
+
+const float RC0=3.335640951981520e-12, SAFED=0.001, DSAFED=0.002;
+const float TWO_PI=6.28318530717959, FEPS=1.19209290E-07, FMAX=3.402823466e+38;
+const float RAY_TMIN=1e-5;
+const uint INIT_UNK=0xFFFFFFFFu, DEAD=0xFFFFFFFEu, AMBIENT=0u;
+const int otFlux=0, otFluence=1, otEnergy=2;
+
+// ---- xorshift128+ RNG ----
+float xsf(inout uvec4 st){
+    uvec2 s1=st.xy,s0=st.zw; st.xy=s0;
+    s1^=uvec2(s1.x<<23u,(s1.y<<23u)|(s1.x>>9u));
+    uvec2 ns=s1^s0^uvec2((s1.x>>18u)|(s1.y<<14u),s1.y>>18u)^uvec2((s0.x>>5u)|(s0.y<<27u),s0.y>>5u);
+    st.zw=ns; uint rl=ns.x+s0.x;
+    return uintBitsToFloat(0x3F800000u|(rl>>9u))-1.0;
+}
+float rU(inout uvec4 s,float a,float b){return(b-a)*xsf(s)+a;}
+float rSL(inout uvec4 s){return-log(xsf(s)+FEPS);}
+
+// ---- Ray trace ----
+bool tr(vec3 o,vec3 d,float mn,float mx,out float t,out int pid,out bool ff){
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq,tlas,gl_RayFlagsNoneEXT,0xFF,o,mn,d,mx);
+    while(rayQueryProceedEXT(rq)){}
+    if(rayQueryGetIntersectionTypeEXT(rq,true)==gl_RayQueryCommittedIntersectionTriangleEXT){
+        t=rayQueryGetIntersectionTEXT(rq,true);
+        pid=rayQueryGetIntersectionPrimitiveIndexEXT(rq,true);
+        ff=rayQueryGetIntersectionFrontFaceEXT(rq,true); return true;}
+    return false;
+}
+
+void unpackM(float pw,out uint fm,out uint bm){uint p=floatBitsToUint(pw);fm=p>>16u;bm=p&0xFFFFu;}
+
+// ---- Atomic float add ----
+void aaf(uint i,float v){
+#ifdef USE_ATOMIC_FLOAT
+    atomicAdd(obuf[i],v);
+#else
+    uint prev=obuf[i],next,old;
+    do{old=prev;next=floatBitsToUint(uintBitsToFloat(old)+v);prev=atomicCompSwap(obuf[i],old,next);}while(prev!=old);
+#endif
+}
+void save(uint eid,float w){aaf(eid,w);}
+
+// ---- Voxel index ----
+uint vidx(vec3 p){
+    uint ix=p.x>0.0?uint(min(p.x,nmax.x)*dstep):0u;
+    uint iy=p.y>0.0?uint(min(p.y,nmax.y)*dstep):0u;
+    uint iz=p.z>0.0?uint(min(p.z,nmax.z)*dstep):0u;
+    return iz*crop0.y+iy*crop0.x+ix;
+}
+uint tframe(float t){return uint(min(int((t-tstart)*Rtstep),maxgate-1))*crop0.z;}
+
+// ---- Accumulate output ----
+void accum(vec3 p0,vec3 dir,uint mid,float wt,float timer,float lmove){
+    Medium pr=med[mid];
+    int sc=(int(lmove*dstep)+1)<<1; float sl=lmove/float(sc);
+    float sd=exp(-pr.mua*sl);
+    float loss=(outputtype==otEnergy)?wt*(1.0-sd):(pr.mua>0.0?wt*(1.0-sd)/pr.mua:0.0);
+    vec3 stp=sl*dir,sm=p0-nmin.xyz+0.5*stp;
+    float ct=timer+sl*RC0*pr.n;
+    uint oe=tframe(ct)+vidx(sm); float ow=loss;
+    for(int i=1;i<sc;++i){
+        loss*=sd; sm+=stp; ct+=sl*RC0*pr.n;
+        uint ne=tframe(ct)+vidx(sm);
+        if(ne!=oe){save(oe,ow);oe=ne;ow=0.0;}
+        ow+=loss;
+    }
+    save(oe,ow);
+}
+
+// ---- HG + rotation ----
+vec3 rotV(vec3 v,vec2 z,vec2 a){
+    if(v.z>-1.0+FEPS&&v.z<1.0-FEPS){
+        float t0=1.0-v.z*v.z,t1=z.x*inversesqrt(t0);
+        return t1*(a.y*vec3(v.x*v.z,v.y*v.z,-t0)+a.x*vec3(-v.y,v.x,0.0))+z.y*v;
+    }else{return vec3(z.x*a.y,z.x*a.x,v.z>0.0?z.y:-z.y);}
+}
+vec2 hg(float g,inout uvec4 s){
+    float ct;
+    if(abs(g)>FEPS){ct=(1.0-g*g)/(1.0-g+2.0*g*rU(s,0.0,1.0));ct*=ct;ct=(1.0+g*g-ct)/(2.0*g);ct=clamp(ct,-1.0,1.0);}
+    else ct=2.0*rU(s,0.0,1.0)-1.0;
+    return vec2(sin(acos(ct)),ct);
+}
+vec3 scat(vec3 dir,float g,inout uvec4 s){
+    float sp,cp,phi=rU(s,0.0,TWO_PI);sp=sin(phi);cp=cos(phi);
+    return rotV(dir,hg(g,s),vec2(sp,cp));
+}
+
+// ---- Fresnel reflection ----
+bool reflectray(vec3 norm,float n1,float n2,inout uvec4 rng,inout vec3 p0,inout vec3 dir){
+    float Icos=abs(dot(dir,norm));
+    float t0=n1*n1,t1=n2*n2,t2=1.0-t0/t1*(1.0-Icos*Icos);
+    if(t2>0.0){
+        float Re=t0*Icos*Icos+t1*t2; t2=sqrt(t2);
+        float Im=2.0*n1*n2*Icos*t2;
+        float Rt=(Re-Im)/(Re+Im);
+        Re=t1*Icos*Icos+t0*t2*t2;
+        Rt=(Rt+(Re-Im)/(Re+Im))*0.5;
+        if(rU(rng,0.0,1.0)<=Rt){p0-=dir*DSAFED;dir+=-2.0*Icos*norm;}
+        else{dir+=-Icos*norm;dir=t2*norm+n1/n2*dir;dir*=inversesqrt(dot(dir,dir));return false;}
+    }else{p0-=dir*DSAFED;dir+=-2.0*Icos*norm;}
+    dir*=inversesqrt(dot(dir,dir));return true;
+}
+
+// ===========================================================================
+void main(){
+    uint tid=gl_GlobalInvocationID.x;
+    if(tid>=total_threads) return;
+    uvec4 rng=seedbuf[tid];
+    int ndone=0, maxphoton=threadphoton+int(tid<uint(oddphoton));
+
+    vec3 p0=srcpos.xyz,dir=srcdir.xyz;
+    float wt=1.0,slen=rSL(rng),timer=0.0; uint mid=mediumid0;
+
+    if(srctype==4){float rx=rU(rng,0.0,1.0),ry=rU(rng,0.0,1.0);
+        p0=srcpos.xyz+rx*srcparam1.xyz+ry*srcparam2.xyz;}
+
+    if(mid==INIT_UNK){float d;int pid;bool ff;
+        if(tr(p0,dir,0.0,FMAX,d,pid,ff)){uint fm,bm;unpackM(fnorm[pid].w,fm,bm);mid=ff?fm:bm;}
+        else mid=DEAD;}
+
+    while(ndone<maxphoton){
+        if(mid!=DEAD){
+            Medium prop=med[mid];
+            float tmax=prop.mus>0.0?slen/prop.mus:FMAX;
+            float hitd;int pid;bool ff;
+            bool hit=tr(p0,dir,RAY_TMIN,tmax,hitd,pid,ff);
+
+            if(hit){
+                uint fm,bm;unpackM(fnorm[pid].w,fm,bm);
+                Medium cp2=med[mid];
+                float lmove=min(hitd,cp2.mus>0.0?slen/cp2.mus:FMAX);
+                accum(p0,dir,mid,wt,timer,lmove);
+                p0+=dir*(lmove+SAFED);
+                wt*=exp(-cp2.mua*lmove);
+                timer+=lmove*RC0*cp2.n;
+                slen-=lmove*cp2.mus;
+                mid=ff?bm:fm;
+                if(isreflect>0u&&cp2.n!=med[mid].n){
+                    vec3 norm=ff?-fnorm[pid].xyz:fnorm[pid].xyz;
+                    if(reflectray(norm,cp2.n,med[mid].n,rng,p0,dir)){mid=ff?fm:bm;}
+                    if(mid==AMBIENT) mid=DEAD;
+                }
+            }else{
+                Medium cp2=med[mid];
+                float lmove=slen/cp2.mus;
+                accum(p0,dir,mid,wt,timer,lmove);
+                p0+=dir*lmove;
+                wt*=exp(-cp2.mua*lmove);
+                timer+=lmove*RC0*cp2.n;
+                dir=scat(dir,cp2.g,rng);
+                slen=rSL(rng);
+            }
+        }
+        if(!(mid!=DEAD&&timer<tend)){
+            p0=srcpos.xyz;dir=srcdir.xyz;wt=1.0;timer=0.0;mid=mediumid0;
+            if(srctype==4){float rx=rU(rng,0.0,1.0),ry=rU(rng,0.0,1.0);
+                p0=srcpos.xyz+rx*srcparam1.xyz+ry*srcparam2.xyz;}
+            slen=rSL(rng);
+            if(mid==INIT_UNK){float d;int pid;bool ff2;
+                if(tr(p0,dir,0.0,FMAX,d,pid,ff2)){uint fm2,bm2;unpackM(fnorm[pid].w,fm2,bm2);mid=ff2?fm2:bm2;}
+                else mid=DEAD;}
+            ++ndone;
+        }
+    }
+}
