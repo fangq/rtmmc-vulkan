@@ -24,8 +24,8 @@
  *   3D fluence array saved as JData inside a JSON file.
  */
 
-#ifndef VK_RTMMC_IO_H
-#define VK_RTMMC_IO_H
+#ifndef VKMMC_IO_H
+#define VKMMC_IO_H
 
 #include <nlohmann/json.hpp>
 #include <miniz.h>
@@ -357,11 +357,23 @@ void load_mesh_surf(const std::vector<Vec3>& nodes,
     for (auto it = fmap.begin(); it != fmap.end(); ++it) {
         auto& entries = it->second;
         auto& e0 = entries[0];
-        uint32_t front = e0.region;
-        uint32_t back = 0; // ambient by default (exterior face)
+        // e0.region = the region this face encloses (inside)
+        // For the OptiX packing convention:
+        //   front = medium the normal points toward
+        //   back  = medium on the other side
+        // For MeshSurf, "region" is the enclosed region.
+        // Face normal points outward from the enclosed region.
+        // So front = neighbor (or ambient if unpaired), back = enclosed region.
+        uint32_t front, back;
 
         if (entries.size() >= 2) {
-            back = entries[1].region;
+            // Shared face: e0 encloses one region, e1 encloses the neighbor
+            front = entries[1].region;  // neighbor region
+            back  = e0.region;          // enclosed region
+        } else {
+            // Exterior face: outside is ambient
+            front = 0u;          // ambient
+            back  = e0.region;   // enclosed tissue
         }
 
         // Skip internal faces where both sides have the same region
@@ -425,8 +437,24 @@ void extract_surface_from_tet(const std::vector<Vec3>& nodes,
 
     for (auto it = fmap.begin(); it != fmap.end(); ++it) {
         auto& fi = it->second;
-        uint32_t front = (uint32_t)fi.r1;
-        uint32_t back = (fi.r2 >= 0) ? (uint32_t)fi.r2 : 0u;
+        // r1 = region of the first tet that created this face
+        // r2 = region of the second tet (or -1 if exterior)
+        // The face normal is computed from the first tet's winding.
+        // For the OptiX convention:
+        //   "front" = medium on the side the normal points toward
+        //   "back"  = medium on the other side
+        // For a shared face: front=r1, back=r2 (normal from first tet points outward from r1)
+        // For an exterior face: the normal points outward from the tet,
+        //   so front=ambient(0), back=r1 (inside the tet)
+        uint32_t front, back;
+
+        if (fi.r2 >= 0) {
+            front = (uint32_t)fi.r1;
+            back  = (uint32_t)fi.r2;
+        } else {
+            front = 0u;               // ambient (outside)
+            back  = (uint32_t)fi.r1;  // tissue (inside)
+        }
 
         // Skip internal faces where both sides have the same region
         if (front == back) {
@@ -569,9 +597,18 @@ SimConfig load_json_input(const char* filepath) {
         if (d.contains("Media")) {
             cfg.media.clear();
 
-            for (auto& m : d["Media"])
-                cfg.media.push_back({m.value("mua", 0.f), m.value("mus", 0.f),
-                                     m.value("g", 1.f), m.value("n", 1.f)});
+            for (size_t i = 0; i < d["Media"].size(); i++) {
+                json& m = d["Media"][i];
+                // mua and mus are stored in 1/mm in the JSON,
+                // but must be scaled by LengthUnit for the simulation
+                // (matching OptiX prepLaunchParams: mua * unitinmm, mus * unitinmm)
+                cfg.media.push_back({
+                    m.value("mua", 0.f) * cfg.unitinmm,
+                    m.value("mus", 0.f) * cfg.unitinmm,
+                    m.value("g", 1.f),
+                    m.value("n", 1.f)
+                });
+            }
         }
 
         // Read grid dimensions if provided
@@ -774,4 +811,4 @@ void save_json_output(const char* filepath,
     std::cout << " float32, " << data_bytes << " bytes uncompressed)\n";
 }
 
-#endif // VK_RTMMC_IO_H
+#endif // VKMMC_IO_H

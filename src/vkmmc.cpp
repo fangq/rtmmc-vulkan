@@ -210,6 +210,33 @@ void zero_device_buffer(VulkanCtx& c, Buffer& dst, VkDeviceSize sz) {
     end_submit(c, cmd);
 }
 
+// Ensure extension name is defined (older Vulkan headers may lack it)
+#ifndef VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME
+    #define VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME "VK_EXT_shader_atomic_float"
+#endif
+#ifndef VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT
+    #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT ((VkStructureType)1000260000)
+#endif
+
+#ifndef VK_EXT_shader_atomic_float
+typedef struct VkPhysicalDeviceShaderAtomicFloatFeaturesEXT {
+    VkStructureType sType;
+    void* pNext;
+    VkBool32 shaderBufferFloat32Atomics;
+    VkBool32 shaderBufferFloat32AtomicAdd;
+    VkBool32 shaderBufferFloat64Atomics;
+    VkBool32 shaderBufferFloat64AtomicAdd;
+    VkBool32 shaderSharedFloat32Atomics;
+    VkBool32 shaderSharedFloat32AtomicAdd;
+    VkBool32 shaderSharedFloat64Atomics;
+    VkBool32 shaderSharedFloat64AtomicAdd;
+    VkBool32 shaderImageFloat32Atomics;
+    VkBool32 shaderImageFloat32AtomicAdd;
+    VkBool32 sparseImageFloat32Atomics;
+    VkBool32 sparseImageFloat32AtomicAdd;
+} VkPhysicalDeviceShaderAtomicFloatFeaturesEXT;
+#endif
+
 // ---- Vulkan init ----
 void list_vulkan_gpus() {
     VkInstance inst;
@@ -549,14 +576,14 @@ struct CmdOverrides {
     bool listgpu;
     std::string session_id, json_str;
     bool dumpjson;
-    CmdOverrides(): nphoton(0), batch_size(0), rng_seed(0), totalthread(0), unitinmm(0), outputtype(-1), isreflect(-1), isnormalize(-1), gpuid(0), listgpu(false), dumpjson(false) {}
+    CmdOverrides(): nphoton(0), batch_size(UINT64_MAX), rng_seed(0), totalthread(0), unitinmm(0), outputtype(-1), isreflect(-1), isnormalize(-1), gpuid(0), listgpu(false), dumpjson(false) {}
 };
 
 void printhelp(const char* n) {
     printf("Vulkan RT-MMC — Ray-tracing accelerated mesh Monte Carlo\nUsage: %s input.json  OR  %s -f input.json [flags]\n\n"
            "Flags:\n -f/--input\tJSON file\n -n/--photon\tphoton number\n -s/--session\tsession name\n -u/--unitinmm\tvoxel size [1]\n"
            " -E/--seed\tRNG seed\n -O/--outputtype\tx:energy,f:flux,l:fluence\n -b/--reflect\tmismatch [1]\n -U/--normalize\t[1]\n"
-           " -S/--save2pt\tsave volume [1]\n -t/--thread\tGPU threads [65536]\n -B/--batch\tphotons/batch [500000]\n"
+           " -S/--save2pt\tsave volume [1]\n -t/--thread\tGPU threads [65536]\n -B/--batch\tphotons/batch [500000, 0=no batch]\n"
            " -G/--gpuid\tGPU device ID [1]\n -L/--listgpu\tlist all GPUs\n"
            " -j/--json\tJSON override\n --dumpjson\tdump config\n -h/--help\n", n, n);
     exit(0);
@@ -835,19 +862,25 @@ int main(int argc, char** argv) {
     update_desc(ctx, cp, tlas.handle, faceBuf, mediaBuf, outBuf, paramBuf, seedBuf);
 
     // Batched dispatch
-    uint64_t photons_per_batch = (ovr.batch_size > 0) ? ovr.batch_size : 500000;
+    // Batch size: UINT64_MAX = use default (500K), 0 = no batching, else = user value
+    uint64_t photons_per_batch;
+
+    if (ovr.batch_size == 0) {
+        photons_per_batch = cfg.nphoton;    // -B 0 → all photons in one launch
+    } else if (ovr.batch_size != UINT64_MAX) {
+        photons_per_batch = ovr.batch_size;    // -B N → user-specified
+    } else {
+        photons_per_batch = 500000;    // default
+    }
 
     uint64_t photons_done = 0;
-
     int batch = 0;
-
     uint32_t wg = totalthread / 256;
-
     printf("Threads: %u (%u workgroups), batch: %lu photons\n", totalthread, wg, (unsigned long)photons_per_batch);
 
     typedef std::chrono::high_resolution_clock Clock;
-
-    Clock::time_point t0 = Clock::now();
+    double kernel_ms = 0.0;
+    Clock::time_point t_total_start = Clock::now();
 
     while (photons_done < cfg.nphoton) {
         uint64_t rem = cfg.nphoton - photons_done;
@@ -860,24 +893,34 @@ int main(int argc, char** argv) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeLayout, 0, 1, &cp.descSet, 0, NULL);
         vkCmdDispatch(cmd, wg, 1, 1);
-        end_submit(ctx, cmd);
+
+        Clock::time_point t_kernel_start = Clock::now();
+        end_submit(ctx, cmd); // includes vkQueueWaitIdle
+        kernel_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_kernel_start).count();
 
         photons_done += bp;
         batch++;
         printf("  batch %d: %lu photons (%lu/%lu)\n", batch, (unsigned long)bp, (unsigned long)photons_done, (unsigned long)cfg.nphoton);
     }
 
-    double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-    printf("Complete (%d batches), speed: %.2f photon/ms, duration: %.3f ms\n", batch, (double)cfg.nphoton / ms, ms);
+    double total_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_total_start).count();
+    printf("Complete (%d batches), kernel: %.3f ms, total: %.3f ms\n", batch, kernel_ms, total_ms);
+    printf("Speed: %.2f photon/ms (kernel only), %.2f photon/ms (total)\n",
+           (double)cfg.nphoton / kernel_ms, (double)cfg.nphoton / total_ms);
 
     // Readback
     std::vector<float> raw(outSize);
     download_from_device(ctx, outBuf, raw.data(), outSize * sizeof(float));
     std::vector<float> fluence(crop0w);
+    double total_absorbed = 0.0;
 
     for (uint32_t i = 0; i < crop0w; i++) {
         fluence[i] = raw[i] + raw[i + crop0w];
+        total_absorbed += fluence[i];
     }
+
+    // Report absorption before normalization
+    printf("simulated %lu photons, absorbed: %.5f%%\n", (unsigned long)cfg.nphoton, total_absorbed / (double)cfg.nphoton * 100.0);
 
     if (cfg.do_normalize) {
         float vv = voxel_size * voxel_size * voxel_size;
