@@ -513,6 +513,7 @@ ComputePipe create_pipeline(VulkanCtx& c, const char* spirv) {
     smci.pCode = code.data();
     VkShaderModule sm;
     VK_CHECK(vkCreateShaderModule(c.device, &smci, NULL, &sm));
+
     VkPipelineShaderStageCreateInfo stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
     stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     stage.module = sm;
@@ -793,14 +794,14 @@ int main(int argc, char** argv) {
     Buffer outBuf = create_device_buffer(ctx, outSize * sizeof(float), ssbo);
     zero_device_buffer(ctx, outBuf, outSize * sizeof(float));
 
-    // Thread/batch setup
+    // Thread setup
     uint32_t totalthread = (ovr.totalthread > 0) ? ovr.totalthread : 65536;
 
     if (cfg.nphoton < totalthread) {
-        totalthread = ((uint32_t)cfg.nphoton + 255) / 256 * 256;
+        totalthread = ((uint32_t)cfg.nphoton + 63) / 64 * 64;
 
-        if (!totalthread) {
-            totalthread = 256;
+        if (totalthread == 0) {
+            totalthread = 64;
         }
     }
 
@@ -875,8 +876,9 @@ int main(int argc, char** argv) {
 
     uint64_t photons_done = 0;
     int batch = 0;
-    uint32_t wg = totalthread / 256;
-    printf("Threads: %u (%u workgroups), batch: %lu photons\n", totalthread, wg, (unsigned long)photons_per_batch);
+    uint32_t wg = totalthread / 64;
+    printf("Threads: %u (%u workgroups x 64), batch: %lu photons\n",
+           totalthread, wg, (unsigned long)photons_per_batch);
 
     typedef std::chrono::high_resolution_clock Clock;
     double kernel_ms = 0.0;
@@ -913,10 +915,24 @@ int main(int argc, char** argv) {
     download_from_device(ctx, outBuf, raw.data(), outSize * sizeof(float));
     std::vector<float> fluence(crop0w);
     double total_absorbed = 0.0;
+    int nan_count = 0, inf_count = 0;
 
     for (uint32_t i = 0; i < crop0w; i++) {
         fluence[i] = raw[i] + raw[i + crop0w];
-        total_absorbed += fluence[i];
+
+        if (fluence[i] != fluence[i]) {
+            nan_count++;    // NaN check
+            fluence[i] = 0.f;
+        } else if (fluence[i] > 1e30f || fluence[i] < -1e30f) {
+            inf_count++;    // Inf check
+            fluence[i] = 0.f;
+        } else {
+            total_absorbed += fluence[i];
+        }
+    }
+
+    if (nan_count || inf_count) {
+        printf("WARNING: %d NaN, %d Inf voxels detected and zeroed\n", nan_count, inf_count);
     }
 
     // Report absorption before normalization

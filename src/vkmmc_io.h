@@ -1,5 +1,5 @@
 /*
- * vkmmc_io.h — Load/save MMC JSON input/output with JData-encoded arrays
+ * vk_rtmmc_io.h — Load/save MMC JSON input/output with JData-encoded arrays
  *
  * Dependencies:
  *   - nlohmann/json (json.hpp): https://github.com/nlohmann/json
@@ -44,7 +44,7 @@
 using json = nlohmann::json;
 
 // ============================================================================
-// Data structures (shared with vkmmc.cpp)
+// Data structures (shared with vk_rtmmc.cpp)
 // ============================================================================
 
 struct Vec3 {
@@ -583,10 +583,19 @@ SimConfig load_json_input(const char* filepath) {
     // Forward
     if (j.contains("Forward")) {
         auto& fw = j["Forward"];
-        cfg.t0 = fw.value("T0", 0.0f);
-        cfg.t1 = fw.value("T1", 5e-9f);
-        cfg.dt = fw.value("Dt", 5e-9f);
-        cfg.maxgate = std::max(1, (int)((cfg.t1 - cfg.t0) / cfg.dt + 0.5f));
+        double dt0 = fw.value("T0", 0.0);
+        double dt1 = fw.value("T1", 5e-9);
+        double ddt = fw.value("Dt", 5e-9);
+        cfg.t0 = (float)dt0;
+        cfg.t1 = (float)dt1;
+        cfg.dt = (float)ddt;
+        cfg.maxgate = (int)((dt1 - dt0) / ddt + 0.5);
+
+        if (cfg.maxgate < 1) {
+            cfg.maxgate = 1;
+        }
+
+        printf("Forward: T0=%.4e T1=%.4e Dt=%.4e maxgate=%d\n", dt0, dt1, ddt, cfg.maxgate);
     }
 
     // Domain
@@ -596,18 +605,24 @@ SimConfig load_json_input(const char* filepath) {
 
         if (d.contains("Media")) {
             cfg.media.clear();
+            json media_arr = d["Media"];
 
-            for (size_t i = 0; i < d["Media"].size(); i++) {
-                json& m = d["Media"][i];
-                // mua and mus are stored in 1/mm in the JSON,
-                // but must be scaled by LengthUnit for the simulation
-                // (matching OptiX prepLaunchParams: mua * unitinmm, mus * unitinmm)
+            // Handle nested array [[{...},{...}]] vs flat [{...},{...}]
+            if (media_arr.is_array() && media_arr.size() > 0 && media_arr[0].is_array()) {
+                media_arr = media_arr[0];
+            }
+
+            for (size_t i = 0; i < media_arr.size(); i++) {
+                json& m = media_arr[i];
                 cfg.media.push_back({
                     m.value("mua", 0.f) * cfg.unitinmm,
                     m.value("mus", 0.f) * cfg.unitinmm,
                     m.value("g", 1.f),
                     m.value("n", 1.f)
                 });
+                printf("  Media[%zu]: mua=%.6f mus=%.6f g=%.4f n=%.4f\n",
+                       i, cfg.media.back().mua, cfg.media.back().mus,
+                       cfg.media.back().g, cfg.media.back().n);
             }
         }
 
@@ -738,7 +753,37 @@ SimConfig load_json_input(const char* filepath) {
     // InitElem
     if (sh.contains("InitElem")) {
         cfg.init_elem = sh["InitElem"].get<int>();
-        cfg.mediumid0 = 0xFFFFFFFFu; // runtime detection for Single-AS
+
+        // Look up the medium type from the element's region label
+        // InitElem is 1-based element index
+        if (sh.contains("MeshElem") && cfg.init_elem > 0) {
+            auto& me = sh["MeshElem"];
+            auto dims = me["_ArraySize_"].get<std::vector<size_t> >();
+            size_t ne2 = dims[0], nc2 = dims[1];
+            // Decode elem data to get the region of InitElem
+            std::vector<uint8_t> raw2 = jdata_decode(me);
+            const int32_t* ed2 = reinterpret_cast<const int32_t*>(raw2.data());
+
+            if (cfg.init_elem <= (int)ne2) {
+                int region = ed2[(cfg.init_elem - 1) * nc2 + (nc2 - 1)]; // last column = region
+                cfg.mediumid0 = (uint32_t)region;
+                printf("InitElem: %d, medium type: %u\n", cfg.init_elem, cfg.mediumid0);
+            } else {
+                cfg.mediumid0 = 0xFFFFFFFFu; // unknown, use ray query
+            }
+        } else if (sh.contains("MeshElem") && sh["MeshElem"].is_array()) {
+            // Inline JSON array format
+            auto& me = sh["MeshElem"];
+
+            if (cfg.init_elem > 0 && cfg.init_elem <= (int)me.size()) {
+                auto& row = me[cfg.init_elem - 1];
+                int region = row[row.size() - 1].get<int>(); // last column
+                cfg.mediumid0 = (uint32_t)region;
+                printf("InitElem: %d, medium type: %u\n", cfg.init_elem, cfg.mediumid0);
+            }
+        } else {
+            cfg.mediumid0 = 0xFFFFFFFFu;
+        }
     }
 
     return cfg;

@@ -17,7 +17,7 @@
     #extension GL_EXT_shader_atomic_float : require
 #endif
 
-layout(local_size_x = 256) in;
+layout(local_size_x = 64) in;  // workgroup size
 
 // ==================== Descriptor Bindings ====================
 
@@ -346,72 +346,78 @@ void main() {
         // ---- Propagate if photon is alive ----
         if (medium_id != MEDIUM_DEAD) {
             Medium prop = media[medium_id];
-            float max_travel = (prop.mus > 0.0) ? scat_len / prop.mus : FLOAT_MAX;
 
-            float hit_dist;
-            int   triangle_id;
-            bool  is_front;
-            bool  hit_boundary = trace_ray(pos, dir, RAY_MIN_DIST, max_travel,
-                                           hit_dist, triangle_id, is_front);
-
-            if (hit_boundary) {
-                // ======== Boundary intersection (closest-hit) ========
-                uint front_med, back_med;
-                unpack_media(face_normal[triangle_id].w, front_med, back_med);
-
-                Medium current_prop = media[medium_id];
-                float travel_dist = min(hit_dist,
-                                        current_prop.mus > 0.0 ? scat_len / current_prop.mus : FLOAT_MAX);
-
-                // Deposit energy along path
-                accumulate_along_path(pos, dir, medium_id, weight,
-                                      time_of_flight, travel_dist);
-
-                // Advance photon past boundary
-                pos += dir * (travel_dist + SAFETY_DIST);
-                weight *= exp(-current_prop.mua * travel_dist);
-                time_of_flight += travel_dist * INV_SPEED_OF_LIGHT * current_prop.n;
-                scat_len -= travel_dist * current_prop.mus;
-
-                // Cross boundary (assume index-matched)
-                medium_id = is_front ? back_med : front_med;
-
-                // Handle refractive index mismatch
-                if (do_reflect > 0u && current_prop.n != media[medium_id].n) {
-                    vec3 normal = is_front
-                                  ? -face_normal[triangle_id].xyz
-                                  :  face_normal[triangle_id].xyz;
-
-                    if (handle_reflection(normal, current_prop.n, media[medium_id].n,
-                                          rng, pos, dir)) {
-                        // Reflected — restore original medium
-                        medium_id = is_front ? front_med : back_med;
-                    }
-
-                    // Terminate if reflected/refracted into ambient
-                    if (medium_id == MEDIUM_AMBIENT) {
-                        medium_id = MEDIUM_DEAD;
-                    }
-                }
-
+            // Skip propagation for ambient/void medium (mus=0)
+            if (prop.mus < FLOAT_EPSILON) {
+                medium_id = MEDIUM_DEAD;
             } else {
-                // ======== No boundary hit — scattering event (miss) ========
-                Medium current_prop = media[medium_id];
-                float travel_dist = scat_len / current_prop.mus;
+                float max_travel = scat_len / prop.mus;
 
-                // Deposit energy along path
-                accumulate_along_path(pos, dir, medium_id, weight,
-                                      time_of_flight, travel_dist);
+                float hit_dist;
+                int   triangle_id;
+                bool  is_front;
+                bool  hit_boundary = trace_ray(pos, dir, RAY_MIN_DIST, max_travel,
+                                               hit_dist, triangle_id, is_front);
 
-                // Advance photon
-                pos += dir * travel_dist;
-                weight *= exp(-current_prop.mua * travel_dist);
-                time_of_flight += travel_dist * INV_SPEED_OF_LIGHT * current_prop.n;
+                if (hit_boundary) {
+                    // ======== Boundary intersection (closest-hit) ========
+                    uint front_med, back_med;
+                    unpack_media(face_normal[triangle_id].w, front_med, back_med);
 
-                // Scatter into new direction
-                dir = scatter_direction(dir, current_prop.g, rng);
-                scat_len = rand_scatlen(rng);
-            }
+                    Medium current_prop = media[medium_id];
+                    float travel_dist = min(hit_dist,
+                                            current_prop.mus > 0.0 ? scat_len / current_prop.mus : FLOAT_MAX);
+
+                    // Deposit energy along path
+                    accumulate_along_path(pos, dir, medium_id, weight,
+                                          time_of_flight, travel_dist);
+
+                    // Advance photon past boundary
+                    pos += dir * (travel_dist + SAFETY_DIST);
+                    weight *= exp(-current_prop.mua * travel_dist);
+                    time_of_flight += travel_dist * INV_SPEED_OF_LIGHT * current_prop.n;
+                    scat_len -= travel_dist * current_prop.mus;
+
+                    // Cross boundary (assume index-matched)
+                    medium_id = is_front ? back_med : front_med;
+
+                    // Handle refractive index mismatch
+                    if (do_reflect > 0u && current_prop.n != media[medium_id].n) {
+                        vec3 normal = is_front
+                                      ? -face_normal[triangle_id].xyz
+                                      :  face_normal[triangle_id].xyz;
+
+                        if (handle_reflection(normal, current_prop.n, media[medium_id].n,
+                                              rng, pos, dir)) {
+                            // Reflected — restore original medium
+                            medium_id = is_front ? front_med : back_med;
+                        }
+
+                        // Terminate if reflected/refracted into ambient
+                        if (medium_id == MEDIUM_AMBIENT) {
+                            medium_id = MEDIUM_DEAD;
+                        }
+                    }
+
+                } else {
+                    // ======== No boundary hit — scattering event (miss) ========
+                    Medium current_prop = media[medium_id];
+                    float travel_dist = scat_len / current_prop.mus;
+
+                    // Deposit energy along path
+                    accumulate_along_path(pos, dir, medium_id, weight,
+                                          time_of_flight, travel_dist);
+
+                    // Advance photon
+                    pos += dir * travel_dist;
+                    weight *= exp(-current_prop.mua * travel_dist);
+                    time_of_flight += travel_dist * INV_SPEED_OF_LIGHT * current_prop.n;
+
+                    // Scatter into new direction
+                    dir = scatter_direction(dir, current_prop.g, rng);
+                    scat_len = rand_scatlen(rng);
+                }
+            } // end if (prop.mus >= FLOAT_EPSILON)
         }
 
         // ---- Check termination and relaunch ----
