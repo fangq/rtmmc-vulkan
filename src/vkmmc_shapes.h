@@ -236,7 +236,7 @@ static void gen_slab(ShapeMesh& m, int dir, float lo, float hi,
 /* ================================================================ */
 /*  Parse JSON Shapes array → combined mesh                         */
 /* ================================================================ */
-static ShapeMesh parse_shapes(const json& arr, float ext[6]) {
+static ShapeMesh parse_shapes(const json& arr, float ext[6], int mesh_res = 24) {
     ShapeMesh m;
 
     for (size_t si = 0; si < arr.size(); si++) {
@@ -271,8 +271,10 @@ static ShapeMesh parse_shapes(const json& arr, float ext[6]) {
             float cx = obj["O"][0].get<float>(), cy = obj["O"][1].get<float>(), cz = obj["O"][2].get<float>();
             float r = obj["R"].get<float>();
             uint32_t tag = obj.value("Tag", 1u);
-            gen_sphere(m, cx, cy, cz, r, tag);
-            printf("  Shape[%zu]: Sphere O=[%.1f,%.1f,%.1f] R=%.1f tag=%u (%zu tri)\n", si, cx, cy, cz, r, tag, m.faces.size());
+            int nlon = mesh_res, nlat = std::max(mesh_res * 2 / 3, 8);
+            gen_sphere(m, cx, cy, cz, r, tag, nlon, nlat);
+            printf("  Shape[%zu]: Sphere O=[%.1f,%.1f,%.1f] R=%.1f tag=%u nlon=%d nlat=%d (%zu tri)\n",
+                   si, cx, cy, cz, r, tag, nlon, nlat, m.faces.size());
         } else if (key == "Box") {
             float ox = obj["O"][0].get<float>(), oy = obj["O"][1].get<float>(), oz = obj["O"][2].get<float>();
             float sx = obj["Size"][0].get<float>(), sy = obj["Size"][1].get<float>(), sz = obj["Size"][2].get<float>();
@@ -290,8 +292,9 @@ static ShapeMesh parse_shapes(const json& arr, float ext[6]) {
             float x1 = obj["C1"][0].get<float>(), y1 = obj["C1"][1].get<float>(), z1 = obj["C1"][2].get<float>();
             float r = obj["R"].get<float>();
             uint32_t tag = obj.value("Tag", 1u);
-            gen_cylinder(m, x0, y0, z0, x1, y1, z1, r, tag);
-            printf("  Shape[%zu]: Cylinder R=%.1f tag=%u (%zu tri)\n", si, r, tag, m.faces.size());
+            gen_cylinder(m, x0, y0, z0, x1, y1, z1, r, tag, mesh_res);
+            printf("  Shape[%zu]: Cylinder R=%.1f tag=%u nseg=%d (%zu tri)\n",
+                   si, r, tag, mesh_res, m.faces.size());
         } else if (key == "XSlabs" || key == "YSlabs" || key == "ZSlabs") {
             int dir = (key[0] == 'X') ? 0 : (key[0] == 'Y') ? 1 : 2;
 

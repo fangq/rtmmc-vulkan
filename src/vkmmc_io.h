@@ -58,11 +58,12 @@ struct SimConfig {
     bool has_steps;
     bool is_csg;
     std::vector<uint32_t> face_shape_id;
+    int mesh_res;
 
     SimConfig() : nphoton(1000000), rng_seed(29012391), do_mismatch(true),
         do_normalize(true), output_type(2), t0(0), t1(5e-9f), dt(5e-9f),
         maxgate(1), unitinmm(1.0f), srctype(0), init_elem(-1),
-        mediumid0(0xFFFFFFFFu), has_grid_dim(false), has_steps(false), is_csg(false) {
+        mediumid0(0xFFFFFFFFu), has_grid_dim(false), has_steps(false), is_csg(false), mesh_res(24) {
         memset(srcpos, 0, sizeof(srcpos));
         memset(srcdir, 0, sizeof(srcdir));
         srcdir[2] = 1.0f;
@@ -637,6 +638,11 @@ static SimConfig load_json_input(const char* filepath) {
             }
 
             cfg.has_steps = true;
+        }
+
+        if (d.contains("MeshRes")) {
+            cfg.mesh_res = d["MeshRes"].get<int>();
+            printf("MeshRes: %d\n", cfg.mesh_res);
         }
     }
 

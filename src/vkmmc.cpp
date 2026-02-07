@@ -24,6 +24,7 @@
 #include <string>
 #include "vkmmc_io.h"
 #include "vkmmc_shapes.h"
+#include "vkmmc_curvature.h"
 
 #ifndef VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME
     #define VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME "VK_EXT_shader_atomic_float"
@@ -58,7 +59,8 @@ struct MCParams {
     uint32_t mediumid0, isreflect;
     int      outputtype, threadphoton, oddphoton;
     uint32_t total_threads, num_media, seed, do_csg;
-    uint32_t _pad[2];
+    uint32_t has_curvature;
+    uint32_t _pad[1];
 };
 
 /* ================================================================ */
@@ -110,6 +112,7 @@ uint32_t find_mem_type(VkPhysicalDevice pd, uint32_t filter, VkMemoryPropertyFla
 
     throw std::runtime_error("no suitable memory type");
 }
+
 Buffer create_buffer(VulkanCtx& c, VkDeviceSize sz, VkBufferUsageFlags usage, VkMemoryPropertyFlags memP) {
     Buffer b;
     b.size = sz;
@@ -135,17 +138,20 @@ Buffer create_buffer(VulkanCtx& c, VkDeviceSize sz, VkBufferUsageFlags usage, Vk
     VK_CHECK(vkBindBufferMemory(c.device, b.buf, b.mem, 0));
     return b;
 }
+
 void upload_host(VulkanCtx& c, Buffer& b, const void* data, VkDeviceSize sz) {
     void* p;
     VK_CHECK(vkMapMemory(c.device, b.mem, 0, sz, 0, &p));
     memcpy(p, data, sz);
     vkUnmapMemory(c.device, b.mem);
 }
+
 VkDeviceAddress get_addr(VulkanCtx& c, VkBuffer buf) {
     VkBufferDeviceAddressInfo info = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     info.buffer = buf;
     return c.pfnGetBufAddr(c.device, &info);
 }
+
 void destroy_buf(VulkanCtx& c, Buffer& b) {
     if (b.buf) {
         vkDestroyBuffer(c.device, b.buf, NULL);
@@ -157,6 +163,7 @@ void destroy_buf(VulkanCtx& c, Buffer& b) {
 
     b = Buffer();
 }
+
 VkCommandBuffer begin_cmd(VulkanCtx& c) {
     VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = c.cmdPool;
@@ -169,6 +176,7 @@ VkCommandBuffer begin_cmd(VulkanCtx& c) {
     VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
     return cmd;
 }
+
 void end_submit(VulkanCtx& c, VkCommandBuffer cmd) {
     VK_CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -178,9 +186,11 @@ void end_submit(VulkanCtx& c, VkCommandBuffer cmd) {
     VK_CHECK(vkQueueWaitIdle(c.queue));
     vkFreeCommandBuffers(c.device, c.cmdPool, 1, &cmd);
 }
+
 Buffer create_device_buffer(VulkanCtx& c, VkDeviceSize sz, VkBufferUsageFlags usage) {
     return create_buffer(c, sz, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 }
+
 void upload_to_device(VulkanCtx& c, Buffer& dst, const void* data, VkDeviceSize sz) {
     Buffer stg = create_buffer(c, sz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     upload_host(c, stg, data, sz);
@@ -190,6 +200,7 @@ void upload_to_device(VulkanCtx& c, Buffer& dst, const void* data, VkDeviceSize 
     end_submit(c, cmd);
     destroy_buf(c, stg);
 }
+
 void download_from_device(VulkanCtx& c, Buffer& src, void* data, VkDeviceSize sz) {
     Buffer stg = create_buffer(c, sz, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkCommandBuffer cmd = begin_cmd(c);
@@ -253,7 +264,8 @@ void list_vulkan_gpus() {
 
         uint64_t tm = 0;
 
-        for (uint32_t h = 0; h < mp.memoryHeapCount; h++) if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+        for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
+            if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
                 tm += mp.memoryHeaps[h].size;
             }
 
@@ -283,7 +295,6 @@ VulkanCtx init_vulkan(int gpuid) {
     vkEnumeratePhysicalDevices(c.instance, &cnt, NULL);
     std::vector<VkPhysicalDevice> pds(cnt);
     vkEnumeratePhysicalDevices(c.instance, &cnt, pds.data());
-
     std::vector<VkPhysicalDevice> usable;
 
     for (size_t j = 0; j < pds.size(); j++) {
@@ -360,7 +371,6 @@ VulkanCtx init_vulkan(int gpuid) {
     qci.queueFamilyIndex = c.computeQF;
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
-
     VkPhysicalDeviceProperties devPr;
     vkGetPhysicalDeviceProperties(c.physDev, &devPr);
     bool isNV = (devPr.vendorID == 0x10DE), hasAF = false;
@@ -371,7 +381,8 @@ VulkanCtx init_vulkan(int gpuid) {
         std::vector<VkExtensionProperties> ex2(ec2);
         vkEnumerateDeviceExtensionProperties(c.physDev, NULL, &ec2, ex2.data());
 
-        for (size_t k = 0; k < ex2.size(); k++)if (!strcmp(ex2[k].extensionName, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
+        for (size_t k = 0; k < ex2.size(); k++)
+            if (!strcmp(ex2[k].extensionName, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
                 hasAF = true;
             }
     }
@@ -380,7 +391,6 @@ VulkanCtx init_vulkan(int gpuid) {
                              VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME
                             };
     int nExts = hasAF ? 5 : 4;
-
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT saf;
     memset(&saf, 0, sizeof(saf));
     saf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
@@ -414,7 +424,6 @@ VulkanCtx init_vulkan(int gpuid) {
     cpi.queueFamilyIndex = c.computeQF;
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     VK_CHECK(vkCreateCommandPool(c.device, &cpi, NULL, &c.cmdPool));
-
     c.pfnGetBufAddr = (PFN_vkGetBufferDeviceAddressKHR)vkGetDeviceProcAddr(c.device, "vkGetBufferDeviceAddressKHR");
     c.pfnCreateAS = (PFN_vkCreateAccelerationStructureKHR)vkGetDeviceProcAddr(c.device, "vkCreateAccelerationStructureKHR");
     c.pfnDestroyAS = (PFN_vkDestroyAccelerationStructureKHR)vkGetDeviceProcAddr(c.device, "vkDestroyAccelerationStructureKHR");
@@ -463,7 +472,8 @@ AccelStruct build_tlas(VulkanCtx& c, AccelStruct& blas) {
     asci.size = sz.accelerationStructureSize;
     asci.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
     c.pfnCreateAS(c.device, &asci, NULL, &as.handle);
-    Buffer scratch = create_buffer(c, sz.buildScratchSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    Buffer scratch = create_buffer(c, sz.buildScratchSize,
+                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     bi.dstAccelerationStructure = as.handle;
     bi.scratchData.deviceAddress = get_addr(c, scratch.buf);
     VkAccelerationStructureBuildRangeInfoKHR range;
@@ -494,10 +504,11 @@ std::vector<uint32_t> load_spirv(const char* path) {
     f.read(reinterpret_cast<char*>(code.data()), sz);
     return code;
 }
+
 ComputePipe create_pipeline(VulkanCtx& c, const char* spirv) {
     ComputePipe cp;
     memset(&cp, 0, sizeof(cp));
-    VkDescriptorSetLayoutBinding bn[6];
+    VkDescriptorSetLayoutBinding bn[7];
     memset(bn, 0, sizeof(bn));
     bn[0].binding = 0;
     bn[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
@@ -519,8 +530,12 @@ ComputePipe create_pipeline(VulkanCtx& c, const char* spirv) {
     bn[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bn[5].descriptorCount = 1;
     bn[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bn[6].binding = 6;
+    bn[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bn[6].descriptorCount = 1;
+    bn[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutCreateInfo dl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dl.bindingCount = 6;
+    dl.bindingCount = 7;
     dl.pBindings = bn;
     VK_CHECK(vkCreateDescriptorSetLayout(c.device, &dl, NULL, &cp.descLayout));
     VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -542,7 +557,11 @@ ComputePipe create_pipeline(VulkanCtx& c, const char* spirv) {
     cp2.layout = cp.pipeLayout;
     VK_CHECK(vkCreateComputePipelines(c.device, VK_NULL_HANDLE, 1, &cp2, NULL, &cp.pipeline));
     vkDestroyShaderModule(c.device, mod, NULL);
-    VkDescriptorPoolSize ps[] = {{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}};
+    VkDescriptorPoolSize ps[] = {
+        {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}
+    };
     VkDescriptorPoolCreateInfo dp = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dp.maxSets = 1;
     dp.poolSizeCount = 3;
@@ -555,13 +574,16 @@ ComputePipe create_pipeline(VulkanCtx& c, const char* spirv) {
     VK_CHECK(vkAllocateDescriptorSets(c.device, &da, &cp.descSet));
     return cp;
 }
+
 void update_desc(VulkanCtx& c, ComputePipe& cp, VkAccelerationStructureKHR tlas,
-                 Buffer& fb, Buffer& mb, Buffer& ob, Buffer& pb, Buffer& sb) {
+                 Buffer& fb, Buffer& mb, Buffer& ob, Buffer& pb, Buffer& sb, Buffer& cb) {
     VkWriteDescriptorSetAccelerationStructureKHR aw = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
     aw.accelerationStructureCount = 1;
     aw.pAccelerationStructures = &tlas;
-    VkDescriptorBufferInfo fi = {fb.buf, 0, VK_WHOLE_SIZE}, mi = {mb.buf, 0, VK_WHOLE_SIZE}, oi = {ob.buf, 0, VK_WHOLE_SIZE}, pi = {pb.buf, 0, VK_WHOLE_SIZE}, si = {sb.buf, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet w[6];
+    VkDescriptorBufferInfo fi = {fb.buf, 0, VK_WHOLE_SIZE}, mi = {mb.buf, 0, VK_WHOLE_SIZE},
+                           oi = {ob.buf, 0, VK_WHOLE_SIZE}, pi = {pb.buf, 0, VK_WHOLE_SIZE},
+                           si = {sb.buf, 0, VK_WHOLE_SIZE}, ci = {cb.buf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w[7];
     memset(w, 0, sizeof(w));
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w[0].pNext = &aw;
@@ -570,7 +592,7 @@ void update_desc(VulkanCtx& c, ComputePipe& cp, VkAccelerationStructureKHR tlas,
     w[0].descriptorCount = 1;
     w[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 
-    for (int i = 1; i <= 5; i++) {
+    for (int i = 1; i <= 6; i++) {
         w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[i].dstSet = cp.descSet;
         w[i].dstBinding = (uint32_t)i;
@@ -583,7 +605,8 @@ void update_desc(VulkanCtx& c, ComputePipe& cp, VkAccelerationStructureKHR tlas,
     w[3].pBufferInfo = &oi;
     w[4].pBufferInfo = &pi;
     w[5].pBufferInfo = &si;
-    vkUpdateDescriptorSets(c.device, 6, w, 0, NULL);
+    w[6].pBufferInfo = &ci;
+    vkUpdateDescriptorSets(c.device, 7, w, 0, NULL);
 }
 
 /* ================================================================ */
@@ -595,20 +618,25 @@ struct CmdOverrides {
     float unitinmm;
     int outputtype, isreflect, isnormalize, gpuid;
     bool listgpu, dumpjson, dumpmesh;
+    int meshres;
+    int docurv;   // -1 = auto (enable for CSG), 0 = off, 1 = on
     std::string session_id, json_str, inputfile;
     CmdOverrides(): nphoton(0), batch_size(UINT64_MAX), rng_seed(0), totalthread(0), unitinmm(0),
-        outputtype(-1), isreflect(-1), isnormalize(-1), gpuid(0), listgpu(false), dumpjson(false), dumpmesh(false) {}
+        outputtype(-1), isreflect(-1), isnormalize(-1), gpuid(0), listgpu(false), dumpjson(false), dumpmesh(false), meshres(0), docurv(-1) {}
 };
+
 void printhelp(const char* n) {
-    printf("vkmmc — Vulkan ray-tracing accelerated mesh Monte Carlo\n"
+    printf("vkmmc - Vulkan ray-tracing accelerated mesh Monte Carlo\n"
            "Usage: %s input.json  OR  %s -f input.json [flags]\n\n"
            "Flags:\n -f/--input\tJSON file\n -n/--photon\tphoton number\n -s/--session\tsession name\n"
            " -u/--unitinmm\tvoxel size [1]\n -E/--seed\tRNG seed\n -O/--outputtype\tx:energy,f:flux,l:fluence\n"
            " -b/--reflect\tmismatch [1]\n -U/--normalize\t[1]\n -t/--thread\tGPU threads [65536]\n"
            " -B/--batch\tphotons/batch [500000, 0=no batch]\n -G/--gpuid\tdevice [1]\n"
+           " -m/--meshres\tshape mesh resolution [24]\n -c/--curv\tcurvature [1=on,0=off,-1=auto]\n"
            " -L/--listgpu\tlist GPUs\n --dumpjson\tdump config\n --dumpmesh\tsave mesh JSON\n -h/--help\n", n, n);
     exit(0);
 }
+
 SimConfig parse_cmdline(int argc, char** argv, CmdOverrides& ovr) {
     std::string inputfile;
 
@@ -650,6 +678,10 @@ SimConfig parse_cmdline(int argc, char** argv, CmdOverrides& ovr) {
             ovr.dumpjson = true;
         } else if (a == "--dumpmesh") {
             ovr.dumpmesh = true;
+        } else if ((a == "-m" || a == "--meshres") && i + 1 < argc) {
+            ovr.meshres = atoi(argv[++i]);
+        } else if ((a == "-c" || a == "--curv") && i + 1 < argc) {
+            ovr.docurv = atoi(argv[++i]);
         } else if (a == "-h" || a == "--help") {
             printhelp(argv[0]);
         } else if (a[0] != '-' && inputfile.empty()) {
@@ -693,6 +725,10 @@ SimConfig parse_cmdline(int argc, char** argv, CmdOverrides& ovr) {
         cfg.do_normalize = (ovr.isnormalize != 0);
     }
 
+    if (ovr.meshres > 0) {
+        cfg.mesh_res = ovr.meshres;
+    }
+
     return cfg;
 }
 
@@ -710,7 +746,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Handle -L early
     for (int i = 1; i < argc; i++) {
         std::string a(argv[i]);
 
@@ -723,7 +758,13 @@ int main(int argc, char** argv) {
     CmdOverrides ovr;
     SimConfig cfg = parse_cmdline(argc, argv, ovr);
 
+    printf("sizeof(MCParams) = %zu\n", sizeof(MCParams));
+
     /* ---- Phase 1: Generate CSG mesh if needed ---- */
+    std::vector<NodeCurvature> curvData;
+    bool has_curvature = false;
+    bool want_curvature = (ovr.docurv < 0) ? true : (ovr.docurv != 0);  // auto = on for CSG
+
     if (cfg.is_csg) {
         std::ifstream sf(ovr.inputfile.c_str());
         json jroot;
@@ -731,12 +772,22 @@ int main(int argc, char** argv) {
 
         if (jroot.contains("Shapes") && jroot["Shapes"].is_array()) {
             float ext[6] = {0, 60, 0, 60, 0, 60};
-            ShapeMesh sm = parse_shapes(jroot["Shapes"], ext);
+            ShapeMesh sm = parse_shapes(jroot["Shapes"], ext, cfg.mesh_res);
             cfg.nodes = sm.nodes;
             cfg.faces = sm.faces;
             cfg.facedata = sm.facedata;
             cfg.face_shape_id = sm.shape_id;
             update_bbox(cfg);
+
+            if (want_curvature) {
+                std::vector<ShapeOrigin> shape_origins = extract_shape_origins(jroot["Shapes"]);
+                curvData = compute_curvature(sm, shape_origins);
+                has_curvature = true;
+                printf("Curvature: computed for %zu nodes, %zu shapes\n",
+                       curvData.size(), shape_origins.size());
+            } else {
+                printf("Curvature: disabled\n");
+            }
         }
 
         if (cfg.nodes.empty()) {
@@ -745,7 +796,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* ---- Phase 2: Handle dump commands (exit before Vulkan) ---- */
+    /* ---- Phase 2: Handle dump commands ---- */
     if (ovr.dumpjson) {
         printf("{\"Session\":{\"ID\":\"%s\",\"Photons\":%lu},\"Mesh\":{\"Nodes\":%zu,\"Faces\":%zu}}\n",
                cfg.session_id.c_str(), (unsigned long)cfg.nphoton, cfg.nodes.size(), cfg.faces.size());
@@ -758,7 +809,6 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        // Debug: verify face data
         printf("Verifying face data (%zu faces):\n", cfg.faces.size());
 
         for (size_t i = 0; i < cfg.faces.size() && i < 5; i++) {
@@ -766,8 +816,7 @@ int main(int argc, char** argv) {
             memcpy(&pk, &cfg.facedata[i].packed_media, 4);
             printf("  face[%zu]: v=(%u,%u,%u) n=(%.3f,%.3f,%.3f) front=%u back=%u\n",
                    i, cfg.faces[i][0], cfg.faces[i][1], cfg.faces[i][2],
-                   cfg.facedata[i].nx, cfg.facedata[i].ny, cfg.facedata[i].nz,
-                   pk >> 16, pk & 0xFFFF);
+                   cfg.facedata[i].nx, cfg.facedata[i].ny, cfg.facedata[i].nz, pk >> 16, pk & 0xFFFF);
         }
 
         json dump;
@@ -781,7 +830,6 @@ int main(int argc, char** argv) {
         dump["Optode"]["Source"]["Type"] = (cfg.srctype == 0 ? "pencil" : (cfg.srctype == 4 ? "planar" : (cfg.srctype == 8 ? "disk" : "unknown")));
         dump["Optode"]["Source"]["Pos"] = {cfg.srcpos[0], cfg.srcpos[1], cfg.srcpos[2]};
         dump["Optode"]["Source"]["Dir"] = {cfg.srcdir[0], cfg.srcdir[1], cfg.srcdir[2], cfg.srcdir[3]};
-
         size_t nn = cfg.nodes.size(), nf = cfg.faces.size();
         std::vector<float> nd(nn * 3);
 
@@ -791,19 +839,15 @@ int main(int argc, char** argv) {
             nd[i * 3 + 2] = cfg.nodes[i].z;
         }
 
-        std::vector<size_t> ndim;
-        ndim.push_back(nn);
-        ndim.push_back(3);
+        std::vector<size_t> ndim = {nn, 3};
         dump["Shapes"]["MeshNode"] = jdata_encode("single", ndim, nd.data(), nn * 3 * sizeof(float), false);
-
         std::vector<int32_t> sd(nf * 4);
 
         for (size_t i = 0; i < nf; i++) {
-            sd[i * 4]     = (int32_t)(cfg.faces[i][0] + 1);
+            sd[i * 4] = (int32_t)(cfg.faces[i][0] + 1);
             sd[i * 4 + 1] = (int32_t)(cfg.faces[i][1] + 1);
             sd[i * 4 + 2] = (int32_t)(cfg.faces[i][2] + 1);
 
-            // Use shape ID (1-based) if available, otherwise fall back to tag
             if (i < cfg.face_shape_id.size()) {
                 sd[i * 4 + 3] = (int32_t)cfg.face_shape_id[i];
             } else {
@@ -813,11 +857,8 @@ int main(int argc, char** argv) {
             }
         }
 
-        std::vector<size_t> sdim;
-        sdim.push_back(nf);
-        sdim.push_back(4);
+        std::vector<size_t> sdim = {nf, 4};
         dump["Shapes"]["MeshSurf"] = jdata_encode("int32", sdim, sd.data(), nf * 4 * sizeof(int32_t), false);
-
         std::string mf = cfg.session_id + "_mesh.json";
         std::ofstream of(mf.c_str());
         of << dump.dump(2) << std::endl;
@@ -828,7 +869,7 @@ int main(int argc, char** argv) {
     /* ---- Phase 3: Vulkan simulation ---- */
     VulkanCtx ctx = init_vulkan(ovr.gpuid);
 
-    // Build BLAS
+    /* Build BLAS */
     AccelStruct blas, tlas;
     {
         const VkBufferUsageFlags gu = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -865,13 +906,15 @@ int main(int argc, char** argv) {
         uint32_t pc = (uint32_t)cfg.faces.size();
         VkAccelerationStructureBuildSizesInfoKHR sz = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
         ctx.pfnGetASBuildSizes(ctx.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bi, &pc, &sz);
-        blas.buffer = create_buffer(ctx, sz.accelerationStructureSize, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        blas.buffer = create_buffer(ctx, sz.accelerationStructureSize,
+                                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         VkAccelerationStructureCreateInfoKHR ac = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
         ac.buffer = blas.buffer.buf;
         ac.size = sz.accelerationStructureSize;
         ac.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
         ctx.pfnCreateAS(ctx.device, &ac, NULL, &blas.handle);
-        Buffer scratch = create_buffer(ctx, sz.buildScratchSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        Buffer scratch = create_buffer(ctx, sz.buildScratchSize,
+                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         bi.dstAccelerationStructure = blas.handle;
         bi.scratchData.deviceAddress = get_addr(ctx, scratch.buf);
         VkAccelerationStructureBuildRangeInfoKHR rng;
@@ -889,12 +932,57 @@ int main(int argc, char** argv) {
     }
 
     const VkBufferUsageFlags ssbo = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    Buffer faceBuf = create_device_buffer(ctx, cfg.facedata.size() * sizeof(FaceData), ssbo);
-    upload_to_device(ctx, faceBuf, cfg.facedata.data(), cfg.facedata.size()*sizeof(FaceData));
+
+    /* Face buffer: interleaved [normal+media, vertex_indices] per triangle */
+    struct FaceDataGPU {
+        float nx, ny, nz, packed_media;
+        float v0f, v1f, v2f, pad;
+    };
+    std::vector<FaceDataGPU> faceGpu(cfg.faces.size());
+
+    for (size_t i = 0; i < cfg.faces.size(); i++) {
+        faceGpu[i].nx = cfg.facedata[i].nx;
+        faceGpu[i].ny = cfg.facedata[i].ny;
+        faceGpu[i].nz = cfg.facedata[i].nz;
+        faceGpu[i].packed_media = cfg.facedata[i].packed_media;
+        uint32_t v0 = cfg.faces[i][0], v1 = cfg.faces[i][1], v2 = cfg.faces[i][2];
+        memcpy(&faceGpu[i].v0f, &v0, 4);
+        memcpy(&faceGpu[i].v1f, &v1, 4);
+        memcpy(&faceGpu[i].v2f, &v2, 4);
+        faceGpu[i].pad = 0;
+    }
+
+    Buffer faceBuf = create_device_buffer(ctx, faceGpu.size() * sizeof(FaceDataGPU), ssbo);
+    upload_to_device(ctx, faceBuf, faceGpu.data(), faceGpu.size()*sizeof(FaceDataGPU));
+
+    /* Curvature buffer: 3 x vec4 per node */
+    struct GpuNodeCurv {
+        float nx, ny, nz, k1, px, py, pz, k2, posx, posy, posz, pad;
+    };
+    std::vector<GpuNodeCurv> gpuCurv;
+
+    if (has_curvature && !curvData.empty()) {
+        gpuCurv.resize(curvData.size());
+
+        for (size_t i = 0; i < curvData.size(); i++) {
+            gpuCurv[i] = {curvData[i].nx, curvData[i].ny, curvData[i].nz, curvData[i].k1,
+                          curvData[i].px, curvData[i].py, curvData[i].pz, curvData[i].k2,
+                          cfg.nodes[i].x, cfg.nodes[i].y, cfg.nodes[i].z, 0
+                         };
+        }
+    } else {
+        gpuCurv.resize(1);
+        memset(&gpuCurv[0], 0, sizeof(GpuNodeCurv));
+    }
+
+    Buffer curvBuf = create_device_buffer(ctx, gpuCurv.size() * sizeof(GpuNodeCurv), ssbo);
+    upload_to_device(ctx, curvBuf, gpuCurv.data(), gpuCurv.size()*sizeof(GpuNodeCurv));
+
+    /* Media buffer */
     Buffer mediaBuf = create_device_buffer(ctx, cfg.media.size() * sizeof(Medium), ssbo);
     upload_to_device(ctx, mediaBuf, cfg.media.data(), cfg.media.size()*sizeof(Medium));
 
-    // Output grid
+    /* Output grid */
     float vs = cfg.unitinmm;
 
     if (cfg.has_steps) {
@@ -904,17 +992,21 @@ int main(int argc, char** argv) {
     float ge = vs * 0.5f;
     float gmin[3] = {cfg.nmin.x - ge, cfg.nmin.y - ge, cfg.nmin.z - ge};
     float gmax[3] = {cfg.nmax.x + ge, cfg.nmax.y + ge, cfg.nmax.z + ge};
-    uint32_t nx = (uint32_t)ceil((gmax[0] - gmin[0]) / vs), ny = (uint32_t)ceil((gmax[1] - gmin[1]) / vs), nz = (uint32_t)ceil((gmax[2] - gmin[2]) / vs);
+    uint32_t nx = (uint32_t)ceil((gmax[0] - gmin[0]) / vs);
+    uint32_t ny = (uint32_t)ceil((gmax[1] - gmin[1]) / vs);
+    uint32_t nz = (uint32_t)ceil((gmax[2] - gmin[2]) / vs);
     uint32_t crop0w = nx * ny * nz * cfg.maxgate, outSz = crop0w * 2;
+
     Buffer outBuf = create_device_buffer(ctx, outSz * sizeof(float), ssbo);
     {
         VkCommandBuffer cmd = begin_cmd(ctx);
         vkCmdFillBuffer(cmd, outBuf.buf, 0, outSz * sizeof(float), 0);
         end_submit(ctx, cmd);
     }
-    printf("Grid: %ux%ux%u x %d gates, voxel=%.3fmm, origin=[%.2f,%.2f,%.2f]\n", nx, ny, nz, cfg.maxgate, vs, gmin[0], gmin[1], gmin[2]);
+    printf("Grid: %ux%ux%u x %d gates, voxel=%.3fmm, origin=[%.2f,%.2f,%.2f]\n",
+           nx, ny, nz, cfg.maxgate, vs, gmin[0], gmin[1], gmin[2]);
 
-    // Threads
+    /* Threads */
     uint32_t tt = (ovr.totalthread > 0) ? ovr.totalthread : 65536;
 
     if (cfg.nphoton < tt) {
@@ -925,6 +1017,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    /* MCParams */
     MCParams params;
     memset(&params, 0, sizeof(params));
     params.srctype = cfg.srctype;
@@ -961,9 +1054,11 @@ int main(int argc, char** argv) {
     params.num_media = (uint32_t)cfg.media.size();
     params.seed = cfg.rng_seed;
     params.do_csg = cfg.is_csg ? 1u : 0u;
+    params.has_curvature = has_curvature ? 1u : 0u;
 
     Buffer paramBuf = create_device_buffer(ctx, sizeof(MCParams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
+    /* RNG seeds */
     srand(cfg.rng_seed > 0 ? cfg.rng_seed : (uint32_t)time(0));
     struct uint4_t {
         uint32_t x, y, z, w;
@@ -976,9 +1071,22 @@ int main(int argc, char** argv) {
 
     upload_to_device(ctx, seedBuf, seeds.data(), tt * sizeof(uint4_t));
 
+    if (has_curvature && !curvData.empty()) {
+        gpuCurv.resize(curvData.size());
+
+        for (size_t i = 0; i < curvData.size(); i++) {
+            gpuCurv[i] = { curvData[i].nx, curvData[i].ny, curvData[i].nz, curvData[i].k1,
+                           curvData[i].px, curvData[i].py, curvData[i].pz, curvData[i].k2
+                         };
+        }
+    } else {
+        gpuCurv.resize(1); // dummy
+        memset(&gpuCurv[0], 0, sizeof(GpuNodeCurv));
+    }
+
     ComputePipe cp = create_pipeline(ctx, spirvFile);
 
-    update_desc(ctx, cp, tlas.handle, faceBuf, mediaBuf, outBuf, paramBuf, seedBuf);
+    update_desc(ctx, cp, tlas.handle, faceBuf, mediaBuf, outBuf, paramBuf, seedBuf, curvBuf);
 
     // Batched dispatch
     uint64_t batchsz;
@@ -1094,6 +1202,7 @@ int main(int argc, char** argv) {
     destroy_buf(ctx, outBuf);
     destroy_buf(ctx, paramBuf);
     destroy_buf(ctx, seedBuf);
+    destroy_buf(ctx, curvBuf);
     vkDestroyPipeline(ctx.device, cp.pipeline, NULL);
     vkDestroyPipelineLayout(ctx.device, cp.pipeLayout, NULL);
     vkDestroyDescriptorPool(ctx.device, cp.descPool, NULL);

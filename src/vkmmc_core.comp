@@ -7,7 +7,10 @@
  *      A per-photon 8-byte state buffer tracks enclosing surfaces.
  *      Highest media ID among all enclosing surfaces determines the current medium.
  *
- * For NVIDIA GPUs: uncomment the next line for native atomicAdd(float)
+ * Curvature-informed reflection: when has_curvature=1, uses per-node principal
+ * curvature to estimate the true surface normal at the intersection point,
+ * yielding accurate Fresnel reflection/transmission on curved CSG surfaces.
+ *
  * Compile: glslangValidator --target-env vulkan1.2 -e main -o vkmmc_core.spv vkmmc_core.comp
  */
 #version 460
@@ -52,10 +55,20 @@ layout(std140, set = 0, binding = 4) uniform SimParams {
     uint initial_medium, do_reflect;
     int   output_type, photons_per_thread, extra_photons;
     uint  total_threads, num_media, rng_seed;
-    uint  do_csg;     // 0=mesh mode, 1=CSG mode
+    uint  do_csg;
+    uint  has_curvature;
+    uint  _pad1;
 };
 
 layout(std430, set = 0, binding = 5) readonly buffer SeedBuffer { uvec4 thread_seeds[]; };
+
+/* Per-node curvature: 3 x vec4 = 12 floats per node */
+struct NodeCurv {
+    vec4 vnorm_k1;   // .xyz = vertex normal, .w = k1
+    vec4 pdir_k2;    // .xyz = principal direction 1, .w = k2
+    vec4 node_pos;   // .xyz = node world position, .w = unused
+};
+layout(std430, set = 0, binding = 6) readonly buffer CurvBuffer { NodeCurv node_curv[]; };
 
 // ==================== Constants ====================
 
@@ -110,15 +123,58 @@ bool trace_ray(vec3 o, vec3 d, float tmin, float tmax,
     return false;
 }
 
+/* Extended trace that also returns barycentric coordinates */
+bool trace_ray_bary(vec3 o, vec3 d, float tmin, float tmax,
+                    out float dist, out int tri_id, out bool front_face, out vec2 bary) {
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q, scene, gl_RayFlagsNoneEXT, 0xFF, o, tmin, d, tmax);
+
+    while (rayQueryProceedEXT(q)) {}
+
+    if (rayQueryGetIntersectionTypeEXT(q, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+        dist = rayQueryGetIntersectionTEXT(q, true);
+        tri_id = rayQueryGetIntersectionPrimitiveIndexEXT(q, true);
+        front_face = rayQueryGetIntersectionFrontFaceEXT(q, true);
+        bary = rayQueryGetIntersectionBarycentricsEXT(q, true);
+        return true;
+    }
+
+    return false;
+}
+
 void unpack_media(float pw, out uint front_med, out uint back_med) {
     uint p = floatBitsToUint(pw);
     front_med = p >> 16u;
     back_med  = p & 0xFFFFu;
 }
 
+// ==================== Curvature-corrected normal ====================
+// Following the MMC curvature paper (Yen & Fang):
+//   N_B = (1/3) * sum_i [ N_Pi - k1_i * d1_i * u_i - k2_i * d2_i * v_i ]
+// where d1_i = dot(B - P_i, u_i), d2_i = dot(B - P_i, v_i)
+// v_i = cross(u_i, N_Pi)
+
+vec3 compute_curvature_normal_at_node(vec3 hit_pos, uint node_idx) {
+    vec3 N  = node_curv[node_idx].vnorm_k1.xyz;
+    float k1 = node_curv[node_idx].vnorm_k1.w;
+    vec3 u  = node_curv[node_idx].pdir_k2.xyz;
+    float k2 = node_curv[node_idx].pdir_k2.w;
+    vec3 v  = cross(u, N);
+
+    // We need the node position. Since we don't have a separate node position
+    // buffer in the shader, we use the vertex buffer via the AS. However,
+    // we can reconstruct using barycentrics from the caller.
+    // Instead, this function takes the displacement from the node to the hit point.
+    // The caller passes (hit_pos - node_pos) as hit_pos for efficiency.
+    vec3 d = hit_pos; // actually (B - P_i)
+    float d1 = dot(d, u);
+    float d2 = dot(d, v);
+
+    return normalize(N - k1 * d1 * u - k2 * d2 * v);
+}
+
 // ==================== Media State Buffer (CSG mode) ====================
-// 8 slots of uint8, packed into uvec2 (mediastate.x = slots 0-3, .y = slots 4-7)
-// Slot 0 always holds the highest (active) media ID.
+// 8 slots of uint8, packed into uvec2
 
 uint ms_get(uvec2 ms, int slot) {
     uint word = (slot < 4) ? ms.x : ms.y;
@@ -138,7 +194,6 @@ uvec2 ms_set(uvec2 ms, int slot, uint val) {
     return ms;
 }
 
-// Find the highest media ID across all 8 slots
 uint ms_max(uvec2 ms) {
     uint mx = 0u;
 
@@ -149,8 +204,6 @@ uint ms_max(uvec2 ms) {
     return mx;
 }
 
-// Enter a surface: write back_id into the state buffer
-// The highest ID goes to slot 0; old slot 0 value moves to first empty slot
 uvec2 ms_enter(uvec2 ms, uint back_id) {
     if (back_id == 0u) {
         return ms;
@@ -160,10 +213,8 @@ uvec2 ms_enter(uvec2 ms, uint back_id) {
     uint new_max = max(current_max, back_id);
     uint demoted = (new_max == back_id) ? current_max : back_id;
 
-    // Write the highest to slot 0
     ms = ms_set(ms, 0, new_max);
 
-    // Write the demoted value to the first empty slot (if nonzero)
     if (demoted > 0u) {
         for (int i = 1; i < 8; i++) {
             if (ms_get(ms, i) == 0u) {
@@ -176,13 +227,11 @@ uvec2 ms_enter(uvec2 ms, uint back_id) {
     return ms;
 }
 
-// Leave a surface: find back_id in the buffer and zero it, then update slot 0
 uvec2 ms_leave(uvec2 ms, uint back_id) {
     if (back_id == 0u) {
         return ms;
     }
 
-    // Find and remove back_id (search all slots including 0)
     for (int i = 0; i < 8; i++) {
         if (ms_get(ms, i) == back_id) {
             ms = ms_set(ms, i, 0u);
@@ -190,7 +239,6 @@ uvec2 ms_leave(uvec2 ms, uint back_id) {
         }
     }
 
-    // Recalculate max and put it in slot 0
     uint mx = 0u;
     int mx_slot = -1;
 
@@ -296,30 +344,50 @@ vec3 scatter_dir(vec3 d, float g, inout uvec4 rng) {
 }
 
 // ==================== Fresnel Reflection ====================
+// Returns true if reflected, false if transmitted.
+// Updates pos and dir in-place.
+// Now accepts an explicit normal vector N (may be curvature-corrected).
 
 bool do_reflection(vec3 N, float n1, float n2, inout uvec4 rng, inout vec3 p, inout vec3 d) {
-    float ci = abs(dot(d, N));
-    float n12 = n1 * n1, n22 = n2 * n2, ct2 = 1.0 - n12 / n22 * (1.0 - ci * ci);
+    // N should point toward the side the photon is coming from (outward for front-face hit)
+    // Ensure ci = cos(incident angle) > 0 using the correct orientation
+    float cid = dot(d, N);
+
+    // If d and N point in the same direction (should not happen with correct N orientation),
+    // flip N so that ci is positive
+    if (cid > 0.0) {
+        N = -N;
+        cid = -cid;
+    }
+
+    float ci = -cid;  // ci > 0
+
+    float n12 = n1 * n1, n22 = n2 * n2;
+    float ct2 = 1.0 - n12 / n22 * (1.0 - ci * ci);
 
     if (ct2 > 0.0) {
         float ct = sqrt(ct2);
+        // Fresnel reflectance (unpolarized)
         float re = n12 * ci * ci + n22 * ct2, im = 2.0 * n1 * n2 * ci * ct;
         float rp = (re - im) / (re + im);
         re = n22 * ci * ci + n12 * ct * ct;
         float rt = (rp + (re - im) / (re + im)) * 0.5;
 
         if (rand01(rng) <= rt) {
+            // Reflection: d_r = d + 2*ci*N
             p -= d * DOUBLE_SAFETY;
-            d += -2.0 * ci * N;
+            d = d + 2.0 * ci * N;
         } else {
-            d += -ci * N;
-            d = ct * N + n1 / n2 * d;
+            // Snell's law transmission: d_t = (n1/n2)*d + ((n1/n2)*ci - ct)*N
+            float ratio = n1 / n2;
+            d = ratio * d + (ratio * ci - ct) * N;
             d *= inversesqrt(dot(d, d));
             return false;
         }
     } else {
+        // Total internal reflection
         p -= d * DOUBLE_SAFETY;
-        d += -2.0 * ci * N;
+        d = d + 2.0 * ci * N;
     }
 
     d *= inversesqrt(dot(d, d));
@@ -334,25 +402,36 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
     d = src_dir.xyz;
     w = 1.0;
     tof = 0.0;
-    mstate = uvec2(0u, 0u); // clear state buffer
+    mstate = uvec2(0u, 0u);
 
     if (src_type == 4) { // planar
         float u = rand01(rng), v = rand01(rng);
         p = src_pos.xyz + u * src_param1.xyz + v * src_param2.xyz;
+    } else if (src_type == 8) { // disk
+        float r0 = sqrt(rand01(rng)) * src_param1.x;
+        float phi = TWO_PI * rand01(rng);
+        float cphi = cos(phi), sphi = sin(phi);
+        // Build tangent plane perpendicular to src_dir
+        vec3 sd = src_dir.xyz;
+
+        if (sd.z > -1.0 + FEPS && sd.z < 1.0 - FEPS) {
+            float tmp0 = 1.0 - sd.z * sd.z;
+            float tmp1 = r0 * inversesqrt(tmp0);
+            p.x += tmp1 * (sd.x * sd.z * cphi - sd.y * sphi);
+            p.y += tmp1 * (sd.y * sd.z * cphi + sd.x * sphi);
+            p.z -= tmp1 * tmp0 * cphi;
+        } else {
+            p.x += r0 * cphi;
+            p.y += r0 * sphi;
+        }
     }
 
     slen = rand_scatlen(rng);
 
     if (do_csg > 0u) {
-        // CSG mode: determine enclosing surfaces using parity counting.
-        // Cast ray forward, walk through ALL intersections. For each surface (back_id),
-        // count crossings. Odd count = source is inside that surface.
-        // We use a temporary counter packed into mstate, then convert to enter calls.
         mstate = uvec2(0u, 0u);
 
-        // Count crossings per back_id (use state buffer slots as counters mod 2)
-        // Since we have up to 8 media IDs, track parity for each
-        uint parity[8]; // parity[i] = crossing count for media id (i+1), mod 2
+        uint parity[8];
 
         for (int i = 0; i < 8; i++) {
             parity[i] = 0u;
@@ -370,9 +449,8 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
             }
 
             uint fm, bm;
-            unpack_media(face_normal[tid].w, fm, bm);
+            unpack_media(face_normal[tid * 2].w, fm, bm);
 
-            // Every crossing of a surface with back_id=bm toggles parity
             if (bm > 0u && bm <= 8u) {
                 parity[bm - 1u] ^= 1u;
             }
@@ -380,7 +458,6 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
             walk_pos = walk_pos + d * (hd + SAFETY_DIST);
         }
 
-        // Odd parity = source is inside that surface → enter it
         for (int i = 0; i < 8; i++) {
             if (parity[i] != 0u) {
                 mstate = ms_enter(mstate, uint(i + 1));
@@ -390,23 +467,86 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
         mid = ms_get(mstate, 0);
 
         if (mid == 0u) {
-            // Source is outside all surfaces — skip forward to first entry
             float hd;
             int tid;
             bool ff;
 
             if (trace_ray(p, d, 0.0, FMAX, hd, tid, ff) && ff) {
                 uint fm, bm;
-                unpack_media(face_normal[tid].w, fm, bm);
+                unpack_media(face_normal[tid * 2].w, fm, bm);
+
+                // Move to the surface
                 p = p + d * (hd + SAFETY_DIST);
                 mstate = ms_enter(mstate, bm);
                 mid = ms_get(mstate, 0);
+
+                // Apply Fresnel refraction at entry if refractive index mismatch
+                if (do_reflect > 0u && mid < num_media) {
+                    float n_in = 1.0;  // exterior
+                    float n_out = media[mid].n;
+
+                    if (n_in != n_out) {
+                        // Get surface normal for refraction
+                        vec3 N;
+
+                        if (has_curvature > 0u) {
+                            vec3 hit_pos = p - d * SAFETY_DIST;
+                            vec4 vidx_raw = face_normal[tid * 2 + 1];
+                            uint v0 = floatBitsToUint(vidx_raw.x);
+                            uint v1 = floatBitsToUint(vidx_raw.y);
+                            uint v2 = floatBitsToUint(vidx_raw.z);
+
+                            vec3 N0 = node_curv[v0].vnorm_k1.xyz;
+                            float k1_0 = node_curv[v0].vnorm_k1.w;
+                            vec3 u0 = node_curv[v0].pdir_k2.xyz;
+                            float k2_0 = node_curv[v0].pdir_k2.w;
+                            vec3 P0 = node_curv[v0].node_pos.xyz;
+                            vec3 dd0 = hit_pos - P0;
+                            vec3 vv0 = cross(u0, N0);
+                            vec3 NB0 = N0 - k1_0 * dot(dd0, u0) * u0 - k2_0 * dot(dd0, vv0) * vv0;
+
+                            vec3 N1 = node_curv[v1].vnorm_k1.xyz;
+                            float k1_1 = node_curv[v1].vnorm_k1.w;
+                            vec3 u1 = node_curv[v1].pdir_k2.xyz;
+                            float k2_1 = node_curv[v1].pdir_k2.w;
+                            vec3 P1 = node_curv[v1].node_pos.xyz;
+                            vec3 dd1 = hit_pos - P1;
+                            vec3 vv1 = cross(u1, N1);
+                            vec3 NB1 = N1 - k1_1 * dot(dd1, u1) * u1 - k2_1 * dot(dd1, vv1) * vv1;
+
+                            vec3 N2 = node_curv[v2].vnorm_k1.xyz;
+                            float k1_2 = node_curv[v2].vnorm_k1.w;
+                            vec3 u2 = node_curv[v2].pdir_k2.xyz;
+                            float k2_2 = node_curv[v2].pdir_k2.w;
+                            vec3 P2 = node_curv[v2].node_pos.xyz;
+                            vec3 dd2 = hit_pos - P2;
+                            vec3 vv2 = cross(u2, N2);
+                            vec3 NB2 = N2 - k1_2 * dot(dd2, u2) * u2 - k2_2 * dot(dd2, vv2) * vv2;
+
+                            N = normalize((NB0 + NB1 + NB2) / 3.0);
+                        } else {
+                            N = -face_normal[tid * 2].xyz;  // front face, inward normal
+                        }
+
+                        if (dot(N, d) > 0.0) {
+                            N = -N;
+                        }
+
+                        // Apply reflection/refraction
+                        bool refl = do_reflection(N, n_in, n_out, rng, p, d);
+
+                        if (refl) {
+                            // Reflected back outside — photon doesn't enter
+                            mstate = uvec2(0u, 0u);
+                            mid = MEDIUM_DEAD;
+                        }
+                    }
+                }
             } else {
                 mid = MEDIUM_DEAD;
             }
         }
     } else {
-        // Mesh mode: use precomputed initial_medium or ray query
         mid = initial_medium;
 
         if (mid == MEDIUM_UNKNOWN) {
@@ -416,13 +556,126 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
 
             if (trace_ray(p, d, 0.0, FMAX, hd, tid, ff)) {
                 uint fm, bm;
-                unpack_media(face_normal[tid].w, fm, bm);
+                unpack_media(face_normal[tid * 2].w, fm, bm);
                 mid = ff ? fm : bm;
             } else {
                 mid = MEDIUM_DEAD;
             }
         }
     }
+}
+
+// ==================== Curvature-corrected normal at hit point ====================
+// tri_id gives the triangle index; barycentrics (u,v) give the hit location.
+// Vertex indices for triangle tri_id are 3*tri_id, 3*tri_id+1, 3*tri_id+2
+// in the index buffer. But in vkmmc, faces are stored separately and the
+// acceleration structure is built from the index buffer. The primitive index
+// from ray query corresponds to the triangle index, and the vertex indices
+// are faces[tri_id][0,1,2]. We need those node indices to look up curvature.
+//
+// PROBLEM: The GLSL ray query doesn't give us vertex indices directly.
+// We need a vertex index buffer accessible in the shader.
+// We'll reuse FaceBuffer: pack vertex indices into an additional buffer,
+// or pass them via a separate SSBO.
+//
+// WORKAROUND: We store triangle vertex indices in a separate buffer.
+// For now, we encode them in the existing face_normal buffer by using
+// additional entries, OR we add a new SSBO. Since adding another binding
+// would require more pipeline changes, we'll use an alternative:
+//
+// We pass the index buffer as part of the face buffer. Each triangle has:
+//   face_normal[tri_id] = vec4(nx, ny, nz, packed_media)  [already exists]
+// We add a second parallel buffer for vertex indices.
+//
+// SIMPLEST APPROACH: Since the faces are built in order in parse_shapes,
+// and the index buffer uploaded for BLAS is faces[i][0], faces[i][1], faces[i][2],
+// we can pass the flattened index buffer as another SSBO. But to minimize
+// binding changes, we can pack the 3 vertex indices into the SSBO alongside
+// the face normal data.
+//
+// For this implementation, we'll extend the FaceBuffer to interleave:
+//   [tri_id*2 + 0] = vec4(nx, ny, nz, packed_media)
+//   [tri_id*2 + 1] = vec4(v0_as_float, v1_as_float, v2_as_float, 0)
+//
+// This requires changing the host-side facedata upload. Let's do that.
+
+// With the extended face buffer layout:
+//   face_normal[tri_id * 2]     = vec4(nx, ny, nz, packed_media)
+//   face_normal[tri_id * 2 + 1] = uvec4(v0, v1, v2, 0) reinterpreted as vec4
+
+vec3 get_curvature_normal(int tri_id, vec2 bary_uv, vec3 hit_pos) {
+    // Read vertex indices from extended face buffer
+    vec4 vidx_raw = face_normal[tri_id * 2 + 1];
+    uint v0 = floatBitsToUint(vidx_raw.x);
+    uint v1 = floatBitsToUint(vidx_raw.y);
+    uint v2 = floatBitsToUint(vidx_raw.z);
+
+    // Barycentric: ray query gives (u, v) where hit = (1-u-v)*V0 + u*V1 + v*V2
+    float w0 = 1.0 - bary_uv.x - bary_uv.y;
+    float w1 = bary_uv.x;
+    float w2 = bary_uv.y;
+
+    // We need node positions to compute (hit_pos - node_pos).
+    // Reconstruct node positions from the curvature data is not possible
+    // (curvature buffer has normals, not positions).
+    // Instead, we compute per-node corrected normals using vertex positions
+    // from the BLAS vertex data. But vertex data isn't directly accessible.
+    //
+    // PRACTICAL SOLUTION: We compute the corrected normal per-node where
+    // displacement = hit_pos - node_pos. Since we know:
+    //   hit_pos = w0*P0 + w1*P1 + w2*P2
+    //   (hit_pos - P0) = w1*(P1-P0) + w2*(P2-P0)
+    // We can't get P0, P1, P2 without a vertex position buffer.
+    //
+    // We'll add node positions to the curvature buffer.
+    // Extended NodeCurv: vec4(nx,ny,nz,k1), vec4(px,py,pz,k2), vec4(posx,posy,posz,0)
+    // = 12 floats per node.
+
+    // Read node positions from extended curvature buffer
+    // (see updated NodeCurv struct below)
+
+    // For now, use interpolated vertex normal without position-dependent correction
+    // as a first approximation when positions aren't available.
+    // With full implementation (positions in curvature buffer), we do:
+
+    vec3 N0 = node_curv[v0].vnorm_k1.xyz;
+    float k1_0 = node_curv[v0].vnorm_k1.w;
+    vec3 u0 = node_curv[v0].pdir_k2.xyz;
+    float k2_0 = node_curv[v0].pdir_k2.w;
+
+    vec3 N1 = node_curv[v1].vnorm_k1.xyz;
+    float k1_1 = node_curv[v1].vnorm_k1.w;
+    vec3 u1 = node_curv[v1].pdir_k2.xyz;
+    float k2_1 = node_curv[v1].pdir_k2.w;
+
+    vec3 N2 = node_curv[v2].vnorm_k1.xyz;
+    float k1_2 = node_curv[v2].vnorm_k1.w;
+    vec3 u2 = node_curv[v2].pdir_k2.xyz;
+    float k2_2 = node_curv[v2].pdir_k2.w;
+
+    // For flat surfaces (k1=k2=0), this reduces to interpolated vertex normal
+    // For curved surfaces, we need displacements from each vertex to hit point.
+    // We use node_curv[vi].node_pos for vertex positions.
+    vec3 P0 = node_curv[v0].node_pos.xyz;
+    vec3 P1 = node_curv[v1].node_pos.xyz;
+    vec3 P2 = node_curv[v2].node_pos.xyz;
+
+    // Per-node curvature-corrected normal at hit_pos
+    vec3 d0 = hit_pos - P0;
+    vec3 v0_dir = cross(u0, N0);
+    vec3 NB0 = N0 - k1_0 * dot(d0, u0) * u0 - k2_0 * dot(d0, v0_dir) * v0_dir;
+
+    vec3 d1 = hit_pos - P1;
+    vec3 v1_dir = cross(u1, N1);
+    vec3 NB1 = N1 - k1_1 * dot(d1, u1) * u1 - k2_1 * dot(d1, v1_dir) * v1_dir;
+
+    vec3 d2 = hit_pos - P2;
+    vec3 v2_dir = cross(u2, N2);
+    vec3 NB2 = N2 - k1_2 * dot(d2, u2) * u2 - k2_2 * dot(d2, v2_dir) * v2_dir;
+
+    // Average (Eq. 1 from the paper)
+    vec3 NB = (NB0 + NB1 + NB2) / 3.0;
+    return normalize(NB);
 }
 
 // ==================== Main ====================
@@ -440,7 +693,7 @@ void main() {
     vec3 pos, dir;
     float weight, slen, tof;
     uint mid;
-    uvec2 mstate; // CSG media state buffer (8 x uint8)
+    uvec2 mstate;
 
     launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng);
 
@@ -449,112 +702,119 @@ void main() {
         if (mid != MEDIUM_DEAD && mid != MEDIUM_AMBIENT) {
             Medium prop = media[mid];
 
-            if (prop.mus < FEPS) {
-                mid = MEDIUM_DEAD;
+            // Compute max travel distance: if mus > 0, use scattering length;
+            // if mus ~ 0 (transparent medium), ray goes to next boundary
+            bool is_transparent = (prop.mus < FEPS);
+            float max_dist = is_transparent ? FMAX : slen / prop.mus;
+            float hd;
+            int tri;
+            bool ff;
+            vec2 bary_uv;
+
+            bool hit;
+
+            if (has_curvature > 0u) {
+                hit = trace_ray_bary(pos, dir, RAY_TMIN, max_dist, hd, tri, ff, bary_uv);
             } else {
-                float max_dist = slen / prop.mus;
-                float hd;
-                int tri;
-                bool ff;
-                bool hit = trace_ray(pos, dir, RAY_TMIN, max_dist, hd, tri, ff);
+                hit = trace_ray(pos, dir, RAY_TMIN, max_dist, hd, tri, ff);
+            }
 
-                if (hit) {
-                    // ---- Boundary hit ----
-                    uint fm, bm;
-                    unpack_media(face_normal[tri].w, fm, bm);
-                    float L = min(hd, slen / prop.mus);
+            if (!hit && is_transparent) {
+                // Transparent medium, no boundary: photon escapes
+                mid = MEDIUM_DEAD;
+            } else if (hit) {
+                // ---- Boundary hit ----
+                uint fm, bm;
+                unpack_media(face_normal[tri * 2].w, fm, bm);
+                float L = is_transparent ? hd : min(hd, slen / prop.mus);
 
-                    accumulate(pos, dir, mid, weight, tof, L);
-                    pos += dir * (L + SAFETY_DIST);
-                    weight *= exp(-prop.mua * L);
-                    tof += L * INV_C0 * prop.n;
+                accumulate(pos, dir, mid, weight, tof, L);
+                pos += dir * (L + SAFETY_DIST);
+                weight *= exp(-prop.mua * L);
+                tof += L * INV_C0 * prop.n;
+
+                if (!is_transparent) {
                     slen -= L * prop.mus;
+                }
 
-                    if (do_csg > 0u) {
-                        // CSG mode: update state buffer and handle reflection
+                if (do_csg > 0u) {
+                    // CSG mode: update state buffer and handle reflection
+                    uint old_mid = mid;
 
-                        // Determine the old medium (before crossing) and new medium (after crossing)
-                        uint old_mid = mid;  // current medium before state update
+                    uvec2 new_mstate;
 
-                        // Tentatively update state to find what new medium would be
-                        uvec2 new_mstate;
-
-                        if (ff) {
-                            // Front-face hit: entering this surface → add back_id
-                            new_mstate = ms_enter(mstate, bm);
-                        } else {
-                            // Back-face hit: leaving this surface → remove back_id
-                            new_mstate = ms_leave(mstate, bm);
-                        }
-
-                        uint new_mid = ms_get(new_mstate, 0);
-
-                        // Check for reflection at refractive index boundary
-                        bool reflected = false;
-
-                        if (do_reflect > 0u && new_mid != old_mid
-                                && new_mid < num_media && old_mid < num_media) {
-                            float n_in  = media[old_mid].n;
-                            float n_out = (new_mid == 0u) ? 1.0 : media[new_mid].n;
-
-                            if (n_in != n_out) {
-                                // Get face normal, oriented toward the incoming ray
-                                vec3 N = ff ? -face_normal[tri].xyz : face_normal[tri].xyz;
-
-                                // do_reflection returns true if reflected, false if transmitted
-                                // it also updates pos and dir accordingly
-                                reflected = do_reflection(N, n_in, n_out, rng, pos, dir);
-                            }
-                        }
-
-                        if (reflected) {
-                            // Photon bounced back — do NOT update state buffer
-                            // mid stays the same (old_mid)
-                            // pos and dir were already updated by do_reflection
-                        } else {
-                            // Transmitted (or no index mismatch) — commit the state update
-                            mstate = new_mstate;
-                            mid = new_mid;
-
-                            if (mid == 0u) {
-                                mid = MEDIUM_DEAD;  // exited all surfaces
-                            }
-                        }
-
+                    if (ff) {
+                        new_mstate = ms_enter(mstate, bm);
                     } else {
-                        // Mesh mode: direct front/back lookup
-                        uint new_mid = ff ? bm : fm;
+                        new_mstate = ms_leave(mstate, bm);
+                    }
 
-                        if (do_reflect > 0u && new_mid != MEDIUM_AMBIENT
-                                && prop.n != media[new_mid].n) {
-                            vec3 N = ff ? -face_normal[tri].xyz : face_normal[tri].xyz;
+                    uint new_mid = ms_get(new_mstate, 0);
 
-                            if (do_reflection(N, prop.n, media[new_mid].n, rng, pos, dir)) {
-                                new_mid = ff ? fm : bm; // reflected
+                    bool reflected = false;
+
+                    if (do_reflect > 0u && new_mid != old_mid
+                            && new_mid < num_media && old_mid < num_media) {
+                        float n_in  = media[old_mid].n;
+                        float n_out = (new_mid == 0u) ? 1.0 : media[new_mid].n;
+
+                        if (n_in != n_out) {
+                            vec3 N;
+
+                            if (has_curvature > 0u) {
+                                vec3 hit_pos = pos - dir * SAFETY_DIST;
+                                N = get_curvature_normal(tri, bary_uv, hit_pos);
+                            } else {
+                                N = face_normal[tri * 2].xyz;
                             }
-                        }
 
+                            reflected = do_reflection(N, n_in, n_out, rng, pos, dir);
+                        }
+                    }
+
+                    if (reflected) {
+                        // Stay in current medium
+                    } else {
+                        mstate = new_mstate;
                         mid = new_mid;
 
-                        if (mid == MEDIUM_AMBIENT) {
+                        if (mid == 0u) {
                             mid = MEDIUM_DEAD;
                         }
                     }
 
                 } else {
-                    // ---- Miss: scattering event ----
-                    if (do_csg > 0u && ms_get(mstate, 0) == 0u) {
-                        // CSG mode: miss while outside all surfaces → terminate
-                        mid = MEDIUM_DEAD;
-                    } else {
-                        float L = slen / prop.mus;
-                        accumulate(pos, dir, mid, weight, tof, L);
-                        pos += dir * L;
-                        weight *= exp(-prop.mua * L);
-                        tof += L * INV_C0 * prop.n;
-                        dir = scatter_dir(dir, prop.g, rng);
-                        slen = rand_scatlen(rng);
+                    // Mesh mode: direct front/back lookup
+                    uint new_mid = ff ? bm : fm;
+
+                    if (do_reflect > 0u && new_mid != MEDIUM_AMBIENT
+                            && prop.n != media[new_mid].n) {
+                        vec3 N = ff ? -face_normal[tri * 2].xyz : face_normal[tri * 2].xyz;
+
+                        if (do_reflection(N, prop.n, media[new_mid].n, rng, pos, dir)) {
+                            new_mid = ff ? fm : bm;
+                        }
                     }
+
+                    mid = new_mid;
+
+                    if (mid == MEDIUM_AMBIENT) {
+                        mid = MEDIUM_DEAD;
+                    }
+                }
+
+            } else if (!hit && !is_transparent) {
+                // ---- Miss: scattering event (only for scattering media) ----
+                if (do_csg > 0u && ms_get(mstate, 0) == 0u) {
+                    mid = MEDIUM_DEAD;
+                } else {
+                    float L = slen / prop.mus;
+                    accumulate(pos, dir, mid, weight, tof, L);
+                    pos += dir * L;
+                    weight *= exp(-prop.mua * L);
+                    tof += L * INV_C0 * prop.n;
+                    dir = scatter_dir(dir, prop.g, rng);
+                    slen = rand_scatlen(rng);
                 }
             }
         }
