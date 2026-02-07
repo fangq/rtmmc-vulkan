@@ -23,34 +23,48 @@
 #include <algorithm>
 #include <string>
 #include "vkmmc_io.h"
+#include "vkmmc_shapes.h"
 
-// ---- MCParams uniform (must match std140 in vkmmc_core.comp) ----
+#ifndef VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME
+    #define VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME "VK_EXT_shader_atomic_float"
+#endif
+#ifndef VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT
+    #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT ((VkStructureType)1000260000)
+#endif
+#ifndef VK_EXT_shader_atomic_float
+typedef struct VkPhysicalDeviceShaderAtomicFloatFeaturesEXT {
+    VkStructureType sType;
+    void* pNext;
+    VkBool32 shaderBufferFloat32Atomics, shaderBufferFloat32AtomicAdd;
+    VkBool32 shaderBufferFloat64Atomics, shaderBufferFloat64AtomicAdd;
+    VkBool32 shaderSharedFloat32Atomics, shaderSharedFloat32AtomicAdd;
+    VkBool32 shaderSharedFloat64Atomics, shaderSharedFloat64AtomicAdd;
+    VkBool32 shaderImageFloat32Atomics, shaderImageFloat32AtomicAdd;
+    VkBool32 sparseImageFloat32Atomics, sparseImageFloat32AtomicAdd;
+} VkPhysicalDeviceShaderAtomicFloatFeaturesEXT;
+#endif
+
+/* ================================================================ */
+/*                       MCParams uniform                           */
+/* ================================================================ */
 struct MCParams {
-    int      srctype;           // 0
-    int      _p0, _p1, _p2;    // 4,8,12
-    float    srcpos[4];         // 16
-    float    srcdir[4];         // 32
-    float    srcparam1[4];      // 48
-    float    srcparam2[4];      // 64
-    float    nmin[4];           // 80
-    float    nmax[4];           // 96
-    uint32_t crop0[4];          // 112
-    float    dstep;             // 128
-    float    tstart, tend, Rtstep; // 132,136,140
-    int      maxgate;           // 144
-    uint32_t mediumid0;         // 148
-    uint32_t isreflect;         // 152
-    int      outputtype;        // 156
-    int      threadphoton;      // 160
-    int      oddphoton;         // 164
-    uint32_t total_threads;     // 168
-    uint32_t num_media;         // 172
-    uint32_t seed;              // 176
-    uint32_t _pad[3];           // 180 — pad to 192
+    int      srctype;
+    int _p0, _p1, _p2;
+    float    srcpos[4], srcdir[4], srcparam1[4], srcparam2[4];
+    float    nmin[4], nmax[4];
+    uint32_t crop0[4];
+    float    dstep, tstart, tend, Rtstep;
+    int      maxgate;
+    uint32_t mediumid0, isreflect;
+    int      outputtype, threadphoton, oddphoton;
+    uint32_t total_threads, num_media, seed, do_csg;
+    uint32_t _pad[2];
 };
 
-// ---- Vulkan helpers ----
-#define VK_CHECK(x) do{VkResult r=(x);if(r!=VK_SUCCESS){fprintf(stderr,"Vulkan error %d at %s:%d\n",r,__FILE__,__LINE__);abort();}}while(0)
+/* ================================================================ */
+/*                       Vulkan helpers                             */
+/* ================================================================ */
+#define VK_CHECK(x) do{VkResult r=(x);if(r!=VK_SUCCESS){fprintf(stderr,"VK error %d at %s:%d\n",r,__FILE__,__LINE__);abort();}}while(0)
 
 struct VulkanCtx {
     VkInstance instance;
@@ -89,13 +103,13 @@ uint32_t find_mem_type(VkPhysicalDevice pd, uint32_t filter, VkMemoryPropertyFla
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(pd, &mp);
 
-    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) if ((filter & (1u << i)) && (mp.memoryTypes[i].propertyFlags & props) == props) {
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        if ((filter & (1u << i)) && (mp.memoryTypes[i].propertyFlags & props) == props) {
             return i;
         }
 
     throw std::runtime_error("no suitable memory type");
 }
-
 Buffer create_buffer(VulkanCtx& c, VkDeviceSize sz, VkBufferUsageFlags usage, VkMemoryPropertyFlags memP) {
     Buffer b;
     b.size = sz;
@@ -117,30 +131,21 @@ Buffer create_buffer(VulkanCtx& c, VkDeviceSize sz, VkBufferUsageFlags usage, Vk
         ai.pNext = &fl;
     }
 
-    VkResult mr = vkAllocateMemory(c.device, &ai, NULL, &b.mem);
-
-    if (mr != VK_SUCCESS) {
-        fprintf(stderr, "vkAllocateMemory failed(%d) for %lu bytes\n", mr, (unsigned long)ai.allocationSize);
-        abort();
-    }
-
+    VK_CHECK(vkAllocateMemory(c.device, &ai, NULL, &b.mem));
     VK_CHECK(vkBindBufferMemory(c.device, b.buf, b.mem, 0));
     return b;
 }
-
 void upload_host(VulkanCtx& c, Buffer& b, const void* data, VkDeviceSize sz) {
     void* p;
     VK_CHECK(vkMapMemory(c.device, b.mem, 0, sz, 0, &p));
     memcpy(p, data, sz);
     vkUnmapMemory(c.device, b.mem);
 }
-
 VkDeviceAddress get_addr(VulkanCtx& c, VkBuffer buf) {
     VkBufferDeviceAddressInfo info = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     info.buffer = buf;
     return c.pfnGetBufAddr(c.device, &info);
 }
-
 void destroy_buf(VulkanCtx& c, Buffer& b) {
     if (b.buf) {
         vkDestroyBuffer(c.device, b.buf, NULL);
@@ -152,7 +157,6 @@ void destroy_buf(VulkanCtx& c, Buffer& b) {
 
     b = Buffer();
 }
-
 VkCommandBuffer begin_cmd(VulkanCtx& c) {
     VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = c.cmdPool;
@@ -165,7 +169,6 @@ VkCommandBuffer begin_cmd(VulkanCtx& c) {
     VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
     return cmd;
 }
-
 void end_submit(VulkanCtx& c, VkCommandBuffer cmd) {
     VK_CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -175,12 +178,9 @@ void end_submit(VulkanCtx& c, VkCommandBuffer cmd) {
     VK_CHECK(vkQueueWaitIdle(c.queue));
     vkFreeCommandBuffers(c.device, c.cmdPool, 1, &cmd);
 }
-
-// ---- Device-local buffer helpers (staging upload/download) ----
 Buffer create_device_buffer(VulkanCtx& c, VkDeviceSize sz, VkBufferUsageFlags usage) {
     return create_buffer(c, sz, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 }
-
 void upload_to_device(VulkanCtx& c, Buffer& dst, const void* data, VkDeviceSize sz) {
     Buffer stg = create_buffer(c, sz, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     upload_host(c, stg, data, sz);
@@ -190,7 +190,6 @@ void upload_to_device(VulkanCtx& c, Buffer& dst, const void* data, VkDeviceSize 
     end_submit(c, cmd);
     destroy_buf(c, stg);
 }
-
 void download_from_device(VulkanCtx& c, Buffer& src, void* data, VkDeviceSize sz) {
     Buffer stg = create_buffer(c, sz, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkCommandBuffer cmd = begin_cmd(c);
@@ -204,40 +203,9 @@ void download_from_device(VulkanCtx& c, Buffer& src, void* data, VkDeviceSize sz
     destroy_buf(c, stg);
 }
 
-void zero_device_buffer(VulkanCtx& c, Buffer& dst, VkDeviceSize sz) {
-    VkCommandBuffer cmd = begin_cmd(c);
-    vkCmdFillBuffer(cmd, dst.buf, 0, sz, 0);
-    end_submit(c, cmd);
-}
-
-// Ensure extension name is defined (older Vulkan headers may lack it)
-#ifndef VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME
-    #define VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME "VK_EXT_shader_atomic_float"
-#endif
-#ifndef VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT
-    #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT ((VkStructureType)1000260000)
-#endif
-
-#ifndef VK_EXT_shader_atomic_float
-typedef struct VkPhysicalDeviceShaderAtomicFloatFeaturesEXT {
-    VkStructureType sType;
-    void* pNext;
-    VkBool32 shaderBufferFloat32Atomics;
-    VkBool32 shaderBufferFloat32AtomicAdd;
-    VkBool32 shaderBufferFloat64Atomics;
-    VkBool32 shaderBufferFloat64AtomicAdd;
-    VkBool32 shaderSharedFloat32Atomics;
-    VkBool32 shaderSharedFloat32AtomicAdd;
-    VkBool32 shaderSharedFloat64Atomics;
-    VkBool32 shaderSharedFloat64AtomicAdd;
-    VkBool32 shaderImageFloat32Atomics;
-    VkBool32 shaderImageFloat32AtomicAdd;
-    VkBool32 sparseImageFloat32Atomics;
-    VkBool32 sparseImageFloat32AtomicAdd;
-} VkPhysicalDeviceShaderAtomicFloatFeaturesEXT;
-#endif
-
-// ---- Vulkan init ----
+/* ================================================================ */
+/*                       Vulkan init                                */
+/* ================================================================ */
 void list_vulkan_gpus() {
     VkInstance inst;
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -254,57 +222,50 @@ void list_vulkan_gpus() {
     vkEnumeratePhysicalDevices(inst, &cnt, NULL);
     std::vector<VkPhysicalDevice> pds(cnt);
     vkEnumeratePhysicalDevices(inst, &cnt, pds.data());
-    const char* dtypes[] = {"other", "integrated", "discrete", "virtual", "cpu"};
+    const char* dt[] = {"other", "integrated", "discrete", "virtual", "cpu"};
     printf("========================== Vulkan GPU Devices ==========================\n");
-    int devid = 0;
+    int did = 0;
 
     for (size_t j = 0; j < pds.size(); j++) {
-        VkPhysicalDeviceProperties props;
-        vkGetPhysicalDeviceProperties(pds[j], &props);
+        VkPhysicalDeviceProperties pr;
+        vkGetPhysicalDeviceProperties(pds[j], &pr);
         VkPhysicalDeviceMemoryProperties mp;
         vkGetPhysicalDeviceMemoryProperties(pds[j], &mp);
-        // Check ray query support
         uint32_t ec = 0;
         vkEnumerateDeviceExtensionProperties(pds[j], NULL, &ec, NULL);
         std::vector<VkExtensionProperties> exts(ec);
         vkEnumerateDeviceExtensionProperties(pds[j], NULL, &ec, exts.data());
-        bool hasRQ = false, hasAS = false, hasAF = false;
+        bool rq = false, as = false, af = false;
 
         for (size_t k = 0; k < exts.size(); k++) {
             if (!strcmp(exts[k].extensionName, VK_KHR_RAY_QUERY_EXTENSION_NAME)) {
-                hasRQ = true;
+                rq = true;
             }
 
             if (!strcmp(exts[k].extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
-                hasAS = true;
+                as = true;
             }
 
             if (!strcmp(exts[k].extensionName, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
-                hasAF = true;
+                af = true;
             }
         }
 
-        uint64_t totalmem = 0;
+        uint64_t tm = 0;
 
         for (uint32_t h = 0; h < mp.memoryHeapCount; h++) if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-                totalmem += mp.memoryHeaps[h].size;
+                tm += mp.memoryHeaps[h].size;
             }
 
-        bool usable = hasRQ && hasAS;
+        bool ok = rq && as;
 
-        if (usable) {
-            devid++;
+        if (ok) {
+            did++;
         }
 
-        printf("============ GPU device ID %d [%zu of %u]: %s %s============\n", usable ? devid : 0, j + 1, cnt, props.deviceName, usable ? "" : "(not usable) ");
-        printf(" Device %zu of %u:\t\t%s\n", j + 1, cnt, props.deviceName);
-        printf(" Vendor ID      :\t0x%04x\n", props.vendorID);
-        printf(" Device type    :\t%s\n", dtypes[props.deviceType < 5 ? props.deviceType : 0]);
-        printf(" API version    :\t%u.%u.%u\n", VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion));
-        printf(" Global memory  :\t%lu B\n", (unsigned long)totalmem);
-        printf(" Ray query      :\t%s\n", hasRQ ? "Yes" : "No");
-        printf(" Accel structure:\t%s\n", hasAS ? "Yes" : "No");
-        printf(" Atomic float   :\t%s\n", hasAF ? "Yes" : "No");
+        printf("============ GPU device ID %d [%zu of %u]: %s %s============\n", ok ? did : 0, j + 1, cnt, pr.deviceName, ok ? "" : "(not usable) ");
+        printf(" Vendor ID      :\t0x%04x\n Device type    :\t%s\n Global memory  :\t%lu B\n", pr.vendorID, dt[pr.deviceType < 5 ? pr.deviceType : 0], (unsigned long)tm);
+        printf(" Ray query      :\t%s\n Accel structure:\t%s\n Atomic float   :\t%s\n", rq ? "Yes" : "No", as ? "Yes" : "No", af ? "Yes" : "No");
     }
 
     vkDestroyInstance(inst, NULL);
@@ -323,12 +284,14 @@ VulkanCtx init_vulkan(int gpuid) {
     std::vector<VkPhysicalDevice> pds(cnt);
     vkEnumeratePhysicalDevices(c.instance, &cnt, pds.data());
 
+    std::vector<VkPhysicalDevice> usable;
+
     for (size_t j = 0; j < pds.size(); j++) {
         uint32_t ec = 0;
         vkEnumerateDeviceExtensionProperties(pds[j], NULL, &ec, NULL);
         std::vector<VkExtensionProperties> exts(ec);
         vkEnumerateDeviceExtensionProperties(pds[j], NULL, &ec, exts.data());
-        bool ok[4] = {false, false, false, false};
+        bool ok[4] = {};
 
         for (size_t k = 0; k < exts.size(); k++) {
             if (!strcmp(exts[k].extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
@@ -349,13 +312,36 @@ VulkanCtx init_vulkan(int gpuid) {
         }
 
         if (ok[0] && ok[1] && ok[2] && ok[3]) {
-            c.physDev = pds[j];
-            break;
+            usable.push_back(pds[j]);
         }
     }
 
-    if (!c.physDev) {
+    if (usable.empty()) {
         throw std::runtime_error("No GPU with ray query support");
+    }
+
+    if (gpuid >= 1 && gpuid <= (int)usable.size()) {
+        c.physDev = usable[gpuid - 1];
+    } else {
+        for (size_t j = 0; j < usable.size(); j++) {
+            VkPhysicalDeviceProperties p2;
+            vkGetPhysicalDeviceProperties(usable[j], &p2);
+
+            if (p2.vendorID == 0x10DE && p2.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+                c.physDev = usable[j];
+                break;
+            }
+        }
+
+        if (!c.physDev) {
+            c.physDev = usable[0];
+        }
+    }
+
+    {
+        VkPhysicalDeviceProperties p2;
+        vkGetPhysicalDeviceProperties(c.physDev, &p2);
+        printf("Selected GPU [%d/%d]: %s (vendor=0x%04x type=%d)\n", gpuid ? gpuid : 1, (int)usable.size(), p2.deviceName, p2.vendorID, p2.deviceType);
     }
 
     uint32_t qfc = 0;
@@ -374,9 +360,34 @@ VulkanCtx init_vulkan(int gpuid) {
     qci.queueFamilyIndex = c.computeQF;
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
-    const char* devExts[] = {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, VK_KHR_RAY_QUERY_EXTENSION_NAME, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME};
+
+    VkPhysicalDeviceProperties devPr;
+    vkGetPhysicalDeviceProperties(c.physDev, &devPr);
+    bool isNV = (devPr.vendorID == 0x10DE), hasAF = false;
+
+    if (isNV) {
+        uint32_t ec2 = 0;
+        vkEnumerateDeviceExtensionProperties(c.physDev, NULL, &ec2, NULL);
+        std::vector<VkExtensionProperties> ex2(ec2);
+        vkEnumerateDeviceExtensionProperties(c.physDev, NULL, &ec2, ex2.data());
+
+        for (size_t k = 0; k < ex2.size(); k++)if (!strcmp(ex2[k].extensionName, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
+                hasAF = true;
+            }
+    }
+
+    const char* devExts[] = {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, VK_KHR_RAY_QUERY_EXTENSION_NAME,
+                             VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME
+                            };
+    int nExts = hasAF ? 5 : 4;
+
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT saf;
+    memset(&saf, 0, sizeof(saf));
+    saf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+    saf.shaderBufferFloat32AtomicAdd = VK_TRUE;
     VkPhysicalDeviceBufferDeviceAddressFeatures bda = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
     bda.bufferDeviceAddress = VK_TRUE;
+    bda.pNext = hasAF ? (void*)&saf : NULL;
     VkPhysicalDeviceAccelerationStructureFeaturesKHR asf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     asf.accelerationStructure = VK_TRUE;
     asf.pNext = &bda;
@@ -389,15 +400,21 @@ VulkanCtx init_vulkan(int gpuid) {
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 4;
+    dci.enabledExtensionCount = nExts;
     dci.ppEnabledExtensionNames = devExts;
     dci.pNext = &v12;
     VK_CHECK(vkCreateDevice(c.physDev, &dci, NULL, &c.device));
     vkGetDeviceQueue(c.device, c.computeQF, 0, &c.queue);
+
+    if (hasAF) {
+        printf("GPU supports native atomicAdd(float)\n");
+    }
+
     VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpi.queueFamilyIndex = c.computeQF;
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     VK_CHECK(vkCreateCommandPool(c.device, &cpi, NULL, &c.cmdPool));
+
     c.pfnGetBufAddr = (PFN_vkGetBufferDeviceAddressKHR)vkGetDeviceProcAddr(c.device, "vkGetBufferDeviceAddressKHR");
     c.pfnCreateAS = (PFN_vkCreateAccelerationStructureKHR)vkGetDeviceProcAddr(c.device, "vkCreateAccelerationStructureKHR");
     c.pfnDestroyAS = (PFN_vkDestroyAccelerationStructureKHR)vkGetDeviceProcAddr(c.device, "vkDestroyAccelerationStructureKHR");
@@ -407,11 +424,13 @@ VulkanCtx init_vulkan(int gpuid) {
     return c;
 }
 
-// ---- Build TLAS ----
+/* ================================================================ */
+/*                       Build TLAS                                 */
+/* ================================================================ */
 AccelStruct build_tlas(VulkanCtx& c, AccelStruct& blas) {
     VkAccelerationStructureDeviceAddressInfoKHR ai = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
     ai.accelerationStructure = blas.handle;
-    VkDeviceAddress blasAddr = c.pfnGetASAddr(c.device, &ai);
+    VkDeviceAddress ba = c.pfnGetASAddr(c.device, &ai);
     VkAccelerationStructureInstanceKHR inst;
     memset(&inst, 0, sizeof(inst));
     inst.transform.matrix[0][0] = 1.f;
@@ -419,10 +438,9 @@ AccelStruct build_tlas(VulkanCtx& c, AccelStruct& blas) {
     inst.transform.matrix[2][2] = 1.f;
     inst.mask = 0xFF;
     inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-    inst.accelerationStructureReference = blasAddr;
+    inst.accelerationStructureReference = ba;
     const VkBufferUsageFlags gu = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    Buffer ib = create_buffer(c, sizeof(inst), gu, hv);
+    Buffer ib = create_buffer(c, sizeof(inst), gu, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     upload_host(c, ib, &inst, sizeof(inst));
     VkAccelerationStructureGeometryInstancesDataKHR id = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR};
     id.data.deviceAddress = get_addr(c, ib.buf);
@@ -438,7 +456,8 @@ AccelStruct build_tlas(VulkanCtx& c, AccelStruct& blas) {
     VkAccelerationStructureBuildSizesInfoKHR sz = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
     c.pfnGetASBuildSizes(c.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bi, &ic, &sz);
     AccelStruct as;
-    as.buffer = create_buffer(c, sz.accelerationStructureSize, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    as.buffer = create_buffer(c, sz.accelerationStructureSize,
+                              VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     VkAccelerationStructureCreateInfoKHR asci = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
     asci.buffer = as.buffer.buf;
     asci.size = sz.accelerationStructureSize;
@@ -459,7 +478,9 @@ AccelStruct build_tlas(VulkanCtx& c, AccelStruct& blas) {
     return as;
 }
 
-// ---- Compute pipeline ----
+/* ================================================================ */
+/*                       Compute pipeline                           */
+/* ================================================================ */
 std::vector<uint32_t> load_spirv(const char* path) {
     std::ifstream f(path, std::ios::ate | std::ios::binary);
 
@@ -473,79 +494,77 @@ std::vector<uint32_t> load_spirv(const char* path) {
     f.read(reinterpret_cast<char*>(code.data()), sz);
     return code;
 }
-
 ComputePipe create_pipeline(VulkanCtx& c, const char* spirv) {
     ComputePipe cp;
     memset(&cp, 0, sizeof(cp));
-    VkDescriptorSetLayoutBinding bindings[6];
-    memset(bindings, 0, sizeof(bindings));
-    bindings[0].binding = 0;
-    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-    bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding bn[6];
+    memset(bn, 0, sizeof(bn));
+    bn[0].binding = 0;
+    bn[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    bn[0].descriptorCount = 1;
+    bn[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     for (int i = 1; i <= 3; i++) {
-        bindings[i].binding = (uint32_t)i;
-        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[i].descriptorCount = 1;
-        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bn[i].binding = (uint32_t)i;
+        bn[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bn[i].descriptorCount = 1;
+        bn[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
 
-    bindings[4].binding = 4;
-    bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    bindings[4].descriptorCount = 1;
-    bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    bindings[5].binding = 5;
-    bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bindings[5].descriptorCount = 1;
-    bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutCreateInfo dslci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslci.bindingCount = 6;
-    dslci.pBindings = bindings;
-    VK_CHECK(vkCreateDescriptorSetLayout(c.device, &dslci, NULL, &cp.descLayout));
-    VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plci.setLayoutCount = 1;
-    plci.pSetLayouts = &cp.descLayout;
-    VK_CHECK(vkCreatePipelineLayout(c.device, &plci, NULL, &cp.pipeLayout));
+    bn[4].binding = 4;
+    bn[4].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bn[4].descriptorCount = 1;
+    bn[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bn[5].binding = 5;
+    bn[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bn[5].descriptorCount = 1;
+    bn[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo dl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dl.bindingCount = 6;
+    dl.pBindings = bn;
+    VK_CHECK(vkCreateDescriptorSetLayout(c.device, &dl, NULL, &cp.descLayout));
+    VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pl.setLayoutCount = 1;
+    pl.pSetLayouts = &cp.descLayout;
+    VK_CHECK(vkCreatePipelineLayout(c.device, &pl, NULL, &cp.pipeLayout));
     std::vector<uint32_t> code = load_spirv(spirv);
-    VkShaderModuleCreateInfo smci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smci.codeSize = code.size() * 4;
-    smci.pCode = code.data();
-    VkShaderModule sm;
-    VK_CHECK(vkCreateShaderModule(c.device, &smci, NULL, &sm));
-
-    VkPipelineShaderStageCreateInfo stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-    stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    stage.module = sm;
-    stage.pName = "main";
-    VkComputePipelineCreateInfo cpci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    cpci.stage = stage;
-    cpci.layout = cp.pipeLayout;
-    VK_CHECK(vkCreateComputePipelines(c.device, VK_NULL_HANDLE, 1, &cpci, NULL, &cp.pipeline));
-    vkDestroyShaderModule(c.device, sm, NULL);
+    VkShaderModuleCreateInfo sm = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    sm.codeSize = code.size() * 4;
+    sm.pCode = code.data();
+    VkShaderModule mod;
+    VK_CHECK(vkCreateShaderModule(c.device, &sm, NULL, &mod));
+    VkPipelineShaderStageCreateInfo st = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    st.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    st.module = mod;
+    st.pName = "main";
+    VkComputePipelineCreateInfo cp2 = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cp2.stage = st;
+    cp2.layout = cp.pipeLayout;
+    VK_CHECK(vkCreateComputePipelines(c.device, VK_NULL_HANDLE, 1, &cp2, NULL, &cp.pipeline));
+    vkDestroyShaderModule(c.device, mod, NULL);
     VkDescriptorPoolSize ps[] = {{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}};
-    VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpci.maxSets = 1;
-    dpci.poolSizeCount = 3;
-    dpci.pPoolSizes = ps;
-    VK_CHECK(vkCreateDescriptorPool(c.device, &dpci, NULL, &cp.descPool));
-    VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dsai.descriptorPool = cp.descPool;
-    dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts = &cp.descLayout;
-    VK_CHECK(vkAllocateDescriptorSets(c.device, &dsai, &cp.descSet));
+    VkDescriptorPoolCreateInfo dp = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dp.maxSets = 1;
+    dp.poolSizeCount = 3;
+    dp.pPoolSizes = ps;
+    VK_CHECK(vkCreateDescriptorPool(c.device, &dp, NULL, &cp.descPool));
+    VkDescriptorSetAllocateInfo da = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    da.descriptorPool = cp.descPool;
+    da.descriptorSetCount = 1;
+    da.pSetLayouts = &cp.descLayout;
+    VK_CHECK(vkAllocateDescriptorSets(c.device, &da, &cp.descSet));
     return cp;
 }
-
-void update_desc(VulkanCtx& c, ComputePipe& cp, VkAccelerationStructureKHR tlas, Buffer& faceBuf, Buffer& mediaBuf, Buffer& outBuf, Buffer& paramBuf, Buffer& seedBuf) {
-    VkWriteDescriptorSetAccelerationStructureKHR asW = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
-    asW.accelerationStructureCount = 1;
-    asW.pAccelerationStructures = &tlas;
-    VkDescriptorBufferInfo fi = {faceBuf.buf, 0, VK_WHOLE_SIZE}, mi = {mediaBuf.buf, 0, VK_WHOLE_SIZE}, oi = {outBuf.buf, 0, VK_WHOLE_SIZE}, pi = {paramBuf.buf, 0, VK_WHOLE_SIZE}, si = {seedBuf.buf, 0, VK_WHOLE_SIZE};
+void update_desc(VulkanCtx& c, ComputePipe& cp, VkAccelerationStructureKHR tlas,
+                 Buffer& fb, Buffer& mb, Buffer& ob, Buffer& pb, Buffer& sb) {
+    VkWriteDescriptorSetAccelerationStructureKHR aw = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
+    aw.accelerationStructureCount = 1;
+    aw.pAccelerationStructures = &tlas;
+    VkDescriptorBufferInfo fi = {fb.buf, 0, VK_WHOLE_SIZE}, mi = {mb.buf, 0, VK_WHOLE_SIZE}, oi = {ob.buf, 0, VK_WHOLE_SIZE}, pi = {pb.buf, 0, VK_WHOLE_SIZE}, si = {sb.buf, 0, VK_WHOLE_SIZE};
     VkWriteDescriptorSet w[6];
     memset(w, 0, sizeof(w));
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w[0].pNext = &asW;
+    w[0].pNext = &aw;
     w[0].dstSet = cp.descSet;
     w[0].dstBinding = 0;
     w[0].descriptorCount = 1;
@@ -567,29 +586,29 @@ void update_desc(VulkanCtx& c, ComputePipe& cp, VkAccelerationStructureKHR tlas,
     vkUpdateDescriptorSets(c.device, 6, w, 0, NULL);
 }
 
-// ---- CLI parsing (matching umcx.cpp) ----
+/* ================================================================ */
+/*                       CLI parsing                                */
+/* ================================================================ */
 struct CmdOverrides {
     uint64_t nphoton, batch_size;
     uint32_t rng_seed, totalthread;
     float unitinmm;
-    int outputtype, isreflect, isnormalize;
-    int gpuid;
-    bool listgpu;
-    std::string session_id, json_str;
-    bool dumpjson;
-    CmdOverrides(): nphoton(0), batch_size(UINT64_MAX), rng_seed(0), totalthread(0), unitinmm(0), outputtype(-1), isreflect(-1), isnormalize(-1), gpuid(0), listgpu(false), dumpjson(false) {}
+    int outputtype, isreflect, isnormalize, gpuid;
+    bool listgpu, dumpjson, dumpmesh;
+    std::string session_id, json_str, inputfile;
+    CmdOverrides(): nphoton(0), batch_size(UINT64_MAX), rng_seed(0), totalthread(0), unitinmm(0),
+        outputtype(-1), isreflect(-1), isnormalize(-1), gpuid(0), listgpu(false), dumpjson(false), dumpmesh(false) {}
 };
-
 void printhelp(const char* n) {
-    printf("Vulkan RT-MMC — Ray-tracing accelerated mesh Monte Carlo\nUsage: %s input.json  OR  %s -f input.json [flags]\n\n"
-           "Flags:\n -f/--input\tJSON file\n -n/--photon\tphoton number\n -s/--session\tsession name\n -u/--unitinmm\tvoxel size [1]\n"
-           " -E/--seed\tRNG seed\n -O/--outputtype\tx:energy,f:flux,l:fluence\n -b/--reflect\tmismatch [1]\n -U/--normalize\t[1]\n"
-           " -S/--save2pt\tsave volume [1]\n -t/--thread\tGPU threads [65536]\n -B/--batch\tphotons/batch [500000, 0=no batch]\n"
-           " -G/--gpuid\tGPU device ID [1]\n -L/--listgpu\tlist all GPUs\n"
-           " -j/--json\tJSON override\n --dumpjson\tdump config\n -h/--help\n", n, n);
+    printf("vkmmc — Vulkan ray-tracing accelerated mesh Monte Carlo\n"
+           "Usage: %s input.json  OR  %s -f input.json [flags]\n\n"
+           "Flags:\n -f/--input\tJSON file\n -n/--photon\tphoton number\n -s/--session\tsession name\n"
+           " -u/--unitinmm\tvoxel size [1]\n -E/--seed\tRNG seed\n -O/--outputtype\tx:energy,f:flux,l:fluence\n"
+           " -b/--reflect\tmismatch [1]\n -U/--normalize\t[1]\n -t/--thread\tGPU threads [65536]\n"
+           " -B/--batch\tphotons/batch [500000, 0=no batch]\n -G/--gpuid\tdevice [1]\n"
+           " -L/--listgpu\tlist GPUs\n --dumpjson\tdump config\n --dumpmesh\tsave mesh JSON\n -h/--help\n", n, n);
     exit(0);
 }
-
 SimConfig parse_cmdline(int argc, char** argv, CmdOverrides& ovr) {
     std::string inputfile;
 
@@ -612,7 +631,7 @@ SimConfig parse_cmdline(int argc, char** argv, CmdOverrides& ovr) {
             ovr.rng_seed = (uint32_t)atoi(argv[++i]);
         } else if ((a == "-O" || a == "--outputtype") && i + 1 < argc) {
             char c2 = argv[++i][0];
-            ovr.outputtype = (c2 == 'f' ? 0 : c2 == 'l' ? 1 : c2 == 'x' ? 2 : 2);
+            ovr.outputtype = (c2 == 'f' ? 0 : c2 == 'l' ? 1 : 2);
         } else if ((a == "-b" || a == "--reflect") && i + 1 < argc) {
             ovr.isreflect = atoi(argv[++i]);
         } else if ((a == "-U" || a == "--normalize") && i + 1 < argc) {
@@ -629,18 +648,21 @@ SimConfig parse_cmdline(int argc, char** argv, CmdOverrides& ovr) {
             ovr.json_str = argv[++i];
         } else if (a == "--dumpjson") {
             ovr.dumpjson = true;
+        } else if (a == "--dumpmesh") {
+            ovr.dumpmesh = true;
         } else if (a == "-h" || a == "--help") {
             printhelp(argv[0]);
         } else if (a[0] != '-' && inputfile.empty()) {
-            inputfile = a;    // positional arg = input file
+            inputfile = a;
         }
     }
 
     if (inputfile.empty()) {
-        fprintf(stderr, "Error: no input JSON file specified\n");
+        fprintf(stderr, "No input JSON\n");
         printhelp(argv[0]);
     }
 
+    ovr.inputfile = inputfile;
     SimConfig cfg = load_json_input(inputfile.c_str());
 
     if (ovr.nphoton > 0) {
@@ -674,11 +696,12 @@ SimConfig parse_cmdline(int argc, char** argv, CmdOverrides& ovr) {
     return cfg;
 }
 
-// ---- Main ----
+/* ================================================================ */
+/*                             Main                                 */
+/* ================================================================ */
 int main(int argc, char** argv) {
     const char* spirvFile = "vkmmc_core.spv";
 
-    // Check if last arg is .spv
     if (argc > 2) {
         std::string la(argv[argc - 1]);
 
@@ -687,9 +710,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    CmdOverrides ovr;
-
-    // Handle -L before full parse (doesn't need input file)
+    // Handle -L early
     for (int i = 1; i < argc; i++) {
         std::string a(argv[i]);
 
@@ -699,16 +720,115 @@ int main(int argc, char** argv) {
         }
     }
 
+    CmdOverrides ovr;
     SimConfig cfg = parse_cmdline(argc, argv, ovr);
 
+    /* ---- Phase 1: Generate CSG mesh if needed ---- */
+    if (cfg.is_csg) {
+        std::ifstream sf(ovr.inputfile.c_str());
+        json jroot;
+        sf >> jroot;
+
+        if (jroot.contains("Shapes") && jroot["Shapes"].is_array()) {
+            float ext[6] = {0, 60, 0, 60, 0, 60};
+            ShapeMesh sm = parse_shapes(jroot["Shapes"], ext);
+            cfg.nodes = sm.nodes;
+            cfg.faces = sm.faces;
+            cfg.facedata = sm.facedata;
+            cfg.face_shape_id = sm.shape_id;
+            update_bbox(cfg);
+        }
+
+        if (cfg.nodes.empty()) {
+            fprintf(stderr, "CSG: no shapes\n");
+            return 1;
+        }
+    }
+
+    /* ---- Phase 2: Handle dump commands (exit before Vulkan) ---- */
     if (ovr.dumpjson) {
-        printf("{\"Session\":{\"ID\":\"%s\",\"Photons\":%lu},\"Mesh\":{\"Nodes\":%lu,\"Faces\":%lu}}\n", cfg.session_id.c_str(), (unsigned long)cfg.nphoton, cfg.nodes.size(), cfg.faces.size());
+        printf("{\"Session\":{\"ID\":\"%s\",\"Photons\":%lu},\"Mesh\":{\"Nodes\":%zu,\"Faces\":%zu}}\n",
+               cfg.session_id.c_str(), (unsigned long)cfg.nphoton, cfg.nodes.size(), cfg.faces.size());
         return 0;
     }
 
+    if (ovr.dumpmesh) {
+        if (cfg.nodes.empty() || cfg.faces.empty()) {
+            fprintf(stderr, "No mesh to dump\n");
+            return 1;
+        }
+
+        // Debug: verify face data
+        printf("Verifying face data (%zu faces):\n", cfg.faces.size());
+
+        for (size_t i = 0; i < cfg.faces.size() && i < 5; i++) {
+            uint32_t pk = 0;
+            memcpy(&pk, &cfg.facedata[i].packed_media, 4);
+            printf("  face[%zu]: v=(%u,%u,%u) n=(%.3f,%.3f,%.3f) front=%u back=%u\n",
+                   i, cfg.faces[i][0], cfg.faces[i][1], cfg.faces[i][2],
+                   cfg.facedata[i].nx, cfg.facedata[i].ny, cfg.facedata[i].nz,
+                   pk >> 16, pk & 0xFFFF);
+        }
+
+        json dump;
+        dump["Session"] = {{"ID", cfg.session_id}, {"Photons", cfg.nphoton}};
+        dump["Forward"] = {{"T0", cfg.t0}, {"T1", cfg.t1}, {"Dt", cfg.dt}};
+        dump["Domain"]["LengthUnit"] = cfg.unitinmm;
+        dump["Domain"]["Media"] = json::array();
+
+        for (size_t i = 0; i < cfg.media.size(); i++)
+            dump["Domain"]["Media"].push_back({{"mua", cfg.media[i].mua / cfg.unitinmm}, {"mus", cfg.media[i].mus / cfg.unitinmm}, {"g", cfg.media[i].g}, {"n", cfg.media[i].n}});
+        dump["Optode"]["Source"]["Type"] = (cfg.srctype == 0 ? "pencil" : (cfg.srctype == 4 ? "planar" : (cfg.srctype == 8 ? "disk" : "unknown")));
+        dump["Optode"]["Source"]["Pos"] = {cfg.srcpos[0], cfg.srcpos[1], cfg.srcpos[2]};
+        dump["Optode"]["Source"]["Dir"] = {cfg.srcdir[0], cfg.srcdir[1], cfg.srcdir[2], cfg.srcdir[3]};
+
+        size_t nn = cfg.nodes.size(), nf = cfg.faces.size();
+        std::vector<float> nd(nn * 3);
+
+        for (size_t i = 0; i < nn; i++) {
+            nd[i * 3] = cfg.nodes[i].x;
+            nd[i * 3 + 1] = cfg.nodes[i].y;
+            nd[i * 3 + 2] = cfg.nodes[i].z;
+        }
+
+        std::vector<size_t> ndim;
+        ndim.push_back(nn);
+        ndim.push_back(3);
+        dump["Shapes"]["MeshNode"] = jdata_encode("single", ndim, nd.data(), nn * 3 * sizeof(float), false);
+
+        std::vector<int32_t> sd(nf * 4);
+
+        for (size_t i = 0; i < nf; i++) {
+            sd[i * 4]     = (int32_t)(cfg.faces[i][0] + 1);
+            sd[i * 4 + 1] = (int32_t)(cfg.faces[i][1] + 1);
+            sd[i * 4 + 2] = (int32_t)(cfg.faces[i][2] + 1);
+
+            // Use shape ID (1-based) if available, otherwise fall back to tag
+            if (i < cfg.face_shape_id.size()) {
+                sd[i * 4 + 3] = (int32_t)cfg.face_shape_id[i];
+            } else {
+                uint32_t pk = 0;
+                memcpy(&pk, &cfg.facedata[i].packed_media, 4);
+                sd[i * 4 + 3] = (int32_t)(pk & 0xFFFF);
+            }
+        }
+
+        std::vector<size_t> sdim;
+        sdim.push_back(nf);
+        sdim.push_back(4);
+        dump["Shapes"]["MeshSurf"] = jdata_encode("int32", sdim, sd.data(), nf * 4 * sizeof(int32_t), false);
+
+        std::string mf = cfg.session_id + "_mesh.json";
+        std::ofstream of(mf.c_str());
+        of << dump.dump(2) << std::endl;
+        printf("Mesh saved to %s (%zu nodes, %zu faces, %s mode)\n", mf.c_str(), nn, nf, cfg.is_csg ? "CSG" : "mesh");
+        return 0;
+    }
+
+    /* ---- Phase 3: Vulkan simulation ---- */
     VulkanCtx ctx = init_vulkan(ovr.gpuid);
 
-    // ---- Build BLAS (Single-AS) ----
+    // Build BLAS
     AccelStruct blas, tlas;
     {
         const VkBufferUsageFlags gu = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -726,16 +846,16 @@ int main(int argc, char** argv) {
 
         Buffer ib = create_buffer(ctx, idx.size() * sizeof(uint32_t), gu, hv);
         upload_host(ctx, ib, idx.data(), idx.size()*sizeof(uint32_t));
-        VkAccelerationStructureGeometryTrianglesDataKHR tris = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR};
-        tris.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-        tris.vertexData.deviceAddress = get_addr(ctx, vb.buf);
-        tris.vertexStride = sizeof(Vec3);
-        tris.maxVertex = (uint32_t)cfg.nodes.size() - 1;
-        tris.indexType = VK_INDEX_TYPE_UINT32;
-        tris.indexData.deviceAddress = get_addr(ctx, ib.buf);
+        VkAccelerationStructureGeometryTrianglesDataKHR tr = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR};
+        tr.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        tr.vertexData.deviceAddress = get_addr(ctx, vb.buf);
+        tr.vertexStride = sizeof(Vec3);
+        tr.maxVertex = (uint32_t)cfg.nodes.size() - 1;
+        tr.indexType = VK_INDEX_TYPE_UINT32;
+        tr.indexData.deviceAddress = get_addr(ctx, ib.buf);
         VkAccelerationStructureGeometryKHR geom = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
         geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-        geom.geometry.triangles = tris;
+        geom.geometry.triangles = tr;
         geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
         VkAccelerationStructureBuildGeometryInfoKHR bi = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
         bi.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
@@ -746,18 +866,18 @@ int main(int argc, char** argv) {
         VkAccelerationStructureBuildSizesInfoKHR sz = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
         ctx.pfnGetASBuildSizes(ctx.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bi, &pc, &sz);
         blas.buffer = create_buffer(ctx, sz.accelerationStructureSize, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        VkAccelerationStructureCreateInfoKHR asci = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
-        asci.buffer = blas.buffer.buf;
-        asci.size = sz.accelerationStructureSize;
-        asci.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-        ctx.pfnCreateAS(ctx.device, &asci, NULL, &blas.handle);
+        VkAccelerationStructureCreateInfoKHR ac = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+        ac.buffer = blas.buffer.buf;
+        ac.size = sz.accelerationStructureSize;
+        ac.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        ctx.pfnCreateAS(ctx.device, &ac, NULL, &blas.handle);
         Buffer scratch = create_buffer(ctx, sz.buildScratchSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         bi.dstAccelerationStructure = blas.handle;
         bi.scratchData.deviceAddress = get_addr(ctx, scratch.buf);
-        VkAccelerationStructureBuildRangeInfoKHR range;
-        memset(&range, 0, sizeof(range));
-        range.primitiveCount = pc;
-        const VkAccelerationStructureBuildRangeInfoKHR* pR = &range;
+        VkAccelerationStructureBuildRangeInfoKHR rng;
+        memset(&rng, 0, sizeof(rng));
+        rng.primitiveCount = pc;
+        const VkAccelerationStructureBuildRangeInfoKHR* pR = &rng;
         VkCommandBuffer cmd = begin_cmd(ctx);
         ctx.pfnCmdBuildAS(cmd, 1, &bi, &pR);
         end_submit(ctx, cmd);
@@ -769,43 +889,41 @@ int main(int argc, char** argv) {
     }
 
     const VkBufferUsageFlags ssbo = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-
-    // GPU buffers (device-local)
     Buffer faceBuf = create_device_buffer(ctx, cfg.facedata.size() * sizeof(FaceData), ssbo);
     upload_to_device(ctx, faceBuf, cfg.facedata.data(), cfg.facedata.size()*sizeof(FaceData));
     Buffer mediaBuf = create_device_buffer(ctx, cfg.media.size() * sizeof(Medium), ssbo);
     upload_to_device(ctx, mediaBuf, cfg.media.data(), cfg.media.size()*sizeof(Medium));
 
     // Output grid
-    float voxel_size = cfg.unitinmm;
+    float vs = cfg.unitinmm;
 
     if (cfg.has_steps) {
-        voxel_size = cfg.steps[0];
+        vs = cfg.steps[0];
     }
 
-    float grid_eps = voxel_size * 0.5f;
-    float gmin[3] = {cfg.nmin.x - grid_eps, cfg.nmin.y - grid_eps, cfg.nmin.z - grid_eps};
-    float gmax[3] = {cfg.nmax.x + grid_eps, cfg.nmax.y + grid_eps, cfg.nmax.z + grid_eps};
-    uint32_t nx = (uint32_t)ceil((gmax[0] - gmin[0]) / voxel_size);
-    uint32_t ny = (uint32_t)ceil((gmax[1] - gmin[1]) / voxel_size);
-    uint32_t nz = (uint32_t)ceil((gmax[2] - gmin[2]) / voxel_size);
-    uint32_t crop0w = nx * ny * nz * cfg.maxgate, outSize = crop0w * 2;
+    float ge = vs * 0.5f;
+    float gmin[3] = {cfg.nmin.x - ge, cfg.nmin.y - ge, cfg.nmin.z - ge};
+    float gmax[3] = {cfg.nmax.x + ge, cfg.nmax.y + ge, cfg.nmax.z + ge};
+    uint32_t nx = (uint32_t)ceil((gmax[0] - gmin[0]) / vs), ny = (uint32_t)ceil((gmax[1] - gmin[1]) / vs), nz = (uint32_t)ceil((gmax[2] - gmin[2]) / vs);
+    uint32_t crop0w = nx * ny * nz * cfg.maxgate, outSz = crop0w * 2;
+    Buffer outBuf = create_device_buffer(ctx, outSz * sizeof(float), ssbo);
+    {
+        VkCommandBuffer cmd = begin_cmd(ctx);
+        vkCmdFillBuffer(cmd, outBuf.buf, 0, outSz * sizeof(float), 0);
+        end_submit(ctx, cmd);
+    }
+    printf("Grid: %ux%ux%u x %d gates, voxel=%.3fmm, origin=[%.2f,%.2f,%.2f]\n", nx, ny, nz, cfg.maxgate, vs, gmin[0], gmin[1], gmin[2]);
 
-    Buffer outBuf = create_device_buffer(ctx, outSize * sizeof(float), ssbo);
-    zero_device_buffer(ctx, outBuf, outSize * sizeof(float));
+    // Threads
+    uint32_t tt = (ovr.totalthread > 0) ? ovr.totalthread : 65536;
 
-    // Thread setup
-    uint32_t totalthread = (ovr.totalthread > 0) ? ovr.totalthread : 65536;
+    if (cfg.nphoton < tt) {
+        tt = ((uint32_t)cfg.nphoton + 63) / 64 * 64;
 
-    if (cfg.nphoton < totalthread) {
-        totalthread = ((uint32_t)cfg.nphoton + 63) / 64 * 64;
-
-        if (totalthread == 0) {
-            totalthread = 64;
+        if (!tt) {
+            tt = 64;
         }
     }
-
-    printf("Grid: %ux%ux%u x %d gates, voxel=%.3fmm, origin=[%.2f,%.2f,%.2f]\n", nx, ny, nz, cfg.maxgate, voxel_size, gmin[0], gmin[1], gmin[2]);
 
     MCParams params;
     memset(&params, 0, sizeof(params));
@@ -831,7 +949,7 @@ int main(int argc, char** argv) {
     params.crop0[1] = nx * ny;
     params.crop0[2] = nx * ny * nz;
     params.crop0[3] = crop0w;
-    params.dstep = 1.0f / voxel_size;
+    params.dstep = 1.0f / vs;
     params.tstart = cfg.t0;
     params.tend = cfg.t1;
     params.Rtstep = 1.0f / cfg.dt;
@@ -839,135 +957,124 @@ int main(int argc, char** argv) {
     params.mediumid0 = cfg.mediumid0;
     params.isreflect = cfg.do_mismatch ? 1u : 0u;
     params.outputtype = cfg.output_type;
-    params.total_threads = totalthread;
+    params.total_threads = tt;
     params.num_media = (uint32_t)cfg.media.size();
     params.seed = cfg.rng_seed;
+    params.do_csg = cfg.is_csg ? 1u : 0u;
 
     Buffer paramBuf = create_device_buffer(ctx, sizeof(MCParams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
-    // Seeds
     srand(cfg.rng_seed > 0 ? cfg.rng_seed : (uint32_t)time(0));
     struct uint4_t {
         uint32_t x, y, z, w;
     };
-    std::vector<uint4_t> seeds(totalthread);
+    std::vector<uint4_t> seeds(tt);
 
-    for (uint32_t i = 0; i < totalthread; i++) seeds[i] = {(uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand()};
+    for (uint32_t i = 0; i < tt; i++) seeds[i] = {(uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand()};
 
-    Buffer seedBuf = create_device_buffer(ctx, totalthread * sizeof(uint4_t), ssbo);
+    Buffer seedBuf = create_device_buffer(ctx, tt * sizeof(uint4_t), ssbo);
 
-    upload_to_device(ctx, seedBuf, seeds.data(), totalthread * sizeof(uint4_t));
+    upload_to_device(ctx, seedBuf, seeds.data(), tt * sizeof(uint4_t));
 
     ComputePipe cp = create_pipeline(ctx, spirvFile);
 
     update_desc(ctx, cp, tlas.handle, faceBuf, mediaBuf, outBuf, paramBuf, seedBuf);
 
     // Batched dispatch
-    // Batch size: UINT64_MAX = use default (500K), 0 = no batching, else = user value
-    uint64_t photons_per_batch;
+    uint64_t batchsz;
 
     if (ovr.batch_size == 0) {
-        photons_per_batch = cfg.nphoton;    // -B 0 → all photons in one launch
+        batchsz = cfg.nphoton;
     } else if (ovr.batch_size != UINT64_MAX) {
-        photons_per_batch = ovr.batch_size;    // -B N → user-specified
+        batchsz = ovr.batch_size;
     } else {
-        photons_per_batch = 500000;    // default
+        batchsz = 500000;
     }
 
-    uint64_t photons_done = 0;
+    uint64_t pdone = 0;
     int batch = 0;
-    uint32_t wg = totalthread / 64;
-    printf("Threads: %u (%u workgroups x 64), batch: %lu photons\n",
-           totalthread, wg, (unsigned long)photons_per_batch);
+    uint32_t wg = tt / 64;
+    printf("Threads: %u (%u x 64), batch: %lu photons\n", tt, wg, (unsigned long)batchsz);
 
-    typedef std::chrono::high_resolution_clock Clock;
-    double kernel_ms = 0.0;
-    Clock::time_point t_total_start = Clock::now();
+    typedef std::chrono::high_resolution_clock Clk;
+    double kms = 0;
+    Clk::time_point t0 = Clk::now();
 
-    while (photons_done < cfg.nphoton) {
-        uint64_t rem = cfg.nphoton - photons_done;
-        uint64_t bp = std::min(rem, photons_per_batch);
-        params.threadphoton = (int)(bp / totalthread);
-        params.oddphoton = (int)(bp - (uint64_t)params.threadphoton * totalthread);
+    while (pdone < cfg.nphoton) {
+        uint64_t rem = cfg.nphoton - pdone, bp = (rem < batchsz) ? rem : batchsz;
+        params.threadphoton = (int)(bp / tt);
+        params.oddphoton = (int)(bp - (uint64_t)params.threadphoton * tt);
         upload_to_device(ctx, paramBuf, &params, sizeof(params));
-
         VkCommandBuffer cmd = begin_cmd(ctx);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeLayout, 0, 1, &cp.descSet, 0, NULL);
         vkCmdDispatch(cmd, wg, 1, 1);
-
-        Clock::time_point t_kernel_start = Clock::now();
-        end_submit(ctx, cmd); // includes vkQueueWaitIdle
-        kernel_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_kernel_start).count();
-
-        photons_done += bp;
+        Clk::time_point ks = Clk::now();
+        end_submit(ctx, cmd);
+        kms += std::chrono::duration<double, std::milli>(Clk::now() - ks).count();
+        pdone += bp;
         batch++;
-        printf("  batch %d: %lu photons (%lu/%lu)\n", batch, (unsigned long)bp, (unsigned long)photons_done, (unsigned long)cfg.nphoton);
+        printf("  batch %d: %lu photons (%lu/%lu)\n", batch, (unsigned long)bp, (unsigned long)pdone, (unsigned long)cfg.nphoton);
     }
 
-    double total_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_total_start).count();
-    printf("Complete (%d batches), kernel: %.3f ms, total: %.3f ms\n", batch, kernel_ms, total_ms);
-    printf("Speed: %.2f photon/ms (kernel only), %.2f photon/ms (total)\n",
-           (double)cfg.nphoton / kernel_ms, (double)cfg.nphoton / total_ms);
+    double tms = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
+    printf("Done (%d batches), kernel: %.3f ms, total: %.3f ms\n", batch, kms, tms);
+    printf("Speed: %.2f photon/ms (kernel), %.2f photon/ms (total)\n", (double)cfg.nphoton / kms, (double)cfg.nphoton / tms);
 
     // Readback
-    std::vector<float> raw(outSize);
-    download_from_device(ctx, outBuf, raw.data(), outSize * sizeof(float));
+    std::vector<float> raw(outSz);
+    download_from_device(ctx, outBuf, raw.data(), outSz * sizeof(float));
     std::vector<float> fluence(crop0w);
-    double total_absorbed = 0.0;
-    int nan_count = 0, inf_count = 0;
+    double absorbed = 0;
+    int nans = 0, infs = 0;
 
     for (uint32_t i = 0; i < crop0w; i++) {
         fluence[i] = raw[i] + raw[i + crop0w];
 
         if (fluence[i] != fluence[i]) {
-            nan_count++;    // NaN check
-            fluence[i] = 0.f;
+            nans++;
+            fluence[i] = 0;
         } else if (fluence[i] > 1e30f || fluence[i] < -1e30f) {
-            inf_count++;    // Inf check
-            fluence[i] = 0.f;
+            infs++;
+            fluence[i] = 0;
         } else {
-            total_absorbed += fluence[i];
+            absorbed += fluence[i];
         }
     }
 
-    if (nan_count || inf_count) {
-        printf("WARNING: %d NaN, %d Inf voxels detected and zeroed\n", nan_count, inf_count);
+    if (nans || infs) {
+        printf("WARNING: %d NaN, %d Inf voxels zeroed\n", nans, infs);
     }
 
-    // Report absorption before normalization
-    printf("simulated %lu photons, absorbed: %.5f%%\n", (unsigned long)cfg.nphoton, total_absorbed / (double)cfg.nphoton * 100.0);
+    printf("simulated %lu photons, absorbed: %.5f%%\n", (unsigned long)cfg.nphoton, absorbed / (double)cfg.nphoton * 100.0);
 
     if (cfg.do_normalize) {
-        float vv = voxel_size * voxel_size * voxel_size;
+        float vv = vs * vs * vs;
 
         for (uint32_t i = 0; i < crop0w; i++) {
             fluence[i] /= (float)cfg.nphoton * vv;
         }
     }
 
-    // Save JData JSON
-    std::string outname = cfg.session_id + ".jdat";
+    // Save JData
     {
         std::vector<size_t> dims;
+        dims.push_back(nx);
+        dims.push_back(ny);
+        dims.push_back(nz);
 
-        if (cfg.maxgate > 1) dims = {nx, ny, nz, (size_t)cfg.maxgate};
-        else dims = {nx, ny, nz};
+        if (cfg.maxgate > 1) {
+            dims.push_back((size_t)cfg.maxgate);
+        }
 
         json root;
-
         root["Session"] = {{"ID", cfg.session_id}, {"Photons", cfg.nphoton}};
-
         root["Forward"] = {{"T0", cfg.t0}, {"T1", cfg.t1}, {"Dt", cfg.dt}};
-
-        root["Domain"] = {{"LengthUnit", cfg.unitinmm}, {"VoxelSize", voxel_size}, {"Dim", {nx, ny, nz}}, {"Origin", {gmin[0], gmin[1], gmin[2]}}};
-
+        root["Domain"] = {{"LengthUnit", cfg.unitinmm}, {"VoxelSize", vs}, {"Dim", {nx, ny, nz}}, {"Origin", {gmin[0], gmin[1], gmin[2]}}};
         root["Fluence"] = jdata_encode("single", dims, fluence.data(), crop0w * sizeof(float));
-
-        std::ofstream f(outname);
-
-        f << root.dump(2) << std::endl;
-
+        std::string outname = cfg.session_id + ".jdat";
+        std::ofstream of(outname.c_str());
+        of << root.dump(2) << std::endl;
         printf("Output: %s (%ux%ux%u", outname.c_str(), nx, ny, nz);
 
         if (cfg.maxgate > 1) {

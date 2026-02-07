@@ -1,429 +1,568 @@
 /*
  * vkmmc_core.comp — Monte Carlo photon transport via Vulkan ray query
- * Direct port of mmc_optix_core.cu (Single-AS RT-MMC)
+ *
+ * Supports two modes:
+ *   1. Mesh mode (do_csg=0): front/back media labels per triangle (tetrahedral mesh)
+ *   2. CSG mode  (do_csg=1): shape-based, each triangle stores only back-material (Tag).
+ *      A per-photon 8-byte state buffer tracks enclosing surfaces.
+ *      Highest media ID among all enclosing surfaces determines the current medium.
  *
  * For NVIDIA GPUs: uncomment the next line for native atomicAdd(float)
- * For AMD/Intel:   keep it commented out (uses CAS fallback)
- *
  * Compile: glslangValidator --target-env vulkan1.2 -e main -o vkmmc_core.spv vkmmc_core.comp
  */
 #version 460
 #extension GL_EXT_ray_query : require
 
-// Uncomment for NVIDIA (Turing+) — ~10x faster atomic accumulation
+// Uncomment for NVIDIA (Turing+)
 //#define USE_ATOMIC_FLOAT
 
 #ifdef USE_ATOMIC_FLOAT
     #extension GL_EXT_shader_atomic_float : require
 #endif
 
-layout(local_size_x = 64) in;  // workgroup size
+layout(local_size_x = 64) in;
 
 // ==================== Descriptor Bindings ====================
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
 
 layout(std430, set = 0, binding = 1) readonly buffer FaceBuffer {
-    vec4 face_normal[];  // .xyz = normal, .w = packed front/back media
+    vec4 face_normal[];  // .xyz = normal, .w = packed media
 };
 
 struct Medium {
     float mua, mus, g, n;
 };
-
-layout(std430, set = 0, binding = 2) readonly buffer MediaBuffer {
-    Medium media[];
-};
+layout(std430, set = 0, binding = 2) readonly buffer MediaBuffer { Medium media[]; };
 
 #ifdef USE_ATOMIC_FLOAT
-layout(std430, set = 0, binding = 3) buffer OutputBuffer {
-    float output_data[];
-};
+layout(std430, set = 0, binding = 3) buffer OutputBuffer { float output_data[]; };
 #else
-layout(std430, set = 0, binding = 3) buffer OutputBuffer {
-    uint output_data[];
-};
+layout(std430, set = 0, binding = 3) buffer OutputBuffer { uint output_data[]; };
 #endif
 
 layout(std140, set = 0, binding = 4) uniform SimParams {
     int   src_type;
-    int   _pad0, _pad1, _pad2;
-    vec4  src_pos;
-    vec4  src_dir;
-    vec4  src_param1;
-    vec4  src_param2;
-    vec4  grid_min;       // grid origin (nmin)
-    vec4  grid_extent;    // grid size (nmax - nmin)
-    uvec4 grid_stride;    // .x=nx, .y=nx*ny, .z=nx*ny*nz, .w=total_voxels
-    float voxel_scale;    // 1.0 / voxel_size
-    float time_start, time_end, inv_timestep;
+    int _p0, _p1, _p2;
+    vec4  src_pos, src_dir, src_param1, src_param2;
+    vec4  grid_min, grid_extent;
+    uvec4 grid_stride;
+    float voxel_scale, time_start, time_end, inv_timestep;
     int   max_gate;
-    uint  initial_medium;
-    uint  do_reflect;
-    int   output_type;
-    int   photons_per_thread;
-    int   extra_photons;
-    uint  total_threads;
-    uint  num_media;
-    uint  rng_seed;
-    uint  _pad3;
+    uint initial_medium, do_reflect;
+    int   output_type, photons_per_thread, extra_photons;
+    uint  total_threads, num_media, rng_seed;
+    uint  do_csg;     // 0=mesh mode, 1=CSG mode
 };
 
-layout(std430, set = 0, binding = 5) readonly buffer SeedBuffer {
-    uvec4 thread_seeds[];
-};
+layout(std430, set = 0, binding = 5) readonly buffer SeedBuffer { uvec4 thread_seeds[]; };
 
 // ==================== Constants ====================
 
-const float INV_SPEED_OF_LIGHT = 3.335640951981520e-12;  // 1/c0 in s/mm
-const float SAFETY_DIST        = 0.001;     // forward nudge after boundary hit
-const float DOUBLE_SAFETY_DIST = 0.002;     // retraction on reflection
-const float TWO_PI             = 6.28318530717959;
-const float FLOAT_EPSILON      = 1.19209290E-07;
-const float FLOAT_MAX          = 3.402823466e+38;
-const float RAY_MIN_DIST       = 1e-5;      // min ray t to prevent self-intersection
+const float INV_C0       = 3.335640951981520e-12;
+const float SAFETY_DIST  = 0.001;
+const float DOUBLE_SAFETY = 0.002;
+const float TWO_PI       = 6.28318530717959;
+const float FEPS         = 1.19209290E-07;
+const float FMAX         = 3.402823466e+38;
+const float RAY_TMIN     = 1e-5;
 
 const uint MEDIUM_UNKNOWN = 0xFFFFFFFFu;
 const uint MEDIUM_DEAD    = 0xFFFFFFFEu;
 const uint MEDIUM_AMBIENT = 0u;
+const int  OUT_FLUX = 0, OUT_FLUENCE = 1, OUT_ENERGY = 2;
 
-const int OUTPUT_FLUX     = 0;
-const int OUTPUT_FLUENCE  = 1;
-const int OUTPUT_ENERGY   = 2;
+// ==================== RNG (xorshift128+) ====================
 
-// ==================== xorshift128+ RNG ====================
-
-float rand_uniform01(inout uvec4 state) {
-    uvec2 s1 = state.xy, s0 = state.zw;
-    state.xy = s0;
+float rand01(inout uvec4 st) {
+    uvec2 s1 = st.xy, s0 = st.zw;
+    st.xy = s0;
     s1 ^= uvec2(s1.x << 23u, (s1.y << 23u) | (s1.x >> 9u));
-    uvec2 new_s1 = s1 ^ s0
-                   ^ uvec2((s1.x >> 18u) | (s1.y << 14u), s1.y >> 18u)
-                   ^ uvec2((s0.x >>  5u) | (s0.y << 27u), s0.y >>  5u);
-    state.zw = new_s1;
-    uint result_lo = new_s1.x + s0.x;
-    return uintBitsToFloat(0x3F800000u | (result_lo >> 9u)) - 1.0;
+    uvec2 ns = s1 ^ s0 ^ uvec2((s1.x >> 18u) | (s1.y << 14u), s1.y >> 18u)
+               ^ uvec2((s0.x >> 5u) | (s0.y << 27u), s0.y >> 5u);
+    st.zw = ns;
+    return uintBitsToFloat(0x3F800000u | ((ns.x + s0.x) >> 9u)) - 1.0;
 }
 
-float rand_range(inout uvec4 state, float lo, float hi) {
-    return (hi - lo) * rand_uniform01(state) + lo;
+float rand_range(inout uvec4 s, float a, float b) {
+    return (b - a) * rand01(s) + a;
 }
-
-float rand_scatlen(inout uvec4 state) {
-    return -log(rand_uniform01(state) + FLOAT_EPSILON);
+float rand_scatlen(inout uvec4 s) {
+    return -log(rand01(s) + FEPS);
 }
 
 // ==================== Ray Tracing ====================
 
-bool trace_ray(vec3 origin, vec3 direction, float min_dist, float max_dist,
-               out float hit_dist, out int triangle_id, out bool is_front_face) {
-    rayQueryEXT query;
-    rayQueryInitializeEXT(query, scene, gl_RayFlagsNoneEXT, 0xFF,
-                          origin, min_dist, direction, max_dist);
+bool trace_ray(vec3 o, vec3 d, float tmin, float tmax,
+               out float dist, out int tri_id, out bool front_face) {
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q, scene, gl_RayFlagsNoneEXT, 0xFF, o, tmin, d, tmax);
 
-    while (rayQueryProceedEXT(query)) {}
+    while (rayQueryProceedEXT(q)) {}
 
-    if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
-        hit_dist    = rayQueryGetIntersectionTEXT(query, true);
-        triangle_id = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
-        is_front_face = rayQueryGetIntersectionFrontFaceEXT(query, true);
+    if (rayQueryGetIntersectionTypeEXT(q, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+        dist = rayQueryGetIntersectionTEXT(q, true);
+        tri_id = rayQueryGetIntersectionPrimitiveIndexEXT(q, true);
+        front_face = rayQueryGetIntersectionFrontFaceEXT(q, true);
         return true;
     }
 
     return false;
 }
 
-void unpack_media(float packed, out uint front_medium, out uint back_medium) {
-    uint bits = floatBitsToUint(packed);
-    front_medium = bits >> 16u;
-    back_medium  = bits & 0xFFFFu;
+void unpack_media(float pw, out uint front_med, out uint back_med) {
+    uint p = floatBitsToUint(pw);
+    front_med = p >> 16u;
+    back_med  = p & 0xFFFFu;
+}
+
+// ==================== Media State Buffer (CSG mode) ====================
+// 8 slots of uint8, packed into uvec2 (mediastate.x = slots 0-3, .y = slots 4-7)
+// Slot 0 always holds the highest (active) media ID.
+
+uint ms_get(uvec2 ms, int slot) {
+    uint word = (slot < 4) ? ms.x : ms.y;
+    return (word >> (uint(slot & 3) * 8u)) & 0xFFu;
+}
+
+uvec2 ms_set(uvec2 ms, int slot, uint val) {
+    uint shift = uint(slot & 3) * 8u;
+    uint mask = 0xFFu << shift;
+
+    if (slot < 4) {
+        ms.x = (ms.x & ~mask) | ((val & 0xFFu) << shift);
+    } else {
+        ms.y = (ms.y & ~mask) | ((val & 0xFFu) << shift);
+    }
+
+    return ms;
+}
+
+// Find the highest media ID across all 8 slots
+uint ms_max(uvec2 ms) {
+    uint mx = 0u;
+
+    for (int i = 0; i < 8; i++) {
+        mx = max(mx, ms_get(ms, i));
+    }
+
+    return mx;
+}
+
+// Enter a surface: write back_id into the state buffer
+// The highest ID goes to slot 0; old slot 0 value moves to first empty slot
+uvec2 ms_enter(uvec2 ms, uint back_id) {
+    if (back_id == 0u) {
+        return ms;
+    }
+
+    uint current_max = ms_get(ms, 0);
+    uint new_max = max(current_max, back_id);
+    uint demoted = (new_max == back_id) ? current_max : back_id;
+
+    // Write the highest to slot 0
+    ms = ms_set(ms, 0, new_max);
+
+    // Write the demoted value to the first empty slot (if nonzero)
+    if (demoted > 0u) {
+        for (int i = 1; i < 8; i++) {
+            if (ms_get(ms, i) == 0u) {
+                ms = ms_set(ms, i, demoted);
+                break;
+            }
+        }
+    }
+
+    return ms;
+}
+
+// Leave a surface: find back_id in the buffer and zero it, then update slot 0
+uvec2 ms_leave(uvec2 ms, uint back_id) {
+    if (back_id == 0u) {
+        return ms;
+    }
+
+    // Find and remove back_id (search all slots including 0)
+    for (int i = 0; i < 8; i++) {
+        if (ms_get(ms, i) == back_id) {
+            ms = ms_set(ms, i, 0u);
+            break;
+        }
+    }
+
+    // Recalculate max and put it in slot 0
+    uint mx = 0u;
+    int mx_slot = -1;
+
+    for (int i = 0; i < 8; i++) {
+        uint v = ms_get(ms, i);
+
+        if (v > mx) {
+            mx = v;
+            mx_slot = i;
+        }
+    }
+
+    if (mx_slot > 0) {
+        ms = ms_set(ms, mx_slot, 0u);
+        ms = ms_set(ms, 0, mx);
+    } else if (mx_slot < 0) {
+        ms = ms_set(ms, 0, 0u);
+    }
+
+    return ms;
 }
 
 // ==================== Output Accumulation ====================
 
-void atomic_add_float(uint index, float value) {
+void atomic_add_float(uint idx, float val) {
 #ifdef USE_ATOMIC_FLOAT
-    atomicAdd(output_data[index], value);
+    atomicAdd(output_data[idx], val);
 #else
-    uint prev = output_data[index], next_val, old_val;
+    uint prev = output_data[idx], nv, old;
 
     do {
-        old_val  = prev;
-        next_val = floatBitsToUint(uintBitsToFloat(old_val) + value);
-        prev     = atomicCompSwap(output_data[index], old_val, next_val);
-    } while (prev != old_val);
+        old = prev;
+        nv = floatBitsToUint(uintBitsToFloat(old) + val);
+        prev = atomicCompSwap(output_data[idx], old, nv);
+    } while (prev != old);
 
 #endif
 }
 
-uint voxel_index(vec3 rel_pos) {
-    uint ix = rel_pos.x > 0.0 ? uint(min(rel_pos.x, grid_extent.x) * voxel_scale) : 0u;
-    uint iy = rel_pos.y > 0.0 ? uint(min(rel_pos.y, grid_extent.y) * voxel_scale) : 0u;
-    uint iz = rel_pos.z > 0.0 ? uint(min(rel_pos.z, grid_extent.z) * voxel_scale) : 0u;
+uint voxel_index(vec3 rp) {
+    uint ix = rp.x > 0.0 ? uint(min(rp.x, grid_extent.x) * voxel_scale) : 0u;
+    uint iy = rp.y > 0.0 ? uint(min(rp.y, grid_extent.y) * voxel_scale) : 0u;
+    uint iz = rp.z > 0.0 ? uint(min(rp.z, grid_extent.z) * voxel_scale) : 0u;
     return iz * grid_stride.y + iy * grid_stride.x + ix;
 }
 
-uint time_gate_offset(float time_of_flight) {
-    return uint(min(int((time_of_flight - time_start) * inv_timestep), max_gate - 1)) * grid_stride.z;
+uint time_offset(float tof) {
+    return uint(min(int((tof - time_start) * inv_timestep), max_gate - 1)) * grid_stride.z;
 }
 
-// Accumulate energy along a photon path segment (matching accumulateOutput)
-void accumulate_along_path(vec3 pos, vec3 dir, uint medium_id,
-                           float weight, float time_of_flight, float path_length) {
-    Medium prop = media[medium_id];
-    int segment_count = (int(path_length * voxel_scale) + 1) << 1;
-    float segment_len = path_length / float(segment_count);
-    float segment_decay = exp(-prop.mua * segment_len);
+void accumulate(vec3 p, vec3 d, uint mid, float w, float tof, float L) {
+    Medium pr = media[mid];
+    int sc = (int(L * voxel_scale) + 1) << 1;
+    float sl = L / float(sc), decay = exp(-pr.mua * sl);
+    float loss = (output_type == OUT_ENERGY) ? w * (1.0 - decay)
+                 : (pr.mua > 0.0 ? w * (1.0 - decay) / pr.mua : 0.0);
+    vec3 step = sl * d, sm = p - grid_min.xyz + 0.5 * step;
+    float ct = tof + sl * INV_C0 * pr.n;
+    uint oe = time_offset(ct) + voxel_index(sm);
+    float ow = loss;
 
-    float energy_loss;
+    for (int i = 1; i < sc; ++i) {
+        loss *= decay;
+        sm += step;
+        ct += sl * INV_C0 * pr.n;
+        uint ne = time_offset(ct) + voxel_index(sm);
 
-    if (output_type == OUTPUT_ENERGY) {
-        energy_loss = weight * (1.0 - segment_decay);
-    } else {
-        energy_loss = (prop.mua > 0.0) ? weight * (1.0 - segment_decay) / prop.mua : 0.0;
-    }
-
-    vec3 step_vec   = segment_len * dir;
-    vec3 segment_mid = pos - grid_min.xyz + 0.5 * step_vec;
-    float current_time = time_of_flight + segment_len * INV_SPEED_OF_LIGHT * prop.n;
-
-    uint  prev_voxel = time_gate_offset(current_time) + voxel_index(segment_mid);
-    float accum_weight = energy_loss;
-
-    for (int i = 1; i < segment_count; ++i) {
-        energy_loss *= segment_decay;
-        segment_mid += step_vec;
-        current_time += segment_len * INV_SPEED_OF_LIGHT * prop.n;
-        uint curr_voxel = time_gate_offset(current_time) + voxel_index(segment_mid);
-
-        if (curr_voxel != prev_voxel) {
-            atomic_add_float(prev_voxel, accum_weight);
-            prev_voxel = curr_voxel;
-            accum_weight = 0.0;
+        if (ne != oe) {
+            atomic_add_float(oe, ow);
+            oe = ne;
+            ow = 0.0;
         }
 
-        accum_weight += energy_loss;
+        ow += loss;
     }
 
-    atomic_add_float(prev_voxel, accum_weight);
+    atomic_add_float(oe, ow);
 }
 
 // ==================== Scattering ====================
 
-vec3 rotate_direction(vec3 dir, vec2 zenith, vec2 azimuth) {
-    if (dir.z > -1.0 + FLOAT_EPSILON && dir.z < 1.0 - FLOAT_EPSILON) {
-        float sin2 = 1.0 - dir.z * dir.z;
-        float scale = zenith.x * inversesqrt(sin2);
-        return scale * (azimuth.y * vec3(dir.x * dir.z, dir.y * dir.z, -sin2)
-                        + azimuth.x * vec3(-dir.y, dir.x, 0.0))
-               + zenith.y * dir;
-    } else {
-        return vec3(zenith.x * azimuth.y, zenith.x * azimuth.x,
-                    dir.z > 0.0 ? zenith.y : -zenith.y);
-    }
-}
-
-vec2 henyey_greenstein(float anisotropy, inout uvec4 rng) {
-    float cos_theta;
-
-    if (abs(anisotropy) > FLOAT_EPSILON) {
-        float temp = (1.0 - anisotropy * anisotropy)
-                     / (1.0 - anisotropy + 2.0 * anisotropy * rand_uniform01(rng));
-        cos_theta = (1.0 + anisotropy * anisotropy - temp * temp)
-                    / (2.0 * anisotropy);
-        cos_theta = clamp(cos_theta, -1.0, 1.0);
-    } else {
-        cos_theta = 2.0 * rand_uniform01(rng) - 1.0;
+vec3 rotate_dir(vec3 v, vec2 z, vec2 a) {
+    if (v.z > -1.0 + FEPS && v.z < 1.0 - FEPS) {
+        float s2 = 1.0 - v.z * v.z, sc = z.x * inversesqrt(s2);
+        return sc * (a.y * vec3(v.x * v.z, v.y * v.z, -s2) + a.x * vec3(-v.y, v.x, 0.0)) + z.y * v;
     }
 
-    return vec2(sin(acos(cos_theta)), cos_theta);
+    return vec3(z.x * a.y, z.x * a.x, v.z > 0.0 ? z.y : -z.y);
 }
 
-vec3 scatter_direction(vec3 dir, float anisotropy, inout uvec4 rng) {
+vec3 scatter_dir(vec3 d, float g, inout uvec4 rng) {
+    float ct;
+
+    if (abs(g) > FEPS) {
+        float t = (1.0 - g * g) / (1.0 - g + 2.0 * g * rand01(rng));
+        ct = clamp((1.0 + g * g - t * t) / (2.0 * g), -1.0, 1.0);
+    } else {
+        ct = 2.0 * rand01(rng) - 1.0;
+    }
+
     float phi = rand_range(rng, 0.0, TWO_PI);
-    vec2 zenith = henyey_greenstein(anisotropy, rng);
-    return rotate_direction(dir, zenith, vec2(sin(phi), cos(phi)));
+    return rotate_dir(d, vec2(sin(acos(ct)), ct), vec2(sin(phi), cos(phi)));
 }
 
 // ==================== Fresnel Reflection ====================
 
-bool handle_reflection(vec3 normal, float n_in, float n_out,
-                       inout uvec4 rng, inout vec3 pos, inout vec3 dir) {
-    float cos_incident = abs(dot(dir, normal));
-    float n_in2 = n_in * n_in;
-    float n_out2 = n_out * n_out;
-    float cos2_transmitted = 1.0 - n_in2 / n_out2 * (1.0 - cos_incident * cos_incident);
+bool do_reflection(vec3 N, float n1, float n2, inout uvec4 rng, inout vec3 p, inout vec3 d) {
+    float ci = abs(dot(d, N));
+    float n12 = n1 * n1, n22 = n2 * n2, ct2 = 1.0 - n12 / n22 * (1.0 - ci * ci);
 
-    if (cos2_transmitted > 0.0) {
-        // Partial reflection — compute Fresnel coefficient
-        float cos_transmitted = sqrt(cos2_transmitted);
-        float re = n_in2 * cos_incident * cos_incident + n_out2 * cos2_transmitted;
-        float im = 2.0 * n_in * n_out * cos_incident * cos_transmitted;
-        float r_parallel = (re - im) / (re + im);
+    if (ct2 > 0.0) {
+        float ct = sqrt(ct2);
+        float re = n12 * ci * ci + n22 * ct2, im = 2.0 * n1 * n2 * ci * ct;
+        float rp = (re - im) / (re + im);
+        re = n22 * ci * ci + n12 * ct * ct;
+        float rt = (rp + (re - im) / (re + im)) * 0.5;
 
-        re = n_out2 * cos_incident * cos_incident + n_in2 * cos_transmitted * cos_transmitted;
-        float r_total = (r_parallel + (re - im) / (re + im)) * 0.5;
-
-        if (rand_uniform01(rng) <= r_total) {
-            // Reflect
-            pos -= dir * DOUBLE_SAFETY_DIST;
-            dir += -2.0 * cos_incident * normal;
+        if (rand01(rng) <= rt) {
+            p -= d * DOUBLE_SAFETY;
+            d += -2.0 * ci * N;
         } else {
-            // Transmit (refract)
-            dir += -cos_incident * normal;
-            dir = cos_transmitted * normal + n_in / n_out * dir;
-            dir *= inversesqrt(dot(dir, dir));
-            return false;  // transmitted
+            d += -ci * N;
+            d = ct * N + n1 / n2 * d;
+            d *= inversesqrt(dot(d, d));
+            return false;
         }
     } else {
-        // Total internal reflection
-        pos -= dir * DOUBLE_SAFETY_DIST;
-        dir += -2.0 * cos_incident * normal;
+        p -= d * DOUBLE_SAFETY;
+        d += -2.0 * ci * N;
     }
 
-    dir *= inversesqrt(dot(dir, dir));
-    return true;  // reflected
+    d *= inversesqrt(dot(d, d));
+    return true;
 }
 
 // ==================== Photon Launch ====================
 
-void launch_photon(inout vec3 pos, inout vec3 dir, inout float weight,
-                   inout float scat_len, inout float time_of_flight,
-                   inout uint medium_id, inout uvec4 rng) {
-    pos = src_pos.xyz;
-    dir = src_dir.xyz;
-    weight = 1.0;
-    time_of_flight = 0.0;
-    medium_id = initial_medium;
+void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
+                   inout float tof, inout uint mid, inout uvec2 mstate, inout uvec4 rng) {
+    p = src_pos.xyz;
+    d = src_dir.xyz;
+    w = 1.0;
+    tof = 0.0;
+    mstate = uvec2(0u, 0u); // clear state buffer
 
-    // Planar source
-    if (src_type == 4) {
-        float rand_u = rand_uniform01(rng);
-        float rand_v = rand_uniform01(rng);
-        pos = src_pos.xyz + rand_u * src_param1.xyz + rand_v * src_param2.xyz;
+    if (src_type == 4) { // planar
+        float u = rand01(rng), v = rand01(rng);
+        p = src_pos.xyz + u * src_param1.xyz + v * src_param2.xyz;
     }
 
-    scat_len = rand_scatlen(rng);
+    slen = rand_scatlen(rng);
 
-    // Determine initial medium by ray query if unknown
-    if (medium_id == MEDIUM_UNKNOWN) {
-        float hit_dist;
-        int triangle_id;
-        bool is_front;
+    if (do_csg > 0u) {
+        // CSG mode: determine enclosing surfaces using parity counting.
+        // Cast ray forward, walk through ALL intersections. For each surface (back_id),
+        // count crossings. Odd count = source is inside that surface.
+        // We use a temporary counter packed into mstate, then convert to enter calls.
+        mstate = uvec2(0u, 0u);
 
-        if (trace_ray(pos, dir, 0.0, FLOAT_MAX, hit_dist, triangle_id, is_front)) {
-            uint front_med, back_med;
-            unpack_media(face_normal[triangle_id].w, front_med, back_med);
-            medium_id = is_front ? front_med : back_med;
-        } else {
-            medium_id = MEDIUM_DEAD;
+        // Count crossings per back_id (use state buffer slots as counters mod 2)
+        // Since we have up to 8 media IDs, track parity for each
+        uint parity[8]; // parity[i] = crossing count for media id (i+1), mod 2
+
+        for (int i = 0; i < 8; i++) {
+            parity[i] = 0u;
+        }
+
+        vec3 walk_pos = p;
+
+        for (int walk = 0; walk < 64; walk++) {
+            float hd;
+            int tid;
+            bool ff;
+
+            if (!trace_ray(walk_pos, d, RAY_TMIN, FMAX, hd, tid, ff)) {
+                break;
+            }
+
+            uint fm, bm;
+            unpack_media(face_normal[tid].w, fm, bm);
+
+            // Every crossing of a surface with back_id=bm toggles parity
+            if (bm > 0u && bm <= 8u) {
+                parity[bm - 1u] ^= 1u;
+            }
+
+            walk_pos = walk_pos + d * (hd + SAFETY_DIST);
+        }
+
+        // Odd parity = source is inside that surface → enter it
+        for (int i = 0; i < 8; i++) {
+            if (parity[i] != 0u) {
+                mstate = ms_enter(mstate, uint(i + 1));
+            }
+        }
+
+        mid = ms_get(mstate, 0);
+
+        if (mid == 0u) {
+            // Source is outside all surfaces — skip forward to first entry
+            float hd;
+            int tid;
+            bool ff;
+
+            if (trace_ray(p, d, 0.0, FMAX, hd, tid, ff) && ff) {
+                uint fm, bm;
+                unpack_media(face_normal[tid].w, fm, bm);
+                p = p + d * (hd + SAFETY_DIST);
+                mstate = ms_enter(mstate, bm);
+                mid = ms_get(mstate, 0);
+            } else {
+                mid = MEDIUM_DEAD;
+            }
+        }
+    } else {
+        // Mesh mode: use precomputed initial_medium or ray query
+        mid = initial_medium;
+
+        if (mid == MEDIUM_UNKNOWN) {
+            float hd;
+            int tid;
+            bool ff;
+
+            if (trace_ray(p, d, 0.0, FMAX, hd, tid, ff)) {
+                uint fm, bm;
+                unpack_media(face_normal[tid].w, fm, bm);
+                mid = ff ? fm : bm;
+            } else {
+                mid = MEDIUM_DEAD;
+            }
         }
     }
 }
 
-// ==================== Main Kernel ====================
+// ==================== Main ====================
 
 void main() {
-    uint thread_id = gl_GlobalInvocationID.x;
+    uint tid = gl_GlobalInvocationID.x;
 
-    if (thread_id >= total_threads) {
+    if (tid >= total_threads) {
         return;
     }
 
-    uvec4 rng = thread_seeds[thread_id];
-    int photons_done = 0;
-    int max_photons = photons_per_thread + int(thread_id < uint(extra_photons));
+    uvec4 rng = thread_seeds[tid];
+    int done = 0, maxph = photons_per_thread + int(tid < uint(extra_photons));
 
-    // Launch first photon
-    vec3  pos, dir;
-    float weight, scat_len, time_of_flight;
-    uint  medium_id;
-    launch_photon(pos, dir, weight, scat_len, time_of_flight, medium_id, rng);
+    vec3 pos, dir;
+    float weight, slen, tof;
+    uint mid;
+    uvec2 mstate; // CSG media state buffer (8 x uint8)
 
-    // Main simulation loop
-    while (photons_done < max_photons) {
+    launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng);
 
-        // ---- Propagate if photon is alive ----
-        if (medium_id != MEDIUM_DEAD) {
-            Medium prop = media[medium_id];
+    while (done < maxph) {
 
-            // Skip propagation for ambient/void medium (mus=0)
-            if (prop.mus < FLOAT_EPSILON) {
-                medium_id = MEDIUM_DEAD;
+        if (mid != MEDIUM_DEAD && mid != MEDIUM_AMBIENT) {
+            Medium prop = media[mid];
+
+            if (prop.mus < FEPS) {
+                mid = MEDIUM_DEAD;
             } else {
-                float max_travel = scat_len / prop.mus;
+                float max_dist = slen / prop.mus;
+                float hd;
+                int tri;
+                bool ff;
+                bool hit = trace_ray(pos, dir, RAY_TMIN, max_dist, hd, tri, ff);
 
-                float hit_dist;
-                int   triangle_id;
-                bool  is_front;
-                bool  hit_boundary = trace_ray(pos, dir, RAY_MIN_DIST, max_travel,
-                                               hit_dist, triangle_id, is_front);
+                if (hit) {
+                    // ---- Boundary hit ----
+                    uint fm, bm;
+                    unpack_media(face_normal[tri].w, fm, bm);
+                    float L = min(hd, slen / prop.mus);
 
-                if (hit_boundary) {
-                    // ======== Boundary intersection (closest-hit) ========
-                    uint front_med, back_med;
-                    unpack_media(face_normal[triangle_id].w, front_med, back_med);
+                    accumulate(pos, dir, mid, weight, tof, L);
+                    pos += dir * (L + SAFETY_DIST);
+                    weight *= exp(-prop.mua * L);
+                    tof += L * INV_C0 * prop.n;
+                    slen -= L * prop.mus;
 
-                    Medium current_prop = media[medium_id];
-                    float travel_dist = min(hit_dist,
-                                            current_prop.mus > 0.0 ? scat_len / current_prop.mus : FLOAT_MAX);
+                    if (do_csg > 0u) {
+                        // CSG mode: update state buffer and handle reflection
 
-                    // Deposit energy along path
-                    accumulate_along_path(pos, dir, medium_id, weight,
-                                          time_of_flight, travel_dist);
+                        // Determine the old medium (before crossing) and new medium (after crossing)
+                        uint old_mid = mid;  // current medium before state update
 
-                    // Advance photon past boundary
-                    pos += dir * (travel_dist + SAFETY_DIST);
-                    weight *= exp(-current_prop.mua * travel_dist);
-                    time_of_flight += travel_dist * INV_SPEED_OF_LIGHT * current_prop.n;
-                    scat_len -= travel_dist * current_prop.mus;
+                        // Tentatively update state to find what new medium would be
+                        uvec2 new_mstate;
 
-                    // Cross boundary (assume index-matched)
-                    medium_id = is_front ? back_med : front_med;
-
-                    // Handle refractive index mismatch
-                    if (do_reflect > 0u && current_prop.n != media[medium_id].n) {
-                        vec3 normal = is_front
-                                      ? -face_normal[triangle_id].xyz
-                                      :  face_normal[triangle_id].xyz;
-
-                        if (handle_reflection(normal, current_prop.n, media[medium_id].n,
-                                              rng, pos, dir)) {
-                            // Reflected — restore original medium
-                            medium_id = is_front ? front_med : back_med;
+                        if (ff) {
+                            // Front-face hit: entering this surface → add back_id
+                            new_mstate = ms_enter(mstate, bm);
+                        } else {
+                            // Back-face hit: leaving this surface → remove back_id
+                            new_mstate = ms_leave(mstate, bm);
                         }
 
-                        // Terminate if reflected/refracted into ambient
-                        if (medium_id == MEDIUM_AMBIENT) {
-                            medium_id = MEDIUM_DEAD;
+                        uint new_mid = ms_get(new_mstate, 0);
+
+                        // Check for reflection at refractive index boundary
+                        bool reflected = false;
+
+                        if (do_reflect > 0u && new_mid != old_mid
+                                && new_mid < num_media && old_mid < num_media) {
+                            float n_in  = media[old_mid].n;
+                            float n_out = (new_mid == 0u) ? 1.0 : media[new_mid].n;
+
+                            if (n_in != n_out) {
+                                // Get face normal, oriented toward the incoming ray
+                                vec3 N = ff ? -face_normal[tri].xyz : face_normal[tri].xyz;
+
+                                // do_reflection returns true if reflected, false if transmitted
+                                // it also updates pos and dir accordingly
+                                reflected = do_reflection(N, n_in, n_out, rng, pos, dir);
+                            }
+                        }
+
+                        if (reflected) {
+                            // Photon bounced back — do NOT update state buffer
+                            // mid stays the same (old_mid)
+                            // pos and dir were already updated by do_reflection
+                        } else {
+                            // Transmitted (or no index mismatch) — commit the state update
+                            mstate = new_mstate;
+                            mid = new_mid;
+
+                            if (mid == 0u) {
+                                mid = MEDIUM_DEAD;  // exited all surfaces
+                            }
+                        }
+
+                    } else {
+                        // Mesh mode: direct front/back lookup
+                        uint new_mid = ff ? bm : fm;
+
+                        if (do_reflect > 0u && new_mid != MEDIUM_AMBIENT
+                                && prop.n != media[new_mid].n) {
+                            vec3 N = ff ? -face_normal[tri].xyz : face_normal[tri].xyz;
+
+                            if (do_reflection(N, prop.n, media[new_mid].n, rng, pos, dir)) {
+                                new_mid = ff ? fm : bm; // reflected
+                            }
+                        }
+
+                        mid = new_mid;
+
+                        if (mid == MEDIUM_AMBIENT) {
+                            mid = MEDIUM_DEAD;
                         }
                     }
 
                 } else {
-                    // ======== No boundary hit — scattering event (miss) ========
-                    Medium current_prop = media[medium_id];
-                    float travel_dist = scat_len / current_prop.mus;
-
-                    // Deposit energy along path
-                    accumulate_along_path(pos, dir, medium_id, weight,
-                                          time_of_flight, travel_dist);
-
-                    // Advance photon
-                    pos += dir * travel_dist;
-                    weight *= exp(-current_prop.mua * travel_dist);
-                    time_of_flight += travel_dist * INV_SPEED_OF_LIGHT * current_prop.n;
-
-                    // Scatter into new direction
-                    dir = scatter_direction(dir, current_prop.g, rng);
-                    scat_len = rand_scatlen(rng);
+                    // ---- Miss: scattering event ----
+                    if (do_csg > 0u && ms_get(mstate, 0) == 0u) {
+                        // CSG mode: miss while outside all surfaces → terminate
+                        mid = MEDIUM_DEAD;
+                    } else {
+                        float L = slen / prop.mus;
+                        accumulate(pos, dir, mid, weight, tof, L);
+                        pos += dir * L;
+                        weight *= exp(-prop.mua * L);
+                        tof += L * INV_C0 * prop.n;
+                        dir = scatter_dir(dir, prop.g, rng);
+                        slen = rand_scatlen(rng);
+                    }
                 }
-            } // end if (prop.mus >= FLOAT_EPSILON)
+            }
         }
 
-        // ---- Check termination and relaunch ----
-        if (!(medium_id != MEDIUM_DEAD && time_of_flight < time_end)) {
-            launch_photon(pos, dir, weight, scat_len, time_of_flight, medium_id, rng);
-            ++photons_done;
+        // ---- Termination & relaunch ----
+        if (mid == MEDIUM_DEAD || mid == MEDIUM_AMBIENT || tof >= time_end) {
+            launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng);
+            ++done;
         }
     }
 }

@@ -20,7 +20,7 @@ GLSLFLAGS = --target-env vulkan1.2 -e main
 BINARY    = vkmmc
 SHADER    = vkmmc_core.spv
 SOURCES   = vkmmc.cpp miniz/miniz.c
-HEADERS   = vkmmc_io.h nlohmann/json.hpp
+HEADERS   = vkmmc_io.h vkmmc_shapes.h nlohmann/json.hpp
 COMP_SRC  = vkmmc_core.comp
 
 # Default input for 'make run'
