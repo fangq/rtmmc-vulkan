@@ -61,13 +61,15 @@ struct MCParams {
     /* scalar block — packed 4 per row (offset 112) */
     float    dstep, tstart, tend, Rtstep;   // 112: 4 floats
     int      srctype, maxgate, outputtype;  // 128: 3 ints
-    uint32_t isreflect;                     // 128+12: 1 uint  → 16 bytes
+    uint32_t isreflect;                     // 128+12: 1 uint
     uint32_t mediumid0, total_threads;      // 144: 2 uints
-    uint32_t num_media, seed;               // 144+8: 2 uints → 16 bytes
+    uint32_t num_media, seed;               // 144+8: 2 uints
     uint32_t do_csg, has_curvature;         // 160: 2 uints
-    int      threadphoton, oddphoton;       // 160+8: 2 ints  → 16 bytes
+    int      threadphoton, oddphoton;       // 160+8: 2 ints
+    float    minenergy, roulettesize;       // 176: 2 floats
+    float    _pad1, _pad2;                  // 176+8: padding to 16-byte align
 };
-// Total: 176 bytes
+// Total: 192 bytes
 
 /* ================================================================ */
 /*                       Vulkan helpers                             */
@@ -1400,6 +1402,27 @@ int main(int argc, char** argv) {
     printf("Grid: %ux%ux%u x %d gates, voxel=%.3fmm, origin=[%.2f,%.2f,%.2f]\n",
            nx, ny, nz, cfg.maxgate, vs, gmin[0], gmin[1], gmin[2]);
 
+    {
+        float bbx_pad = vs * 2.0f;  // 2 voxels padding beyond grid
+        float bbmin[3] = {gmin[0] - bbx_pad, gmin[1] - bbx_pad, gmin[2] - bbx_pad};
+        float bbmax[3] = {gmax[0] + bbx_pad, gmax[1] + bbx_pad, gmax[2] + bbx_pad};
+
+        ShapeMesh bbx_mesh;
+        bbx_mesh.nodes = cfg.nodes;    // start with existing nodes
+        bbx_mesh.faces = cfg.faces;
+        bbx_mesh.facedata = cfg.facedata;
+        bbx_mesh.shape_id = cfg.face_shape_id;
+
+        gen_box(bbx_mesh, bbmin[0], bbmin[1], bbmin[2], bbmax[0] - bbmin[0], bbmax[1] - bbmin[1], bbmax[2] - bbmin[2], 0xFFFF);
+
+        cfg.nodes = bbx_mesh.nodes;
+        cfg.faces = bbx_mesh.faces;
+        cfg.facedata = bbx_mesh.facedata;
+        cfg.face_shape_id = bbx_mesh.shape_id;
+
+        printf("After BBox: %zu nodes, %zu faces\n", cfg.nodes.size(), cfg.faces.size());
+    }
+
     /* Threads */
     uint32_t tt = (ovr.totalthread > 0) ? ovr.totalthread : 65536;
 
@@ -1453,8 +1476,8 @@ int main(int argc, char** argv) {
 
     params.do_csg = cfg.is_csg ? 1u : 0u;
     params.has_curvature = has_curvature ? 1u : 0u;
-    params.do_csg = cfg.is_csg ? 1u : 0u;
-    params.has_curvature = has_curvature ? 1u : 0u;
+    params.minenergy = cfg.minenergy;
+    params.roulettesize = cfg.roulettesize;
 
     Buffer paramBuf = create_device_buffer(ctx, sizeof(MCParams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 

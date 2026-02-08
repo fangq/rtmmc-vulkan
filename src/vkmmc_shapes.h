@@ -2,6 +2,9 @@
  * vkmmc_shapes.h — Generate watertight triangle meshes from JSON shape constructs
  *
  * Each shape generates a closed surface. All triangles store front=0, back=Tag.
+ * All triangle windings follow right-hand rule with normal pointing OUTWARD
+ * from the shape interior.
+ *
  * Box:      8 nodes, 12 triangles (6 quads)
  * Sphere:   lat/lon grid, (nlat-1)*nlon*2 triangles + 2*nlon cap triangles
  * Cylinder: side quads + center-fan caps
@@ -48,11 +51,17 @@ static float pack_tag_flat(uint32_t tag) {
     return f;
 }
 
-/* add one triangle with outward normal, front=0, back=tag */
-static void add_tri(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c, uint32_t tag, bool flat = false) {
-    m.faces.push_back({{a, b, c}});
+/*
+ * add_tri_outward: add one triangle, ensuring its winding produces an outward
+ * normal (i.e. pointing away from 'center'). If the computed cross-product
+ * normal points toward center, the winding is flipped.
+ * front=0, back=tag (CSG convention).
+ */
+static void add_tri_outward(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c,
+                            uint32_t tag, Vec3 center, bool flat = false) {
     Vec3 va = m.nodes[a], vb = m.nodes[b], vc = m.nodes[c];
-    Vec3 e1 = {vb.x - va.x, vb.y - va.y, vb.z - va.z}, e2 = {vc.x - va.x, vc.y - va.y, vc.z - va.z};
+    Vec3 e1 = {vb.x - va.x, vb.y - va.y, vb.z - va.z};
+    Vec3 e2 = {vc.x - va.x, vc.y - va.y, vc.z - va.z};
     Vec3 n = v3cross(e1, e2);
     float l = v3len(n);
 
@@ -60,6 +69,25 @@ static void add_tri(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c, uint32_t t
         n.x /= l;
         n.y /= l;
         n.z /= l;
+    }
+
+    /* Triangle centroid */
+    float cx = (va.x + vb.x + vc.x) / 3.0f;
+    float cy = (va.y + vb.y + vc.y) / 3.0f;
+    float cz = (va.z + vb.z + vc.z) / 3.0f;
+
+    /* Vector from shape center to centroid */
+    float dx = cx - center.x, dy = cy - center.y, dz = cz - center.z;
+
+    /* If normal points inward (toward center), flip winding */
+    if (n.x * dx + n.y * dy + n.z * dz < 0) {
+        /* swap b and c to reverse winding */
+        m.faces.push_back({{a, c, b}});
+        n.x = -n.x;
+        n.y = -n.y;
+        n.z = -n.z;
+    } else {
+        m.faces.push_back({{a, b, c}});
     }
 
     FaceData fd;
@@ -70,10 +98,11 @@ static void add_tri(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c, uint32_t t
     m.facedata.push_back(fd);
 }
 
-/* add quad as 2 triangles */
-static void add_quad(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t tag, bool flat = false) {
-    add_tri(m, a, b, c, tag, flat);
-    add_tri(m, a, c, d, tag, flat);
+/* add quad as 2 triangles with outward normals */
+static void add_quad_outward(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c, uint32_t d,
+                             uint32_t tag, Vec3 center, bool flat = false) {
+    add_tri_outward(m, a, b, c, tag, center, flat);
+    add_tri_outward(m, a, c, d, tag, center, flat);
 }
 
 /* ================================================================ */
@@ -90,29 +119,33 @@ static void gen_box(ShapeMesh& m, float ox, float oy, float oz,
         m.nodes.push_back(v[i]);
     }
 
-    add_quad(m, b + 0, b + 3, b + 2, b + 1, tag, true); /* -Z */
-    add_quad(m, b + 4, b + 5, b + 6, b + 7, tag, true); /* +Z */
-    add_quad(m, b + 0, b + 1, b + 5, b + 4, tag, true); /* -Y */
-    add_quad(m, b + 2, b + 3, b + 7, b + 6, tag, true); /* +Y */
-    add_quad(m, b + 0, b + 4, b + 7, b + 3, tag, true); /* -X */
-    add_quad(m, b + 1, b + 2, b + 6, b + 5, tag, true); /* +X */
+    /* Use box center for outward orientation check */
+    Vec3 center = {ox + sx * 0.5f, oy + sy * 0.5f, oz + sz * 0.5f};
+
+    add_quad_outward(m, b + 0, b + 3, b + 2, b + 1, tag, center, true); /* -Z */
+    add_quad_outward(m, b + 4, b + 5, b + 6, b + 7, tag, center, true); /* +Z */
+    add_quad_outward(m, b + 0, b + 1, b + 5, b + 4, tag, center, true); /* -Y */
+    add_quad_outward(m, b + 2, b + 3, b + 7, b + 6, tag, center, true); /* +Y */
+    add_quad_outward(m, b + 0, b + 4, b + 7, b + 3, tag, center, true); /* -X */
+    add_quad_outward(m, b + 1, b + 2, b + 6, b + 5, tag, center, true); /* +X */
 }
 
 /* ================================================================ */
 /*  Sphere: lat/lon subdivision, watertight — all curved            */
-/*  nlon = longitude divisions, nlat = latitude divisions           */
+/*  All triangles wound with outward normals verified against center */
 /* ================================================================ */
 static void gen_sphere(ShapeMesh& m, float cx, float cy, float cz,
                        float R, uint32_t tag, int nlon = 24, int nlat = 16) {
     uint32_t b = (uint32_t)m.nodes.size();
     const float PI = 3.14159265358979f;
+    Vec3 center = {cx, cy, cz};
 
     /* north pole */
     m.nodes.push_back({cx, cy, cz + R});
 
     /* latitude rings (1..nlat-1) */
     for (int i = 1; i < nlat; i++) {
-        float phi = PI * (float)i / (float)nlat; /* 0=north, PI=south */
+        float phi = PI * (float)i / (float)nlat;
         float sp = std::sin(phi), cp = std::cos(phi);
 
         for (int j = 0; j < nlon; j++) {
@@ -128,7 +161,7 @@ static void gen_sphere(ShapeMesh& m, float cx, float cy, float cz,
     /* north cap: fan from pole to first ring */
     for (int j = 0; j < nlon; j++) {
         uint32_t j1 = (j + 1) % nlon;
-        add_tri(m, b, b + 1 + j, b + 1 + j1, tag);
+        add_tri_outward(m, b, b + 1 + j, b + 1 + j1, tag, center);
     }
 
     /* body: quads between adjacent rings */
@@ -138,7 +171,7 @@ static void gen_sphere(ShapeMesh& m, float cx, float cy, float cz,
 
         for (int j = 0; j < nlon; j++) {
             uint32_t j1 = (j + 1) % nlon;
-            add_quad(m, r0 + j, r1 + j, r1 + j1, r0 + j1, tag);
+            add_quad_outward(m, r0 + j, r1 + j, r1 + j1, r0 + j1, tag, center);
         }
     }
 
@@ -147,12 +180,13 @@ static void gen_sphere(ShapeMesh& m, float cx, float cy, float cz,
 
     for (int j = 0; j < nlon; j++) {
         uint32_t j1 = (j + 1) % nlon;
-        add_tri(m, last_ring + j, south_pole, last_ring + j1, tag);
+        add_tri_outward(m, last_ring + j, south_pole, last_ring + j1, tag, center);
     }
 }
 
 /* ================================================================ */
 /*  Cylinder: side quads (curved) + center-fan caps (flat)          */
+/*  All triangles wound with outward normals verified against center */
 /* ================================================================ */
 static void gen_cylinder(ShapeMesh& m, float c0x, float c0y, float c0z,
                          float c1x, float c1y, float c1z, float R,
@@ -167,6 +201,9 @@ static void gen_cylinder(ShapeMesh& m, float c0x, float c0y, float c0z,
     ax /= al;
     ay /= al;
     az /= al;
+
+    /* Shape center for outward normal verification */
+    Vec3 center = {(c0x + c1x) * 0.5f, (c0y + c1y) * 0.5f, (c0z + c1z) * 0.5f};
 
     /* perpendicular basis vectors u, v */
     float ux, uy, uz;
@@ -213,19 +250,19 @@ static void gen_cylinder(ShapeMesh& m, float c0x, float c0y, float c0z,
     /* side quads — curved surface */
     for (int i = 0; i < nseg; i++) {
         int n = (i + 1) % nseg;
-        add_quad(m, b + i, b + n, b + nseg + n, b + nseg + i, tag, false);
+        add_quad_outward(m, b + i, b + n, b + nseg + n, b + nseg + i, tag, center, false);
     }
 
-    /* bottom cap (c0): fan, normal toward -axis — flat */
+    /* bottom cap (c0): flat */
     for (int i = 0; i < nseg; i++) {
         int n = (i + 1) % nseg;
-        add_tri(m, cap0, b + n, b + i, tag, true);
+        add_tri_outward(m, cap0, b + n, b + i, tag, center, true);
     }
 
-    /* top cap (c1): fan, normal toward +axis — flat */
+    /* top cap (c1): flat */
     for (int i = 0; i < nseg; i++) {
         int n = (i + 1) % nseg;
-        add_tri(m, cap1, b + nseg + i, b + nseg + n, tag, true);
+        add_tri_outward(m, cap1, b + nseg + i, b + nseg + n, tag, center, true);
     }
 }
 

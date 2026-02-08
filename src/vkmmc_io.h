@@ -59,11 +59,13 @@ struct SimConfig {
     bool is_csg;
     std::vector<uint32_t> face_shape_id;
     int mesh_res;
+    float minenergy;
+    float roulettesize;
 
     SimConfig() : nphoton(1000000), rng_seed(29012391), do_mismatch(true),
         do_normalize(true), output_type(2), t0(0), t1(5e-9f), dt(5e-9f),
         maxgate(1), unitinmm(1.0f), srctype(0), init_elem(-1),
-        mediumid0(0xFFFFFFFFu), has_grid_dim(false), has_steps(false), is_csg(false), mesh_res(24) {
+        mediumid0(0xFFFFFFFFu), has_grid_dim(false), has_steps(false), is_csg(false), mesh_res(24), minenergy(1e-6f), roulettesize(10.0f) {
         memset(srcpos, 0, sizeof(srcpos));
         memset(srcdir, 0, sizeof(srcdir));
         srcdir[2] = 1.0f;
@@ -326,18 +328,58 @@ static void load_mesh_surf(const std::vector<Vec3>& nodes, const int32_t* sd, si
 // ============================================================================
 // Extract surface from tetrahedral mesh
 // ============================================================================
+
+/**
+ * Extract surface triangles from a tetrahedral mesh.
+ *
+ * Convention: the geometric normal of each output triangle points toward the
+ * FRONT medium side. In packed_media, front is stored in bits [31:16] and
+ * back in bits [15:0].
+ *
+ * For a photon traveling from medium A to medium B through this triangle:
+ *   - If the ray hits the front face (ff=true), it means the ray is coming
+ *     from the front-medium side → crossing INTO back medium.
+ *     So new_mid = back_med.
+ *   - If the ray hits the back face (ff=false), it means the ray is coming
+ *     from the back-medium side → crossing INTO front medium.
+ *     So new_mid = front_med.
+ *
+ * This is exactly what the shader does: new_mid = ff ? bm : fm;
+ *
+ * To make this work correctly, we orient the triangle normal to point OUTWARD
+ * from the back-medium region (i.e., toward the front-medium region). This way:
+ *   - A ray inside the "back" region heading outward hits the BACK face
+ *     (ray direction aligned with normal → front_face=false) → new_mid = front
+ *   - A ray from the "front" region heading inward hits the FRONT face
+ *     (ray direction against normal → front_face=true) → new_mid = back
+ *
+ * For exterior faces (front=0, back=region), we orient the normal to point
+ * outward from the mesh (toward medium 0/exterior). This means:
+ *   - Photon inside mesh heading out → hits back face → new_mid = 0 (exit)
+ *   - Photon outside heading in → hits front face → new_mid = region (enter)
+ */
 static void extract_surface_from_tet(const std::vector<Vec3>& nodes, const int32_t* elems,
-                                     size_t ne, std::vector<std::array<uint32_t, 3> >& out_f, std::vector<FaceData>& out_d) {
+                                     size_t ne, std::vector<std::array<uint32_t, 3> >& out_f,
+                                     std::vector<FaceData>& out_d) {
+    /* Each tet face is opposite to one vertex. The face indices (in the
+       standard MMC convention) and their outward-pointing winding relative
+       to the tet interior: */
     static const int ftab[4][3] = {{0, 3, 1}, {3, 2, 1}, {0, 2, 3}, {0, 1, 2}};
+
     struct FInfo {
-        uint32_t v[3];
-        int r1, r2;
+        uint32_t v[3];      /* vertex indices (winding from first tet) */
+        int r1;             /* region of first tet */
+        int r2;             /* region of second tet (-1 if exterior) */
+        int tet1;           /* index of first tet */
     };
+
     std::map<FaceKey, FInfo> fmap;
 
     for (size_t e = 0; e < ne; e++) {
         const int32_t* row = elems + e * 5;
-        uint32_t n[4] = {(uint32_t)(row[0] - 1), (uint32_t)(row[1] - 1), (uint32_t)(row[2] - 1), (uint32_t)(row[3] - 1)};
+        uint32_t n[4] = {(uint32_t)(row[0] - 1), (uint32_t)(row[1] - 1),
+                         (uint32_t)(row[2] - 1), (uint32_t)(row[3] - 1)
+                        };
         int reg = row[4];
 
         for (int f = 0; f < 4; f++) {
@@ -347,6 +389,7 @@ static void extract_surface_from_tet(const std::vector<Vec3>& nodes, const int32
             k.v[1] = fv[1];
             k.v[2] = fv[2];
             std::sort(k.v, k.v + 3);
+
             std::map<FaceKey, FInfo>::iterator it = fmap.find(k);
 
             if (it == fmap.end()) {
@@ -356,6 +399,7 @@ static void extract_surface_from_tet(const std::vector<Vec3>& nodes, const int32
                 fi.v[2] = fv[2];
                 fi.r1 = reg;
                 fi.r2 = -1;
+                fi.tet1 = (int)e;
                 fmap[k] = fi;
             } else {
                 it->second.r2 = reg;
@@ -369,12 +413,14 @@ static void extract_surface_from_tet(const std::vector<Vec3>& nodes, const int32
     for (std::map<FaceKey, FInfo>::iterator it = fmap.begin(); it != fmap.end(); ++it) {
         FInfo& fi = it->second;
 
+        /* Skip internal faces where both sides are the same region */
         if (fi.r2 >= 0 && fi.r1 == fi.r2) {
             continue;
         }
 
         Vec3 a = nodes[fi.v[0]], b = nodes[fi.v[1]], c = nodes[fi.v[2]];
-        Vec3 e1 = {b.x - a.x, b.y - a.y, b.z - a.z}, e2 = {c.x - a.x, c.y - a.y, c.z - a.z};
+        Vec3 e1 = {b.x - a.x, b.y - a.y, b.z - a.z};
+        Vec3 e2 = {c.x - a.x, c.y - a.y, c.z - a.z};
         Vec3 N = v3cross(e1, e2);
         float l = v3len(N);
 
@@ -384,9 +430,71 @@ static void extract_surface_from_tet(const std::vector<Vec3>& nodes, const int32
             N.z /= l;
         }
 
-        uint32_t front = (fi.r2 >= 0) ? (uint32_t)fi.r2 : 0u, back = (uint32_t)fi.r1;
+        /* Determine front and back media:
+           front = the medium on the side the normal points toward
+           back  = the medium on the opposite side
+
+           We need the normal to point toward the front medium.
+           First, figure out which tet (r1) the current winding's normal
+           points away from, using the opposite vertex of tet1. */
+
+        /* Find the 4th vertex of tet1 (the one not on this face) */
+        const int32_t* row1 = elems + fi.tet1 * 5;
+        uint32_t tet1_verts[4] = {(uint32_t)(row1[0] - 1), (uint32_t)(row1[1] - 1),
+                                  (uint32_t)(row1[2] - 1), (uint32_t)(row1[3] - 1)
+                                 };
+        Vec3 opp = {0, 0, 0};  /* opposite vertex */
+
+        for (int vi = 0; vi < 4; vi++) {
+            if (tet1_verts[vi] != fi.v[0] &&
+                    tet1_verts[vi] != fi.v[1] &&
+                    tet1_verts[vi] != fi.v[2]) {
+                opp = nodes[tet1_verts[vi]];
+                break;
+            }
+        }
+
+        /* Vector from face centroid to opposite vertex of tet1 */
+        float cx = (a.x + b.x + c.x) / 3.0f;
+        float cy = (a.y + b.y + c.y) / 3.0f;
+        float cz = (a.z + b.z + c.z) / 3.0f;
+        float dx = opp.x - cx, dy = opp.y - cy, dz = opp.z - cz;
+        float dot = N.x * dx + N.y * dy + N.z * dz;
+
+        /* If dot > 0, normal points toward tet1's interior (toward r1).
+           If dot < 0, normal points away from tet1 (toward r2 or exterior).
+
+           We want the convention:
+             normal points toward front_med, away from back_med.
+
+           For exterior faces (r2 = -1): front = 0 (exterior), back = r1.
+             Normal should point outward (away from r1) → dot < 0 is correct.
+             If dot > 0, flip.
+
+           For interior faces (r2 >= 0): front = r2, back = r1.
+             Normal should point away from r1 toward r2 → dot < 0 is correct.
+             If dot > 0, flip. */
+
+        uint32_t front_med, back_med;
+
+        if (dot > 0) {
+            /* Normal points toward r1. Flip it so it points away from r1. */
+            N.x = -N.x;
+            N.y = -N.y;
+            N.z = -N.z;
+            /* Swap winding */
+            uint32_t tmp = fi.v[1];
+            fi.v[1] = fi.v[2];
+            fi.v[2] = tmp;
+        }
+
+        /* Now normal points away from r1.
+           back = r1, front = r2 (or 0 for exterior) */
+        back_med = (uint32_t)fi.r1;
+        front_med = (fi.r2 >= 0) ? (uint32_t)fi.r2 : 0u;
+
         out_f.push_back({{fi.v[0], fi.v[1], fi.v[2]}});
-        out_d.push_back({N.x, N.y, N.z, pack_media(front, back)});
+        out_d.push_back({N.x, N.y, N.z, pack_media(front_med, back_med)});
     }
 
     std::cout << "Extracted " << out_f.size() << " surface triangles from " << ne << " tetrahedra\n";
@@ -581,6 +689,8 @@ static SimConfig load_json_input(const char* filepath) {
         cfg.do_mismatch = s.value("DoMismatch", true);
         cfg.do_normalize = s.value("DoNormalize", true);
         cfg.output_type = parse_outputtype(s.value("OutputType", "x"));
+        cfg.minenergy = s.value("RussianRoulette", 1e-6f);
+        cfg.roulettesize = s.value("RussianRouletteSize", 10.0f);
     }
 
     // Forward
