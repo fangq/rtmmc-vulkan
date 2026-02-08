@@ -630,8 +630,8 @@ static SimConfig load_json_input(const char* filepath) {
             cfg.has_grid_dim = true;
         }
 
-        if (d.contains("Steps")) {
-            json st = d["Steps"];
+        if (d.contains("Step")) {
+            json st = d["Step"];
 
             for (int i = 0; i < (int)st.size() && i < 3; i++) {
                 cfg.steps[i] = st[i].get<float>();

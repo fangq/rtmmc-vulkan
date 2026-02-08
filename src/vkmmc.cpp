@@ -49,19 +49,25 @@ typedef struct VkPhysicalDeviceShaderAtomicFloatFeaturesEXT {
 /*                       MCParams uniform                           */
 /* ================================================================ */
 struct MCParams {
-    int      srctype;
-    int _p0, _p1, _p2;
-    float    srcpos[4], srcdir[4], srcparam1[4], srcparam2[4];
-    float    nmin[4], nmax[4];
-    uint32_t crop0[4];
-    float    dstep, tstart, tend, Rtstep;
-    int      maxgate;
-    uint32_t mediumid0, isreflect;
-    int      outputtype, threadphoton, oddphoton;
-    uint32_t total_threads, num_media, seed, do_csg;
-    uint32_t has_curvature;
-    uint32_t _pad[1];
+    /* vec4-aligned block (offset 0) */
+    float    srcpos[4];                     //  0: vec4
+    float    srcdir[4];                     // 16: vec4
+    float    srcparam1[4];                  // 32: vec4
+    float    srcparam2[4];                  // 48: vec4
+    float    nmin[4];                       // 64: vec4  (grid_min)
+    float    nmax[4];                       // 80: vec4  (grid_extent)
+    uint32_t crop0[4];                      // 96: uvec4 (grid_stride)
+
+    /* scalar block — packed 4 per row (offset 112) */
+    float    dstep, tstart, tend, Rtstep;   // 112: 4 floats
+    int      srctype, maxgate, outputtype;  // 128: 3 ints
+    uint32_t isreflect;                     // 128+12: 1 uint  → 16 bytes
+    uint32_t mediumid0, total_threads;      // 144: 2 uints
+    uint32_t num_media, seed;               // 144+8: 2 uints → 16 bytes
+    uint32_t do_csg, has_curvature;         // 160: 2 uints
+    int      threadphoton, oddphoton;       // 160+8: 2 ints  → 16 bytes
 };
+// Total: 176 bytes
 
 /* ================================================================ */
 /*                       Vulkan helpers                             */
@@ -758,8 +764,6 @@ int main(int argc, char** argv) {
     CmdOverrides ovr;
     SimConfig cfg = parse_cmdline(argc, argv, ovr);
 
-    printf("sizeof(MCParams) = %zu\n", sizeof(MCParams));
-
     /* ---- Phase 1: Generate CSG mesh if needed ---- */
     std::vector<NodeCurvature> curvData;
     bool has_curvature = false;
@@ -1020,7 +1024,6 @@ int main(int argc, char** argv) {
     /* MCParams */
     MCParams params;
     memset(&params, 0, sizeof(params));
-    params.srctype = cfg.srctype;
 
     for (int i = 0; i < 3; i++) {
         params.srcpos[i] = cfg.srcpos[i];
@@ -1042,17 +1045,24 @@ int main(int argc, char** argv) {
     params.crop0[1] = nx * ny;
     params.crop0[2] = nx * ny * nz;
     params.crop0[3] = crop0w;
+
     params.dstep = 1.0f / vs;
     params.tstart = cfg.t0;
     params.tend = cfg.t1;
     params.Rtstep = 1.0f / cfg.dt;
+
+    params.srctype = cfg.srctype;
     params.maxgate = cfg.maxgate;
-    params.mediumid0 = cfg.mediumid0;
-    params.isreflect = cfg.do_mismatch ? 1u : 0u;
     params.outputtype = cfg.output_type;
+    params.isreflect = cfg.do_mismatch ? 1u : 0u;
+
+    params.mediumid0 = cfg.mediumid0;
     params.total_threads = tt;
     params.num_media = (uint32_t)cfg.media.size();
     params.seed = cfg.rng_seed;
+
+    params.do_csg = cfg.is_csg ? 1u : 0u;
+    params.has_curvature = has_curvature ? 1u : 0u;
     params.do_csg = cfg.is_csg ? 1u : 0u;
     params.has_curvature = has_curvature ? 1u : 0u;
 
@@ -1132,6 +1142,7 @@ int main(int argc, char** argv) {
     // Readback
     std::vector<float> raw(outSz);
     download_from_device(ctx, outBuf, raw.data(), outSz * sizeof(float));
+
     std::vector<float> fluence(crop0w);
     double absorbed = 0;
     int nans = 0, infs = 0;

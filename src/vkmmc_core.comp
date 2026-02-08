@@ -45,19 +45,15 @@ layout(std430, set = 0, binding = 3) buffer OutputBuffer { uint output_data[]; }
 #endif
 
 layout(std140, set = 0, binding = 4) uniform SimParams {
-    int   src_type;
-    int _p0, _p1, _p2;
     vec4  src_pos, src_dir, src_param1, src_param2;
     vec4  grid_min, grid_extent;
     uvec4 grid_stride;
     float voxel_scale, time_start, time_end, inv_timestep;
-    int   max_gate;
-    uint initial_medium, do_reflect;
-    int   output_type, photons_per_thread, extra_photons;
-    uint  total_threads, num_media, rng_seed;
-    uint  do_csg;
-    uint  has_curvature;
-    uint  _pad1;
+    int   src_type, max_gate, output_type;
+    uint  do_reflect;
+    uint  initial_medium, total_threads, num_media, rng_seed;
+    uint  do_csg, has_curvature;
+    int   photons_per_thread, extra_photons;
 };
 
 layout(std430, set = 0, binding = 5) readonly buffer SeedBuffer { uvec4 thread_seeds[]; };
@@ -146,31 +142,6 @@ void unpack_media(float pw, out uint front_med, out uint back_med) {
     uint p = floatBitsToUint(pw);
     front_med = p >> 16u;
     back_med  = p & 0xFFFFu;
-}
-
-// ==================== Curvature-corrected normal ====================
-// Following the MMC curvature paper (Yen & Fang):
-//   N_B = (1/3) * sum_i [ N_Pi - k1_i * d1_i * u_i - k2_i * d2_i * v_i ]
-// where d1_i = dot(B - P_i, u_i), d2_i = dot(B - P_i, v_i)
-// v_i = cross(u_i, N_Pi)
-
-vec3 compute_curvature_normal_at_node(vec3 hit_pos, uint node_idx) {
-    vec3 N  = node_curv[node_idx].vnorm_k1.xyz;
-    float k1 = node_curv[node_idx].vnorm_k1.w;
-    vec3 u  = node_curv[node_idx].pdir_k2.xyz;
-    float k2 = node_curv[node_idx].pdir_k2.w;
-    vec3 v  = cross(u, N);
-
-    // We need the node position. Since we don't have a separate node position
-    // buffer in the shader, we use the vertex buffer via the AS. However,
-    // we can reconstruct using barycentrics from the caller.
-    // Instead, this function takes the displacement from the node to the hit point.
-    // The caller passes (hit_pos - node_pos) as hit_pos for efficiency.
-    vec3 d = hit_pos; // actually (B - P_i)
-    float d1 = dot(d, u);
-    float d2 = dot(d, v);
-
-    return normalize(N - k1 * d1 * u - k2 * d2 * v);
 }
 
 // ==================== Media State Buffer (CSG mode) ====================
@@ -430,13 +401,7 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
 
     if (do_csg > 0u) {
         mstate = uvec2(0u, 0u);
-
-        uint parity[8];
-
-        for (int i = 0; i < 8; i++) {
-            parity[i] = 0u;
-        }
-
+        uint parity = 0u;
         vec3 walk_pos = p;
 
         for (int walk = 0; walk < 64; walk++) {
@@ -452,14 +417,14 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
             unpack_media(face_normal[tid * 2].w, fm, bm);
 
             if (bm > 0u && bm <= 8u) {
-                parity[bm - 1u] ^= 1u;
+                parity ^= (1u << (bm - 1u));
             }
 
             walk_pos = walk_pos + d * (hd + SAFETY_DIST);
         }
 
         for (int i = 0; i < 8; i++) {
-            if (parity[i] != 0u) {
+            if ((parity & (1u << i)) != 0u) {
                 mstate = ms_enter(mstate, uint(i + 1));
             }
         }
@@ -566,116 +531,43 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
 }
 
 // ==================== Curvature-corrected normal at hit point ====================
-// tri_id gives the triangle index; barycentrics (u,v) give the hit location.
-// Vertex indices for triangle tri_id are 3*tri_id, 3*tri_id+1, 3*tri_id+2
-// in the index buffer. But in vkmmc, faces are stored separately and the
-// acceleration structure is built from the index buffer. The primitive index
-// from ray query corresponds to the triangle index, and the vertex indices
-// are faces[tri_id][0,1,2]. We need those node indices to look up curvature.
-//
-// PROBLEM: The GLSL ray query doesn't give us vertex indices directly.
-// We need a vertex index buffer accessible in the shader.
-// We'll reuse FaceBuffer: pack vertex indices into an additional buffer,
-// or pass them via a separate SSBO.
-//
-// WORKAROUND: We store triangle vertex indices in a separate buffer.
-// For now, we encode them in the existing face_normal buffer by using
-// additional entries, OR we add a new SSBO. Since adding another binding
-// would require more pipeline changes, we'll use an alternative:
-//
-// We pass the index buffer as part of the face buffer. Each triangle has:
-//   face_normal[tri_id] = vec4(nx, ny, nz, packed_media)  [already exists]
-// We add a second parallel buffer for vertex indices.
-//
-// SIMPLEST APPROACH: Since the faces are built in order in parse_shapes,
-// and the index buffer uploaded for BLAS is faces[i][0], faces[i][1], faces[i][2],
-// we can pass the flattened index buffer as another SSBO. But to minimize
-// binding changes, we can pack the 3 vertex indices into the SSBO alongside
-// the face normal data.
-//
-// For this implementation, we'll extend the FaceBuffer to interleave:
-//   [tri_id*2 + 0] = vec4(nx, ny, nz, packed_media)
-//   [tri_id*2 + 1] = vec4(v0_as_float, v1_as_float, v2_as_float, 0)
-//
-// This requires changing the host-side facedata upload. Let's do that.
-
-// With the extended face buffer layout:
-//   face_normal[tri_id * 2]     = vec4(nx, ny, nz, packed_media)
-//   face_normal[tri_id * 2 + 1] = uvec4(v0, v1, v2, 0) reinterpreted as vec4
+// Uses per-node principal curvature to estimate the true surface normal.
+// Averages curvature-corrected normals from 3 triangle vertices (Yen & Fang).
+// Vertex indices are stored in face_normal[tri_id*2+1] (interleaved layout).
+// Node positions are in node_curv[idx].node_pos.
 
 vec3 get_curvature_normal(int tri_id, vec2 bary_uv, vec3 hit_pos) {
-    // Read vertex indices from extended face buffer
     vec4 vidx_raw = face_normal[tri_id * 2 + 1];
-    uint v0 = floatBitsToUint(vidx_raw.x);
-    uint v1 = floatBitsToUint(vidx_raw.y);
-    uint v2 = floatBitsToUint(vidx_raw.z);
+    vec3 NB_sum = vec3(0.0);
 
-    // Barycentric: ray query gives (u, v) where hit = (1-u-v)*V0 + u*V1 + v*V2
-    float w0 = 1.0 - bary_uv.x - bary_uv.y;
-    float w1 = bary_uv.x;
-    float w2 = bary_uv.y;
+    for (int vi = 0; vi < 3; vi++) {
+        uint idx = floatBitsToUint(vidx_raw[vi]);
+        vec3 Ni  = node_curv[idx].vnorm_k1.xyz;
+        float k1 = node_curv[idx].vnorm_k1.w;
+        vec3 ui  = node_curv[idx].pdir_k2.xyz;
+        float k2 = node_curv[idx].pdir_k2.w;
+        vec3 Pi  = node_curv[idx].node_pos.xyz;
+        vec3 vi2 = cross(ui, Ni);
+        vec3 di  = hit_pos - Pi;
 
-    // We need node positions to compute (hit_pos - node_pos).
-    // Reconstruct node positions from the curvature data is not possible
-    // (curvature buffer has normals, not positions).
-    // Instead, we compute per-node corrected normals using vertex positions
-    // from the BLAS vertex data. But vertex data isn't directly accessible.
-    //
-    // PRACTICAL SOLUTION: We compute the corrected normal per-node where
-    // displacement = hit_pos - node_pos. Since we know:
-    //   hit_pos = w0*P0 + w1*P1 + w2*P2
-    //   (hit_pos - P0) = w1*(P1-P0) + w2*(P2-P0)
-    // We can't get P0, P1, P2 without a vertex position buffer.
-    //
-    // We'll add node positions to the curvature buffer.
-    // Extended NodeCurv: vec4(nx,ny,nz,k1), vec4(px,py,pz,k2), vec4(posx,posy,posz,0)
-    // = 12 floats per node.
+        // Project displacement onto tangent plane (remove normal component)
+        vec3 dt = di - dot(di, Ni) * Ni;
+        float du = dot(dt, ui);
+        float dv = dot(dt, vi2);
 
-    // Read node positions from extended curvature buffer
-    // (see updated NodeCurv struct below)
+        NB_sum += Ni - k1 * du * ui - k2 * dv * vi2;
+    }
 
-    // For now, use interpolated vertex normal without position-dependent correction
-    // as a first approximation when positions aren't available.
-    // With full implementation (positions in curvature buffer), we do:
+    vec3 NB = normalize(NB_sum);
 
-    vec3 N0 = node_curv[v0].vnorm_k1.xyz;
-    float k1_0 = node_curv[v0].vnorm_k1.w;
-    vec3 u0 = node_curv[v0].pdir_k2.xyz;
-    float k2_0 = node_curv[v0].pdir_k2.w;
+    // Ensure curvature normal is consistent with flat face normal direction
+    vec3 flat_N = face_normal[tri_id * 2].xyz;
 
-    vec3 N1 = node_curv[v1].vnorm_k1.xyz;
-    float k1_1 = node_curv[v1].vnorm_k1.w;
-    vec3 u1 = node_curv[v1].pdir_k2.xyz;
-    float k2_1 = node_curv[v1].pdir_k2.w;
+    if (dot(NB, flat_N) < 0.0) {
+        NB = -NB;
+    }
 
-    vec3 N2 = node_curv[v2].vnorm_k1.xyz;
-    float k1_2 = node_curv[v2].vnorm_k1.w;
-    vec3 u2 = node_curv[v2].pdir_k2.xyz;
-    float k2_2 = node_curv[v2].pdir_k2.w;
-
-    // For flat surfaces (k1=k2=0), this reduces to interpolated vertex normal
-    // For curved surfaces, we need displacements from each vertex to hit point.
-    // We use node_curv[vi].node_pos for vertex positions.
-    vec3 P0 = node_curv[v0].node_pos.xyz;
-    vec3 P1 = node_curv[v1].node_pos.xyz;
-    vec3 P2 = node_curv[v2].node_pos.xyz;
-
-    // Per-node curvature-corrected normal at hit_pos
-    vec3 d0 = hit_pos - P0;
-    vec3 v0_dir = cross(u0, N0);
-    vec3 NB0 = N0 - k1_0 * dot(d0, u0) * u0 - k2_0 * dot(d0, v0_dir) * v0_dir;
-
-    vec3 d1 = hit_pos - P1;
-    vec3 v1_dir = cross(u1, N1);
-    vec3 NB1 = N1 - k1_1 * dot(d1, u1) * u1 - k2_1 * dot(d1, v1_dir) * v1_dir;
-
-    vec3 d2 = hit_pos - P2;
-    vec3 v2_dir = cross(u2, N2);
-    vec3 NB2 = N2 - k1_2 * dot(d2, u2) * u2 - k2_2 * dot(d2, v2_dir) * v2_dir;
-
-    // Average (Eq. 1 from the paper)
-    vec3 NB = (NB0 + NB1 + NB2) / 3.0;
-    return normalize(NB);
+    return NB;
 }
 
 // ==================== Main ====================
