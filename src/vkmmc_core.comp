@@ -549,13 +549,9 @@ vec3 get_curvature_normal(int tri_id, vec2 bary_uv, vec3 hit_pos) {
         vec3 Pi  = node_curv[idx].node_pos.xyz;
         vec3 vi2 = cross(ui, Ni);
         vec3 di  = hit_pos - Pi;
-
-        // Project displacement onto tangent plane (remove normal component)
-        vec3 dt = di - dot(di, Ni) * Ni;
-        float du = dot(dt, ui);
-        float dv = dot(dt, vi2);
-
-        NB_sum += Ni - k1 * du * ui - k2 * dv * vi2;
+        float du = dot(di, ui);
+        float dv = dot(di, vi2);
+        NB_sum += Ni + k1 * du * ui + k2 * dv * vi2;
     }
 
     vec3 NB = normalize(NB_sum);

@@ -31,10 +31,11 @@ struct NodeCurvature {
 /* Per-shape origin info needed for analytic curvature */
 struct ShapeOrigin {
     int type;             /* 0=box/slab, 1=sphere, 2=cylinder */
-    float cx, cy, cz;    /* center (sphere) or axis point (cylinder) */
-    float ax, ay, az;    /* axis direction (cylinder only) */
+    float cx, cy, cz;    /* center (sphere) or C0 (cylinder) */
+    float ax, ay, az;    /* axis direction (cylinder only, unit vector) */
     float R;              /* radius */
-    uint32_t node_start, node_end; /* range in combined node list */
+    float length;         /* cylinder axis length */
+    uint32_t node_start, node_end;
 };
 
 /* ================================================================ */
@@ -135,18 +136,29 @@ static std::vector<NodeCurvature> compute_curvature(
             float rx = dx - proj * so.ax, ry = dy - proj * so.ay, rz = dz - proj * so.az;
             float rl = std::sqrt(rx * rx + ry * ry + rz * rz);
 
-            if (rl < 1e-10f) {
-                curv[i].nx = so.ax;
-                curv[i].ny = so.ay;
-                curv[i].nz = so.az;
+            /* Determine if this node is on a cap or the curved side.
+               Cap: node at cylinder endpoint (proj ≈ 0 or proj ≈ length)
+               Side: node between endpoints with rl ≈ R
+               Edge-ring nodes are at endpoints AND rl=R; treat as cap (k=0). */
+            float eps_cap = so.length * 0.01f + 0.01f;
+            bool is_cap = (proj < eps_cap) || (proj > so.length - eps_cap) || (rl < so.R * 0.5f);
+
+            if (is_cap) {
+                /* Cap: flat surface, normal = ±axis direction */
+                /* Determine which cap by sign of projection along axis */
+                float sign_proj = (proj >= 0) ? 1.0f : -1.0f;
+                curv[i].nx = so.ax * sign_proj;
+                curv[i].ny = so.ay * sign_proj;
+                curv[i].nz = so.az * sign_proj;
                 curv[i].k1 = 0;
                 curv[i].k2 = 0;
                 float tx, ty, tz;
-                make_tangent(so.ax, so.ay, so.az, tx, ty, tz);
+                make_tangent(curv[i].nx, curv[i].ny, curv[i].nz, tx, ty, tz);
                 curv[i].px = tx;
                 curv[i].py = ty;
                 curv[i].pz = tz;
             } else {
+                /* Curved side */
                 float nx = rx / rl, ny = ry / rl, nz = rz / rl;
                 float cx2 = so.ay * nz - so.az * ny, cy2 = so.az * nx - so.ax * nz, cz2 = so.ax * ny - so.ay * nx;
                 float cl = std::sqrt(cx2 * cx2 + cy2 * cy2 + cz2 * cz2);
@@ -259,6 +271,7 @@ static std::vector<ShapeOrigin> extract_shape_origins(const json& arr) {
             so.cz = z0;
             float dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
             float l = std::sqrt(dx * dx + dy * dy + dz * dz);
+            so.length = l;
 
             if (l > 1e-10f) {
                 so.ax = dx / l;

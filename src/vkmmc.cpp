@@ -626,9 +626,10 @@ struct CmdOverrides {
     bool listgpu, dumpjson, dumpmesh;
     int meshres;
     int docurv;   // -1 = auto (enable for CSG), 0 = off, 1 = on
+    bool debugcurv;
     std::string session_id, json_str, inputfile;
     CmdOverrides(): nphoton(0), batch_size(UINT64_MAX), rng_seed(0), totalthread(0), unitinmm(0),
-        outputtype(-1), isreflect(-1), isnormalize(-1), gpuid(0), listgpu(false), dumpjson(false), dumpmesh(false), meshres(0), docurv(-1) {}
+        outputtype(-1), isreflect(-1), isnormalize(-1), gpuid(0), listgpu(false), dumpjson(false), dumpmesh(false), meshres(0), docurv(-1), debugcurv(false) {}
 };
 
 void printhelp(const char* n) {
@@ -638,7 +639,7 @@ void printhelp(const char* n) {
            " -u/--unitinmm\tvoxel size [1]\n -E/--seed\tRNG seed\n -O/--outputtype\tx:energy,f:flux,l:fluence\n"
            " -b/--reflect\tmismatch [1]\n -U/--normalize\t[1]\n -t/--thread\tGPU threads [65536]\n"
            " -B/--batch\tphotons/batch [500000, 0=no batch]\n -G/--gpuid\tdevice [1]\n"
-           " -m/--meshres\tshape mesh resolution [24]\n -c/--curv\tcurvature [1=on,0=off,-1=auto]\n"
+           " -m/--meshres\tshape mesh resolution [24]\n -c/--curv\tcurvature [1=on,0=off,-1=auto]\n --debugcurv\texport curvature normal error map\n"
            " -L/--listgpu\tlist GPUs\n --dumpjson\tdump config\n --dumpmesh\tsave mesh JSON\n -h/--help\n", n, n);
     exit(0);
 }
@@ -684,6 +685,8 @@ SimConfig parse_cmdline(int argc, char** argv, CmdOverrides& ovr) {
             ovr.dumpjson = true;
         } else if (a == "--dumpmesh") {
             ovr.dumpmesh = true;
+        } else if (a == "--debugcurv") {
+            ovr.debugcurv = true;
         } else if ((a == "-m" || a == "--meshres") && i + 1 < argc) {
             ovr.meshres = atoi(argv[++i]);
         } else if ((a == "-c" || a == "--curv") && i + 1 < argc) {
@@ -867,6 +870,379 @@ int main(int argc, char** argv) {
         std::ofstream of(mf.c_str());
         of << dump.dump(2) << std::endl;
         printf("Mesh saved to %s (%zu nodes, %zu faces, %s mode)\n", mf.c_str(), nn, nf, cfg.is_csg ? "CSG" : "mesh");
+        return 0;
+    }
+
+    if (ovr.debugcurv) {
+        if (!has_curvature || curvData.empty()) {
+            fprintf(stderr, "debugcurv requires curvature data (use -c 1)\n");
+            return 1;
+        }
+
+        // Re-read JSON for shape origins
+        std::ifstream dcf(ovr.inputfile.c_str());
+        json dcroot;
+        dcf >> dcroot;
+        std::vector<ShapeOrigin> origins = extract_shape_origins(dcroot["Shapes"]);
+
+        // ---- Coarse mesh: already built (cfg.nodes, cfg.faces, curvData) ----
+        printf("debugcurv: coarse mesh = %zu nodes, %zu faces (mesh_res=%d)\n",
+               cfg.nodes.size(), cfg.faces.size(), cfg.mesh_res);
+
+        // ---- Fine mesh: rebuild at higher resolution ----
+        int fine_res = cfg.mesh_res * 4;
+        float ext_fine[6] = {0, 60, 0, 60, 0, 60};
+        ShapeMesh fine_mesh = parse_shapes(dcroot["Shapes"], ext_fine, fine_res);
+        printf("debugcurv: fine mesh = %zu nodes, %zu faces (mesh_res=%d)\n",
+               fine_mesh.nodes.size(), fine_mesh.faces.size(), fine_res);
+
+        // ---- For each fine mesh node, find enclosing coarse triangle ----
+        // Build per-shape coarse face lists for faster lookup
+        // shape_id is 1-based in cfg.face_shape_id
+
+        size_t nn_fine = fine_mesh.nodes.size();
+        size_t nf_fine = fine_mesh.faces.size();
+
+        // Compute analytic normal at each fine node
+        // Also compute curvature-predicted normal using coarse mesh
+        // node_shape mapping for fine mesh
+        std::vector<int> fine_node_shape(nn_fine, -1);
+
+        for (size_t fi = 0; fi < fine_mesh.faces.size(); fi++) {
+            int si = (fi < fine_mesh.shape_id.size()) ? (int)fine_mesh.shape_id[fi] - 1 : -1;
+
+            for (int k = 0; k < 3; k++) {
+                uint32_t ni = fine_mesh.faces[fi][k];
+
+                if (ni < nn_fine && fine_node_shape[ni] < 0) {
+                    fine_node_shape[ni] = si;
+                }
+            }
+        }
+
+        // Output: x, y, z, curv_error, flat_error per fine node
+        std::vector<float> out_nodes(nn_fine * 5);
+        double curv_err_sum = 0, curv_err_max = 0;
+        double flat_err_sum = 0, flat_err_max = 0;
+        int counted = 0;
+
+        // Helper: compute analytic normal at a point for a given shape
+        auto analytic_normal = [&](float px, float py, float pz, int si, Vec3 fallback) -> Vec3 {
+            Vec3 N = fallback;
+
+            if (si >= 0 && si < (int)origins.size()) {
+                const ShapeOrigin& so = origins[si];
+
+                if (so.type == 1) { // sphere
+                    float dx = px - so.cx, dy = py - so.cy, dz = pz - so.cz;
+                    float dl = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+                    if (dl > 1e-10f) {
+                        N.x = dx / dl;
+                        N.y = dy / dl;
+                        N.z = dz / dl;
+                    }
+                } else if (so.type == 2) { // cylinder
+                    float dx = px - so.cx, dy = py - so.cy, dz = pz - so.cz;
+                    float proj = dx * so.ax + dy * so.ay + dz * so.az;
+                    float rx = dx - proj * so.ax, ry = dy - proj * so.ay, rz = dz - proj * so.az;
+                    float rl = std::sqrt(rx * rx + ry * ry + rz * rz);
+
+                    if (rl > 1e-10f) {
+                        N.x = rx / rl;
+                        N.y = ry / rl;
+                        N.z = rz / rl;
+                    }
+                }
+            }
+
+            return N;
+        };
+
+        // Helper: compute barycentric coords of point P in triangle (A, B, C)
+        // Returns true if P is inside, sets u, v, w (barycentric weights)
+        auto barycentric = [](Vec3 P, Vec3 A, Vec3 B, Vec3 C, float & u, float & v, float & w) -> bool {
+            Vec3 v0 = {B.x - A.x, B.y - A.y, B.z - A.z};
+            Vec3 v1 = {C.x - A.x, C.y - A.y, C.z - A.z};
+            Vec3 v2 = {P.x - A.x, P.y - A.y, P.z - A.z};
+            float d00 = v0.x * v0.x + v0.y * v0.y + v0.z * v0.z;
+            float d01 = v0.x * v1.x + v0.y * v1.y + v0.z * v1.z;
+            float d11 = v1.x * v1.x + v1.y * v1.y + v1.z * v1.z;
+            float d20 = v2.x * v0.x + v2.y * v0.y + v2.z * v0.z;
+            float d21 = v2.x * v1.x + v2.y * v1.y + v2.z * v1.z;
+            float denom = d00 * d11 - d01 * d01;
+
+            if (std::fabs(denom) < 1e-20f) {
+                return false;
+            }
+
+            v = (d11 * d20 - d01 * d21) / denom;
+            w = (d00 * d21 - d01 * d20) / denom;
+            u = 1.0f - v - w;
+            return (u >= -0.01f && v >= -0.01f && w >= -0.01f);
+        };
+
+        // Helper: curvature-predicted normal at point (sx,sy,sz) using coarse triangle fi
+        auto curv_normal_at = [&](float sx, float sy, float sz, size_t fi) -> Vec3 {
+            uint32_t cv0 = cfg.faces[fi][0], cv1 = cfg.faces[fi][1], cv2 = cfg.faces[fi][2];
+            float NB[3] = {0, 0, 0};
+            uint32_t vidx[3] = {cv0, cv1, cv2};
+
+            for (int vi = 0; vi < 3; vi++) {
+                uint32_t idx = vidx[vi];
+                float Ni[3] = {curvData[idx].nx, curvData[idx].ny, curvData[idx].nz};
+                float k1 = curvData[idx].k1, k2 = curvData[idx].k2;
+                float ui[3] = {curvData[idx].px, curvData[idx].py, curvData[idx].pz};
+                float Pi[3] = {cfg.nodes[idx].x, cfg.nodes[idx].y, cfg.nodes[idx].z};
+                // v = cross(u, N) — same as shader
+                float vdir[3] = {
+                    ui[1]* Ni[2] - ui[2]* Ni[1], ui[2]* Ni[0] - ui[0]* Ni[2], ui[0]* Ni[1] - ui[1]* Ni[0]
+                };
+                float di[3] = {sx - Pi[0], sy - Pi[1], sz - Pi[2]};
+
+                // Use full displacement as in the paper
+                float du = di[0] * ui[0] + di[1] * ui[1] + di[2] * ui[2];
+                float dv = di[0] * vdir[0] + di[1] * vdir[1] + di[2] * vdir[2];
+                NB[0] += Ni[0] + k1 * du * ui[0] + k2 * dv * vdir[0];
+                NB[1] += Ni[1] + k1 * du * ui[1] + k2 * dv * vdir[1];
+                NB[2] += Ni[2] + k1 * du * ui[2] + k2 * dv * vdir[2];
+            }
+
+            float nbl = std::sqrt(NB[0] * NB[0] + NB[1] * NB[1] + NB[2] * NB[2]);
+
+            if (nbl > 1e-10f) {
+                NB[0] /= nbl;
+                NB[1] /= nbl;
+                NB[2] /= nbl;
+            }
+
+            // Ensure consistent with coarse face normal
+            float fn[3] = {cfg.facedata[fi].nx, cfg.facedata[fi].ny, cfg.facedata[fi].nz};
+
+            if (NB[0]*fn[0] + NB[1]*fn[1] + NB[2]*fn[2] < 0) {
+                NB[0] = -NB[0];
+                NB[1] = -NB[1];
+                NB[2] = -NB[2];
+            }
+
+            return {NB[0], NB[1], NB[2]};
+        };
+
+        // For each fine node, find closest coarse triangle by projecting onto
+        // the triangle plane and checking containment. Use the triangle whose
+        // centroid is nearest as fallback.
+        printf("debugcurv: computing normal errors...\n");
+
+        for (size_t ni = 0; ni < nn_fine; ni++) {
+            Vec3 P = fine_mesh.nodes[ni];
+            int si = fine_node_shape[ni];
+            out_nodes[ni * 5 + 0] = P.x;
+            out_nodes[ni * 5 + 1] = P.y;
+            out_nodes[ni * 5 + 2] = P.z;
+            out_nodes[ni * 5 + 3] = 0;
+            out_nodes[ni * 5 + 4] = 0;
+
+            Vec3 fallback = {0, 0, 1};
+            Vec3 N_analytic = analytic_normal(P.x, P.y, P.z, si, fallback);
+
+            // Find nearest coarse triangle centroid of same shape
+            int best_fi = -1;
+            float best_cdist = 1e30f;
+
+            for (size_t fi = 0; fi < cfg.faces.size(); fi++) {
+                int csi = (fi < cfg.face_shape_id.size()) ? (int)cfg.face_shape_id[fi] - 1 : -1;
+
+                if (csi != si) {
+                    continue;
+                }
+
+                Vec3 A = cfg.nodes[cfg.faces[fi][0]];
+                Vec3 B = cfg.nodes[cfg.faces[fi][1]];
+                Vec3 C = cfg.nodes[cfg.faces[fi][2]];
+                float cx2 = (A.x + B.x + C.x) / 3, cy2 = (A.y + B.y + C.y) / 3, cz2 = (A.z + B.z + C.z) / 3;
+                float d2 = (P.x - cx2) * (P.x - cx2) + (P.y - cy2) * (P.y - cy2) + (P.z - cz2) * (P.z - cz2);
+
+                if (d2 < best_cdist) {
+                    best_cdist = d2;
+                    best_fi = (int)fi;
+                }
+            }
+
+            // Refine: among the closest few triangles, pick the one where
+            // the point projects best (smallest barycentric clamp distance)
+            if (best_fi >= 0) {
+                // Also check the triangles sharing vertices with best_fi
+                // For simplicity, check all same-shape triangles within 2x centroid distance
+                float search_r2 = best_cdist * 4.0f + 1.0f;
+                int refined_fi = best_fi;
+                float best_bary_err = 1e30f;
+
+                for (size_t fi = 0; fi < cfg.faces.size(); fi++) {
+                    int csi = (fi < cfg.face_shape_id.size()) ? (int)cfg.face_shape_id[fi] - 1 : -1;
+
+                    if (csi != si) {
+                        continue;
+                    }
+
+                    Vec3 A = cfg.nodes[cfg.faces[fi][0]];
+                    Vec3 B = cfg.nodes[cfg.faces[fi][1]];
+                    Vec3 C = cfg.nodes[cfg.faces[fi][2]];
+                    float cx2 = (A.x + B.x + C.x) / 3, cy2 = (A.y + B.y + C.y) / 3, cz2 = (A.z + B.z + C.z) / 3;
+                    float d2 = (P.x - cx2) * (P.x - cx2) + (P.y - cy2) * (P.y - cy2) + (P.z - cz2) * (P.z - cz2);
+
+                    if (d2 > search_r2) {
+                        continue;
+                    }
+
+                    float u, v, w;
+
+                    if (barycentric(P, A, B, C, u, v, w)) {
+                        // Clamp distance from valid range
+                        float berr = 0;
+
+                        if (u < 0) {
+                            berr += u * u;
+                        }
+
+                        if (v < 0) {
+                            berr += v * v;
+                        }
+
+                        if (w < 0) {
+                            berr += w * w;
+                        }
+
+                        if (berr < best_bary_err) {
+                            best_bary_err = berr;
+                            refined_fi = (int)fi;
+                        }
+                    }
+                }
+
+                best_fi = refined_fi;
+            }
+
+            if (best_fi >= 0) {
+                // Curvature-predicted normal
+                Vec3 N_curv = curv_normal_at(P.x, P.y, P.z, (size_t)best_fi);
+
+                // Ensure analytic normal consistent direction
+                float fn[3] = {cfg.facedata[best_fi].nx, cfg.facedata[best_fi].ny, cfg.facedata[best_fi].nz};
+
+                if (N_analytic.x * fn[0] + N_analytic.y * fn[1] + N_analytic.z * fn[2] < 0) {
+                    N_analytic.x = -N_analytic.x;
+                    N_analytic.y = -N_analytic.y;
+                    N_analytic.z = -N_analytic.z;
+                }
+
+                // Flat face normal of coarse triangle
+                Vec3 N_flat = {cfg.facedata[best_fi].nx, cfg.facedata[best_fi].ny, cfg.facedata[best_fi].nz};
+
+                float curv_dot = N_curv.x * N_analytic.x + N_curv.y * N_analytic.y + N_curv.z * N_analytic.z;
+                float flat_dot = N_flat.x * N_analytic.x + N_flat.y * N_analytic.y + N_flat.z * N_analytic.z;
+                float cerr = 1.0f - std::min(1.0f, std::max(-1.0f, curv_dot));
+                float ferr = 1.0f - std::min(1.0f, std::max(-1.0f, flat_dot));
+
+                // Debug: print details for high-error nodes
+                static int dbg_printed = 0;
+
+                if (cerr > 0.5f && dbg_printed < 5) {
+                    dbg_printed++;
+                    Vec3 A = cfg.nodes[cfg.faces[best_fi][0]];
+                    Vec3 B = cfg.nodes[cfg.faces[best_fi][1]];
+                    Vec3 C = cfg.nodes[cfg.faces[best_fi][2]];
+                    int csi = (best_fi < (int)cfg.face_shape_id.size()) ? (int)cfg.face_shape_id[best_fi] - 1 : -1;
+                    printf("  HIGH ERR node %zu: pos=(%.2f,%.2f,%.2f) shape=%d\n", ni, P.x, P.y, P.z, si);
+                    printf("    matched coarse face %d: shape=%d\n", best_fi, csi);
+                    printf("    coarse verts: (%.2f,%.2f,%.2f) (%.2f,%.2f,%.2f) (%.2f,%.2f,%.2f)\n",
+                           A.x, A.y, A.z, B.x, B.y, B.z, C.x, C.y, C.z);
+                    printf("    N_curv=(%.4f,%.4f,%.4f) N_anal=(%.4f,%.4f,%.4f) N_flat=(%.4f,%.4f,%.4f)\n",
+                           N_curv.x, N_curv.y, N_curv.z, N_analytic.x, N_analytic.y, N_analytic.z,
+                           N_flat.x, N_flat.y, N_flat.z);
+                    printf("    curv_dot=%.6f flat_dot=%.6f cerr=%.6f ferr=%.6f\n", curv_dot, flat_dot, cerr, ferr);
+
+                    // Print vertex curvature data
+                    for (int vv = 0; vv < 3; vv++) {
+                        uint32_t idx = cfg.faces[best_fi][vv];
+                        printf("    vtx %u: N=(%.3f,%.3f,%.3f) k1=%.4f k2=%.4f u=(%.3f,%.3f,%.3f)\n",
+                               idx, curvData[idx].nx, curvData[idx].ny, curvData[idx].nz,
+                               curvData[idx].k1, curvData[idx].k2,
+                               curvData[idx].px, curvData[idx].py, curvData[idx].pz);
+                    }
+                }
+
+                out_nodes[ni * 5 + 3] = cerr;
+                out_nodes[ni * 5 + 4] = ferr;
+                curv_err_sum += cerr;
+
+                if (cerr > curv_err_max) {
+                    curv_err_max = cerr;
+                }
+
+                flat_err_sum += ferr;
+
+                if (ferr > flat_err_max) {
+                    flat_err_max = ferr;
+                }
+
+                counted++;
+            }
+        }
+
+        printf("debugcurv: %d nodes evaluated\n", counted);
+        printf("  curvature normal error — mean=%.6e  max=%.6e\n", curv_err_sum / counted, curv_err_max);
+        printf("  flat normal error      — mean=%.6e  max=%.6e\n", flat_err_sum / counted, flat_err_max);
+        printf("  improvement ratio      — mean=%.2fx  max=%.2fx\n",
+               (flat_err_sum / counted) / (curv_err_sum / counted + 1e-30),
+               flat_err_max / (curv_err_max + 1e-30));
+
+        // Print worst-error nodes
+        printf("  worst curvature-error nodes:\n");
+        std::vector<std::pair<float, size_t>> errs;
+
+        for (size_t i = 0; i < nn_fine; i++)
+            errs.push_back({out_nodes[i * 5 + 3], i});
+        std::sort(errs.begin(), errs.end(), [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) {
+            return a.first > b.first;
+        });
+
+        for (int i = 0; i < std::min(10, (int)errs.size()); i++) {
+            size_t ni = errs[i].second;
+            printf("    node %zu: pos=(%.2f,%.2f,%.2f) curv_err=%.6f flat_err=%.6f\n",
+                   ni, out_nodes[ni * 5], out_nodes[ni * 5 + 1], out_nodes[ni * 5 + 2],
+                   out_nodes[ni * 5 + 3], out_nodes[ni * 5 + 4]);
+        }
+
+        // Export JData JSON
+        json dump;
+        dump["Session"] = {{"ID", cfg.session_id + "_curv"}};
+        dump["CoarseMesh"] = {{"Nodes", (int)cfg.nodes.size()}, {"Faces", (int)cfg.faces.size()}, {"MeshRes", cfg.mesh_res}};
+        dump["FineMesh"] = {{"Nodes", (int)nn_fine}, {"Faces", (int)nf_fine}, {"MeshRes", fine_res}};
+
+        // MeshNode: Nx5 (x, y, z, curv_error, flat_error)
+        std::vector<size_t> ndim = {nn_fine, 5};
+        dump["Shapes"]["MeshNode"] = jdata_encode("single", ndim,
+                                     out_nodes.data(), nn_fine * 5 * sizeof(float), false);
+
+        // MeshSurf from fine mesh: Mx4 (v1, v2, v3, shape_id) — 1-based
+        std::vector<int32_t> surf_data(nf_fine * 4);
+
+        for (size_t fi = 0; fi < nf_fine; fi++) {
+            surf_data[fi * 4 + 0] = (int32_t)(fine_mesh.faces[fi][0] + 1);
+            surf_data[fi * 4 + 1] = (int32_t)(fine_mesh.faces[fi][1] + 1);
+            surf_data[fi * 4 + 2] = (int32_t)(fine_mesh.faces[fi][2] + 1);
+            surf_data[fi * 4 + 3] = (fi < fine_mesh.shape_id.size()) ? (int32_t)fine_mesh.shape_id[fi] : 1;
+        }
+
+        std::vector<size_t> sdim = {nf_fine, 4};
+        dump["Shapes"]["MeshSurf"] = jdata_encode("int32", sdim,
+                                     surf_data.data(), nf_fine * 4 * sizeof(int32_t), false);
+
+        std::string outf = cfg.session_id + "_curv.json";
+        std::ofstream ofs(outf.c_str());
+        ofs << dump.dump(2) << std::endl;
+        printf("debugcurv: saved to %s\n", outf.c_str());
+
         return 0;
     }
 
