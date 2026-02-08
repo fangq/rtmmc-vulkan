@@ -5,6 +5,10 @@
  * Box:      8 nodes, 12 triangles (6 quads)
  * Sphere:   lat/lon grid, (nlat-1)*nlon*2 triangles + 2*nlon cap triangles
  * Cylinder: side quads + center-fan caps
+ *
+ * Flat-flag: bit 31 of packed_media is set for geometrically flat triangles
+ * (boxes, slabs, cylinder caps). When has_curvature=1, the shader skips
+ * curvature normal correction for these triangles and uses the face normal.
  */
 #ifndef VKMMC_SHAPES_H
 #define VKMMC_SHAPES_H
@@ -36,8 +40,16 @@ static float pack_tag(uint32_t tag) {
     return f;
 }
 
+/* pack tag with bit-31 set to mark triangle as geometrically flat */
+static float pack_tag_flat(uint32_t tag) {
+    uint32_t pk = (tag & 0xFFFFu) | 0x80000000u;
+    float f;
+    std::memcpy(&f, &pk, 4);
+    return f;
+}
+
 /* add one triangle with outward normal, front=0, back=tag */
-static void add_tri(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c, uint32_t tag) {
+static void add_tri(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c, uint32_t tag, bool flat = false) {
     m.faces.push_back({{a, b, c}});
     Vec3 va = m.nodes[a], vb = m.nodes[b], vc = m.nodes[c];
     Vec3 e1 = {vb.x - va.x, vb.y - va.y, vb.z - va.z}, e2 = {vc.x - va.x, vc.y - va.y, vc.z - va.z};
@@ -54,18 +66,18 @@ static void add_tri(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c, uint32_t t
     fd.nx = n.x;
     fd.ny = n.y;
     fd.nz = n.z;
-    fd.packed_media = pack_tag(tag);
+    fd.packed_media = flat ? pack_tag_flat(tag) : pack_tag(tag);
     m.facedata.push_back(fd);
 }
 
 /* add quad as 2 triangles */
-static void add_quad(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t tag) {
-    add_tri(m, a, b, c, tag);
-    add_tri(m, a, c, d, tag);
+static void add_quad(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t tag, bool flat = false) {
+    add_tri(m, a, b, c, tag, flat);
+    add_tri(m, a, c, d, tag, flat);
 }
 
 /* ================================================================ */
-/*  Box: 8 nodes, 12 triangles, outward normals                    */
+/*  Box: 8 nodes, 12 triangles, outward normals — all flat          */
 /* ================================================================ */
 static void gen_box(ShapeMesh& m, float ox, float oy, float oz,
                     float sx, float sy, float sz, uint32_t tag) {
@@ -78,16 +90,16 @@ static void gen_box(ShapeMesh& m, float ox, float oy, float oz,
         m.nodes.push_back(v[i]);
     }
 
-    add_quad(m, b + 0, b + 3, b + 2, b + 1, tag); /* -Z */
-    add_quad(m, b + 4, b + 5, b + 6, b + 7, tag); /* +Z */
-    add_quad(m, b + 0, b + 1, b + 5, b + 4, tag); /* -Y */
-    add_quad(m, b + 2, b + 3, b + 7, b + 6, tag); /* +Y */
-    add_quad(m, b + 0, b + 4, b + 7, b + 3, tag); /* -X */
-    add_quad(m, b + 1, b + 2, b + 6, b + 5, tag); /* +X */
+    add_quad(m, b + 0, b + 3, b + 2, b + 1, tag, true); /* -Z */
+    add_quad(m, b + 4, b + 5, b + 6, b + 7, tag, true); /* +Z */
+    add_quad(m, b + 0, b + 1, b + 5, b + 4, tag, true); /* -Y */
+    add_quad(m, b + 2, b + 3, b + 7, b + 6, tag, true); /* +Y */
+    add_quad(m, b + 0, b + 4, b + 7, b + 3, tag, true); /* -X */
+    add_quad(m, b + 1, b + 2, b + 6, b + 5, tag, true); /* +X */
 }
 
 /* ================================================================ */
-/*  Sphere: lat/lon subdivision, watertight                         */
+/*  Sphere: lat/lon subdivision, watertight — all curved            */
 /*  nlon = longitude divisions, nlat = latitude divisions           */
 /* ================================================================ */
 static void gen_sphere(ShapeMesh& m, float cx, float cy, float cz,
@@ -140,7 +152,7 @@ static void gen_sphere(ShapeMesh& m, float cx, float cy, float cz,
 }
 
 /* ================================================================ */
-/*  Cylinder: side quads + center-fan caps, along arbitrary axis    */
+/*  Cylinder: side quads (curved) + center-fan caps (flat)          */
 /* ================================================================ */
 static void gen_cylinder(ShapeMesh& m, float c0x, float c0y, float c0z,
                          float c1x, float c1y, float c1z, float R,
@@ -198,27 +210,27 @@ static void gen_cylinder(ShapeMesh& m, float c0x, float c0y, float c0z,
     uint32_t cap1 = (uint32_t)m.nodes.size();
     m.nodes.push_back({c1x, c1y, c1z});
 
-    /* side quads */
+    /* side quads — curved surface */
     for (int i = 0; i < nseg; i++) {
         int n = (i + 1) % nseg;
-        add_quad(m, b + i, b + n, b + nseg + n, b + nseg + i, tag);
+        add_quad(m, b + i, b + n, b + nseg + n, b + nseg + i, tag, false);
     }
 
-    /* bottom cap (c0): fan, normal toward -axis */
+    /* bottom cap (c0): fan, normal toward -axis — flat */
     for (int i = 0; i < nseg; i++) {
         int n = (i + 1) % nseg;
-        add_tri(m, cap0, b + n, b + i, tag);
+        add_tri(m, cap0, b + n, b + i, tag, true);
     }
 
-    /* top cap (c1): fan, normal toward +axis */
+    /* top cap (c1): fan, normal toward +axis — flat */
     for (int i = 0; i < nseg; i++) {
         int n = (i + 1) % nseg;
-        add_tri(m, cap1, b + nseg + i, b + nseg + n, tag);
+        add_tri(m, cap1, b + nseg + i, b + nseg + n, tag, true);
     }
 }
 
 /* ================================================================ */
-/*  Slab: axis-aligned slab = box between two bounds                */
+/*  Slab: axis-aligned slab = box between two bounds (flat)         */
 /* ================================================================ */
 static void gen_slab(ShapeMesh& m, int dir, float lo, float hi,
                      float ext[6], uint32_t tag) {
@@ -340,10 +352,16 @@ static ShapeMesh parse_shapes(const json& arr, float ext[6], int mesh_res = 24) 
 
     /* verify: print tag distribution */
     int tagcount[16] = {};
+    int flatcount = 0;
 
     for (size_t i = 0; i < m.facedata.size(); i++) {
         uint32_t pk = 0;
         std::memcpy(&pk, &m.facedata[i].packed_media, 4);
+
+        if (pk & 0x80000000u) {
+            flatcount++;
+        }
+
         uint32_t t = pk & 0xFFFFu;
 
         if (t < 16) {
@@ -357,7 +375,7 @@ static ShapeMesh parse_shapes(const json& arr, float ext[6], int mesh_res = 24) 
             printf(" [%d]=%d", i, tagcount[i]);
         }
 
-    printf("\n");
+    printf("\n  Flat-flagged triangles: %d / %zu\n", flatcount, m.facedata.size());
 
     return m;
 }

@@ -821,9 +821,12 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < cfg.faces.size() && i < 5; i++) {
             uint32_t pk = 0;
             memcpy(&pk, &cfg.facedata[i].packed_media, 4);
-            printf("  face[%zu]: v=(%u,%u,%u) n=(%.3f,%.3f,%.3f) front=%u back=%u\n",
+            bool is_flat = (pk & 0x80000000u) != 0;
+            uint32_t pk_clean = pk & 0x7FFFFFFFu;
+            printf("  face[%zu]: v=(%u,%u,%u) n=(%.3f,%.3f,%.3f) front=%u back=%u%s\n",
                    i, cfg.faces[i][0], cfg.faces[i][1], cfg.faces[i][2],
-                   cfg.facedata[i].nx, cfg.facedata[i].ny, cfg.facedata[i].nz, pk >> 16, pk & 0xFFFF);
+                   cfg.facedata[i].nx, cfg.facedata[i].ny, cfg.facedata[i].nz,
+                   pk_clean >> 16, pk_clean & 0xFFFF, is_flat ? " [FLAT]" : "");
         }
 
         json dump;
@@ -983,7 +986,18 @@ int main(int argc, char** argv) {
         };
 
         // Helper: curvature-predicted normal at point (sx,sy,sz) using coarse triangle fi
+        // If the triangle is flagged as flat (bit 31 of packed_media), returns
+        // the precomputed face normal directly without curvature correction.
         auto curv_normal_at = [&](float sx, float sy, float sz, size_t fi) -> Vec3 {
+            // Check flat flag (bit 31 of packed_media)
+            uint32_t pk = 0;
+            memcpy(&pk, &cfg.facedata[fi].packed_media, 4);
+
+            if (pk & 0x80000000u) {
+                // Flat triangle: return precomputed face normal directly
+                return {cfg.facedata[fi].nx, cfg.facedata[fi].ny, cfg.facedata[fi].nz};
+            }
+
             uint32_t cv0 = cfg.faces[fi][0], cv1 = cfg.faces[fi][1], cv2 = cfg.faces[fi][2];
             float NB[3] = {0, 0, 0};
             uint32_t vidx[3] = {cv0, cv1, cv2};
