@@ -351,7 +351,11 @@ void setup_optix(OptixState& st, int gpuid, const char* ptxfile) {
     st.pipeCompileOpts = {};
     st.pipeCompileOpts.usesMotionBlur = false;
     st.pipeCompileOpts.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
-    st.pipeCompileOpts.numPayloadValues = 16;  /* 12 photon + 4 RNG */
+#ifdef USE_CSG
+    st.pipeCompileOpts.numPayloadValues = 16;  // 12 photon + 4 RNG
+#else
+    st.pipeCompileOpts.numPayloadValues = 14;  // 10 photon + 4 RNG
+#endif
     st.pipeCompileOpts.numAttributeValues = 2;
     st.pipeCompileOpts.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
     st.pipeCompileOpts.pipelineLaunchParamsVariableName = "gcfg";

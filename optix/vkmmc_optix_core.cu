@@ -1,5 +1,9 @@
 /*
- * vkmmc_optix_core.cu – OptiX 7 MC with CSG & curvature (FIXED)
+ * vkmmc_optix_core.cu — OptiX 7 MC photon transport
+ *
+ * Compile-time flags:
+ *   USE_CSG       — enable CSG shape-based media state tracking
+ *   USE_CURVATURE — enable curvature-corrected normals (requires USE_CSG)
  */
 
 #include <optix.h>
@@ -9,14 +13,21 @@
 #include <math.h>
 #include <stdint.h>
 
+#if defined(USE_CURVATURE) && !defined(USE_CSG)
+    #error "USE_CURVATURE requires USE_CSG"
+#endif
+
 struct Medium {
     float mua, mus, g, n;
 };
+
+#ifdef USE_CURVATURE
 struct NodeCurv {
     float4 vnorm_k1;
     float4 pdir_k2;
     float4 node_pos;
 };
+#endif
 
 #define MAX_PROP 256
 
@@ -35,7 +46,9 @@ struct VKMMCParam {
     int maxgate;
     unsigned int initial_medium, do_reflect;
     int output_type;
-    unsigned int num_media, do_csg, has_curvature;
+    unsigned int num_media;
+    unsigned int do_csg;
+    unsigned int has_curvature;
     int threadphoton, oddphoton;
     float minenergy, roulettesize;
     Medium media[MAX_PROP];
@@ -50,16 +63,21 @@ extern "C" {
 #define DOUBLE_SAFETY 0.002f
 #define TWO_PI 6.28318530717959f
 #define FEPS 1.19209290E-07f
-#define RAY_TMIN  0.0f
 #define MEDIUM_UNKNOWN 0xFFFFFFFFu
 #define MEDIUM_DEAD 0xFFFFFFFEu
 #define MEDIUM_AMBIENT 0u
 #define OUT_FLUX 0
 #define OUT_FLUENCE 1
 #define OUT_ENERGY 2
-#define FLAT_FLAG 0x80000000u
 
-// RNG
+#ifdef USE_CURVATURE
+    #define FLAT_FLAG 0x80000000u
+#endif
+
+/* ================================================================ */
+/*                             RNG                                  */
+/* ================================================================ */
+
 __device__ __forceinline__ float rand01(uint4& st) {
     union {
         unsigned long long i;
@@ -78,16 +96,22 @@ __device__ __forceinline__ float rand01(uint4& st) {
     s1.u[0] = 0x3F800000U | (s1.u[0] >> 9);
     return s1.f[0] - 1.0f;
 }
+
 __device__ __forceinline__ float rand_scatlen(uint4& rng) {
     return -logf(rand01(rng) + FEPS);
 }
 
-// Payload
+/* ================================================================ */
+/*                           Payload                                */
+/* ================================================================ */
+
 struct Photon {
     float3 p0, dir;
     float slen, weight, tof;
     unsigned int mid;
+#ifdef USE_CSG
     uint2 mstate;
+#endif
 };
 
 __device__ __forceinline__ Photon getPhoton() {
@@ -102,7 +126,9 @@ __device__ __forceinline__ Photon getPhoton() {
     ph.weight = __uint_as_float(optixGetPayload_7());
     ph.tof = __uint_as_float(optixGetPayload_8());
     ph.mid = optixGetPayload_9();
+#ifdef USE_CSG
     ph.mstate = make_uint2(optixGetPayload_10(), optixGetPayload_11());
+#endif
     return ph;
 }
 
@@ -117,43 +143,69 @@ __device__ __forceinline__ void setPhoton(const Photon& ph) {
     optixSetPayload_7(__float_as_uint(ph.weight));
     optixSetPayload_8(__float_as_uint(ph.tof));
     optixSetPayload_9(ph.mid);
+#ifdef USE_CSG
     optixSetPayload_10(ph.mstate.x);
     optixSetPayload_11(ph.mstate.y);
+#endif
 }
 
 __device__ __forceinline__ uint4 getRNG() {
+#ifdef USE_CSG
     return make_uint4(optixGetPayload_12(), optixGetPayload_13(),
                       optixGetPayload_14(), optixGetPayload_15());
+#else
+    return make_uint4(optixGetPayload_10(), optixGetPayload_11(),
+                      optixGetPayload_12(), optixGetPayload_13());
+#endif
 }
+
 __device__ __forceinline__ void setRNG(const uint4& s) {
+#ifdef USE_CSG
     optixSetPayload_12(s.x);
     optixSetPayload_13(s.y);
     optixSetPayload_14(s.z);
     optixSetPayload_15(s.w);
+#else
+    optixSetPayload_10(s.x);
+    optixSetPayload_11(s.y);
+    optixSetPayload_12(s.z);
+    optixSetPayload_13(s.w);
+#endif
 }
 
 __device__ __forceinline__ void traceRay(Photon& ph, uint4& rng, float tmax) {
     unsigned int p0 = __float_as_uint(ph.p0.x), p1 = __float_as_uint(ph.p0.y), p2 = __float_as_uint(ph.p0.z);
     unsigned int p3 = __float_as_uint(ph.dir.x), p4 = __float_as_uint(ph.dir.y), p5 = __float_as_uint(ph.dir.z);
     unsigned int p6 = __float_as_uint(ph.slen), p7 = __float_as_uint(ph.weight), p8 = __float_as_uint(ph.tof);
-    unsigned int p9 = ph.mid, p10 = ph.mstate.x, p11 = ph.mstate.y;
+    unsigned int p9 = ph.mid;
+#ifdef USE_CSG
+    unsigned int p10 = ph.mstate.x, p11 = ph.mstate.y;
     unsigned int p12 = rng.x, p13 = rng.y, p14 = rng.z, p15 = rng.w;
-
-    optixTrace(gcfg.gashandle, ph.p0, ph.dir, RAY_TMIN, tmax, 0.0f,
+    optixTrace(gcfg.gashandle, ph.p0, ph.dir, 0.0f, tmax, 0.0f,
                OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1, 0,
                p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15);
-
+    ph.mstate = make_uint2(p10, p11);
+    rng = make_uint4(p12, p13, p14, p15);
+#else
+    unsigned int p10 = rng.x, p11 = rng.y, p12 = rng.z, p13 = rng.w;
+    optixTrace(gcfg.gashandle, ph.p0, ph.dir, 0.0f, tmax, 0.0f,
+               OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, 0, 1, 0,
+               p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13);
+    rng = make_uint4(p10, p11, p12, p13);
+#endif
     ph.p0 = make_float3(__uint_as_float(p0), __uint_as_float(p1), __uint_as_float(p2));
     ph.dir = make_float3(__uint_as_float(p3), __uint_as_float(p4), __uint_as_float(p5));
     ph.slen = __uint_as_float(p6);
     ph.weight = __uint_as_float(p7);
     ph.tof = __uint_as_float(p8);
     ph.mid = p9;
-    ph.mstate = make_uint2(p10, p11);
-    rng = make_uint4(p12, p13, p14, p15);
 }
 
-// Media state (CSG)
+/* ================================================================ */
+/*                     CSG media state                              */
+/* ================================================================ */
+
+#ifdef USE_CSG
 __device__ __forceinline__ unsigned int ms_get(uint2 ms, int slot) {
     unsigned int w = (slot < 4) ? ms.x : ms.y;
     return (w >> ((slot & 3) * 8)) & 0xFFu;
@@ -215,6 +267,11 @@ __device__ __forceinline__ uint2 ms_leave(uint2 ms, unsigned int bid) {
 
     return ms;
 }
+#endif
+
+/* ================================================================ */
+/*                       Face data helpers                          */
+/* ================================================================ */
 
 __device__ __forceinline__ void unpack_media(float pw, unsigned int& fm, unsigned int& bm) {
     unsigned int p = __float_as_uint(pw);
@@ -222,13 +279,12 @@ __device__ __forceinline__ void unpack_media(float pw, unsigned int& fm, unsigne
     bm = p & 0xFFFFu;
 }
 
-// Curvature normal (FIXED)
+#ifdef USE_CURVATURE
 __device__ __forceinline__ float3 get_curvature_normal(int tri_id, float3 hit_pos) {
     float4* fb = (float4*)gcfg.facebuf;
     float4 fn4 = fb[tri_id * 2];
     unsigned int packed = __float_as_uint(fn4.w);
 
-    // CRITICAL: Check has_curvature AND flat flag
     if (gcfg.has_curvature == 0u || (packed & FLAT_FLAG)) {
         return make_float3(fn4.x, fn4.y, fn4.z);
     }
@@ -249,7 +305,6 @@ __device__ __forceinline__ float3 get_curvature_normal(int tri_id, float3 hit_po
         float3 vi2 = cross(ui, Ni);
         float3 di = hit_pos - Pi;
         float du = dot(di, ui), dv = dot(di, vi2);
-        // FIXED: Use PLUS for convex curvature
         NB = NB + Ni + k1 * du * ui + k2 * dv * vi2;
     }
 
@@ -261,8 +316,24 @@ __device__ __forceinline__ float3 get_curvature_normal(int tri_id, float3 hit_po
 
     return NB;
 }
+#endif
 
-// Output
+/* ================================================================ */
+/*                    Surface normal helper                         */
+/* ================================================================ */
+
+__device__ __forceinline__ float3 get_normal(int primid, float3 hit_pos, float4 fn4) {
+#ifdef USE_CURVATURE
+    return get_curvature_normal(primid, hit_pos);
+#else
+    return make_float3(fn4.x, fn4.y, fn4.z);
+#endif
+}
+
+/* ================================================================ */
+/*                         Output                                   */
+/* ================================================================ */
+
 __device__ __forceinline__ void atomic_add_out(unsigned int idx, float val) {
     atomicAdd(&((float*)gcfg.outputbuf)[idx], val);
 }
@@ -307,7 +378,10 @@ __device__ void accumulate(const Photon& ph, const Medium& prop, float L) {
     atomic_add_out(oe, ow);
 }
 
-// Scattering
+/* ================================================================ */
+/*                        Scattering                                */
+/* ================================================================ */
+
 __device__ float3 scatter_dir(float3 d, float g, uint4& rng) {
     float ct;
 
@@ -319,9 +393,8 @@ __device__ float3 scatter_dir(float3 d, float g, uint4& rng) {
     }
 
     float st = sinf(acosf(ct));
-    float phi = TWO_PI * rand01(rng);
     float sp, cp;
-    sincosf(phi, &sp, &cp);
+    sincosf(TWO_PI * rand01(rng), &sp, &cp);
 
     if (d.z > -1 + FEPS && d.z < 1 - FEPS) {
         float s2 = 1 - d.z * d.z, isc = st * rsqrtf(s2);
@@ -331,7 +404,10 @@ __device__ float3 scatter_dir(float3 d, float g, uint4& rng) {
     return make_float3(st * cp, st * sp, d.z > 0 ? ct : -ct);
 }
 
-// Fresnel
+/* ================================================================ */
+/*                          Fresnel                                 */
+/* ================================================================ */
+
 __device__ bool do_reflection(float3 N, float n1, float n2, uint4& rng, Photon& ph) {
     float cid = dot(ph.dir, N);
 
@@ -345,7 +421,8 @@ __device__ bool do_reflection(float3 N, float n1, float n2, uint4& rng, Photon& 
 
     if (ct2 > 0) {
         float ct = sqrtf(ct2);
-        float re = n12 * ci * ci + n22 * ct2, im = 2 * n1 * n2 * ci * ct, rp = (re - im) / (re + im);
+        float re = n12 * ci * ci + n22 * ct2, im = 2 * n1 * n2 * ci * ct;
+        float rp = (re - im) / (re + im);
         re = n22 * ci * ci + n12 * ct * ct;
         float rt = (rp + (re - im) / (re + im)) * 0.5f;
 
@@ -367,13 +444,18 @@ __device__ bool do_reflection(float3 N, float n1, float n2, uint4& rng, Photon& 
     return true;
 }
 
-// Launch photon
-__device__ void launch_photon_noTrace(Photon& ph, uint4& rng) {
+/* ================================================================ */
+/*                       Launch photon                              */
+/* ================================================================ */
+
+__device__ void launch_photon(Photon& ph, uint4& rng) {
     ph.p0 = gcfg.srcpos;
     ph.dir = gcfg.srcdir;
     ph.weight = 1.0f;
     ph.tof = 0;
+#ifdef USE_CSG
     ph.mstate = make_uint2(0, 0);
+#endif
 
     if (gcfg.srctype == 8) { // disk
         float r0 = sqrtf(rand01(rng)) * gcfg.srcparam1.x;
@@ -399,24 +481,24 @@ __device__ void launch_photon_noTrace(Photon& ph, uint4& rng) {
 
     ph.slen = rand_scatlen(rng);
     ph.mid = gcfg.initial_medium;
-    // Do NOT call traceRay here — raygen will handle MEDIUM_UNKNOWN
+    // No traceRay here — raygen handles MEDIUM_UNKNOWN probe
 }
 
-// Raygen
+/* ================================================================ */
+/*                          Raygen                                  */
+/* ================================================================ */
 
 extern "C" __global__ void __raygen__rg() {
     unsigned int tid = optixGetLaunchIndex().x;
     uint4 rng = ((uint4*)gcfg.seedbuf)[tid];
 
     Photon ph;
-    launch_photon_noTrace(ph, rng);
+    launch_photon(ph, rng);
 
-    // Handle initial medium probe — single optixTrace
     if (ph.mid == MEDIUM_UNKNOWN) {
         traceRay(ph, rng, std::numeric_limits<float>::max());
 
-        // closesthit sets ph.mid for MEDIUM_UNKNOWN case
-        if (ph.mid == MEDIUM_UNKNOWN || ph.mid == MEDIUM_DEAD) {
+        if (ph.mid == MEDIUM_UNKNOWN) {
             ph.mid = MEDIUM_DEAD;
         }
     }
@@ -429,12 +511,12 @@ extern "C" __global__ void __raygen__rg() {
             float mus = gcfg.media[ph.mid].mus;
             traceRay(ph, rng, mus > 0.0f ? ph.slen / mus : std::numeric_limits<float>::max());
         } else {
-            launch_photon_noTrace(ph, rng);
+            launch_photon(ph, rng);
 
             if (ph.mid == MEDIUM_UNKNOWN) {
                 traceRay(ph, rng, std::numeric_limits<float>::max());
 
-                if (ph.mid == MEDIUM_UNKNOWN || ph.mid == MEDIUM_DEAD) {
+                if (ph.mid == MEDIUM_UNKNOWN) {
                     ph.mid = MEDIUM_DEAD;
                 }
             }
@@ -446,7 +528,10 @@ extern "C" __global__ void __raygen__rg() {
     ((uint4*)gcfg.seedbuf)[tid] = rng;
 }
 
-// Closest-hit (FIXED)
+/* ================================================================ */
+/*                        Closest-hit                               */
+/* ================================================================ */
+
 extern "C" __global__ void __closesthit__ch() {
     Photon ph = getPhoton();
     uint4 rng = getRNG();
@@ -460,8 +545,10 @@ extern "C" __global__ void __closesthit__ch() {
     unsigned int fm, bm;
     unpack_media(fn4.w, fm, bm);
 
-    // Initial probe
+    /* ---- Initial medium probe ---- */
     if (ph.mid == MEDIUM_UNKNOWN) {
+#ifdef USE_CSG
+
         if (gcfg.do_csg) {
             ph.p0 = ph.p0 + ph.dir * (hitlen + SAFETY_DIST);
 
@@ -473,8 +560,7 @@ extern "C" __global__ void __closesthit__ch() {
                     float n_in = 1.0f, n_out = gcfg.media[ph.mid].n;
 
                     if (n_in != n_out) {
-                        float3 N = (gcfg.has_curvature) ? get_curvature_normal(primid, ph.p0 - ph.dir * SAFETY_DIST)
-                                   : make_float3(fn4.x, fn4.y, fn4.z);
+                        float3 N = get_normal(primid, ph.p0 - ph.dir * SAFETY_DIST, fn4);
 
                         if (do_reflection(N, n_in, n_out, rng, ph)) {
                             ph.mstate = make_uint2(0, 0);
@@ -485,7 +571,9 @@ extern "C" __global__ void __closesthit__ch() {
             } else {
                 ph.mid = MEDIUM_DEAD;
             }
-        } else {
+        } else
+#endif
+        {
             ph.mid = ff ? fm : bm;
         }
 
@@ -494,18 +582,18 @@ extern "C" __global__ void __closesthit__ch() {
         return;
     }
 
+    /* ---- Normal transport ---- */
     Medium prop = gcfg.media[ph.mid];
-    bool is_transparent = (prop.mus < FEPS);
-    float L = is_transparent ? hitlen : fminf(hitlen, prop.mus > 0 ? ph.slen / prop.mus : hitlen);
+    float L = fminf(hitlen, prop.mus > 0.0f ? ph.slen / prop.mus : hitlen);
 
     accumulate(ph, prop, L);
+
     ph.p0 = ph.p0 + ph.dir * (L + SAFETY_DIST);
     ph.weight *= expf(-prop.mua * L);
     ph.tof += L * INV_C0 * prop.n;
+    ph.slen -= L * prop.mus;
 
-    if (!is_transparent) {
-        ph.slen -= L * prop.mus;
-    }
+#ifdef USE_CSG
 
     if (gcfg.do_csg) {
         unsigned int old_mid = ph.mid;
@@ -519,8 +607,7 @@ extern "C" __global__ void __closesthit__ch() {
             float n_out = (new_mid == 0) ? 1.0f : gcfg.media[new_mid].n;
 
             if (n_in != n_out) {
-                float3 N = (gcfg.has_curvature) ? get_curvature_normal(primid, ph.p0 - ph.dir * SAFETY_DIST)
-                           : make_float3(fn4.x, fn4.y, fn4.z);
+                float3 N = get_normal(primid, ph.p0 - ph.dir * SAFETY_DIST, fn4);
 
                 if (!ff) {
                     N = -N;
@@ -538,33 +625,23 @@ extern "C" __global__ void __closesthit__ch() {
                 ph.mid = MEDIUM_DEAD;
             }
         }
-    } else {
-        // MESH mode (FIXED)
+    } else
+#endif
+    {
         unsigned int new_mid = ff ? bm : fm;
-        bool reflected = false;
 
-        if (gcfg.do_reflect && ph.mid < gcfg.num_media) {
-            float n_out = (new_mid < gcfg.num_media) ? gcfg.media[new_mid].n : 1.0f;
+        if (gcfg.do_reflect && prop.n != gcfg.media[new_mid].n) {
+            float3 N = get_normal(primid, ph.p0 - ph.dir * SAFETY_DIST, fn4);
 
-            if (prop.n != n_out) {
-                float3 N;
-
-                if (gcfg.has_curvature) {
-                    N = get_curvature_normal(primid, ph.p0 - ph.dir * SAFETY_DIST);
-                } else {
-                    N = ff ? make_float3(fn4.x, fn4.y, fn4.z) : make_float3(-fn4.x, -fn4.y, -fn4.z);
-                }
-
-                reflected = do_reflection(N, prop.n, n_out, rng, ph);
+            if (do_reflection(N, prop.n, gcfg.media[new_mid].n, rng, ph)) {
+                new_mid = ph.mid;
             }
         }
 
-        if (!reflected) {
-            ph.mid = new_mid;
+        ph.mid = new_mid;
 
-            if (ph.mid == MEDIUM_AMBIENT) {
-                ph.mid = MEDIUM_DEAD;
-            }
+        if (ph.mid == MEDIUM_AMBIENT) {
+            ph.mid = MEDIUM_DEAD;
         }
     }
 
@@ -572,19 +649,30 @@ extern "C" __global__ void __closesthit__ch() {
     setRNG(rng);
 }
 
-// Miss
+/* ================================================================ */
+/*                            Miss                                  */
+/* ================================================================ */
+
 extern "C" __global__ void __miss__ms() {
     Photon ph = getPhoton();
     uint4 rng = getRNG();
-    Medium prop = gcfg.media[ph.mid];
 
+    if (ph.mid == MEDIUM_UNKNOWN) {
+        ph.mid = MEDIUM_DEAD;
+        setPhoton(ph);
+        return;
+    }
+
+    Medium prop = gcfg.media[ph.mid];
     float L = ph.slen / prop.mus;
+
     accumulate(ph, prop, L);
+
     ph.p0 = ph.p0 + ph.dir * L;
     ph.weight *= expf(-prop.mua * L);
     ph.tof += L * INV_C0 * prop.n;
 
-    // Russian Roulette HERE instead of raygen
+    // Russian roulette
     if (ph.weight < gcfg.minenergy) {
         if (rand01(rng) <= 1.0f / gcfg.roulettesize) {
             ph.weight *= gcfg.roulettesize;
@@ -596,7 +684,6 @@ extern "C" __global__ void __miss__ms() {
         }
     }
 
-    // Scatter
     ph.dir = scatter_dir(ph.dir, prop.g, rng);
     ph.slen = rand_scatlen(rng);
 
