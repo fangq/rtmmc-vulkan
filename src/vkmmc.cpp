@@ -1478,6 +1478,8 @@ int main(int argc, char** argv) {
     params.has_curvature = has_curvature ? 1u : 0u;
     params.minenergy = cfg.minenergy;
     params.roulettesize = cfg.roulettesize;
+    printf("DEBUG: has_curvature=%d, params.has_curvature=%u\n",
+           has_curvature, params.has_curvature);
 
     Buffer paramBuf = create_device_buffer(ctx, sizeof(MCParams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
@@ -1555,7 +1557,9 @@ int main(int argc, char** argv) {
     // Readback
     std::vector<float> raw(outSz);
     download_from_device(ctx, outBuf, raw.data(), outSz * sizeof(float));
-
+    uint32_t hc_gpu;
+    memcpy(&hc_gpu, &raw[crop0w - 11], 4);
+    printf("DEBUG GPU has_curvature: %u\n", hc_gpu);
     std::vector<float> fluence(crop0w);
     double absorbed = 0;
     int nans = 0, infs = 0;

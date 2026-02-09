@@ -145,6 +145,7 @@ float rand01(inout uvec4 st) {
 float rand_range(inout uvec4 s, float a, float b) {
     return (b - a) * rand01(s) + a;
 }
+
 float rand_scatlen(inout uvec4 s) {
     return -log(rand01(s) + FEPS);
 }
@@ -376,28 +377,27 @@ bool do_reflection(vec3 N, float n1, float n2, inout uvec4 rng, inout vec3 p, in
 // (vnorm_k1 and pdir_k2), plus node_pos.
 
 vec3 get_curvature_normal_at(int tri_id, vec3 hit_pos) {
-    // Flat check
-    if (is_flat_triangle(face_normal[tri_id * 2].w)) {
+    if (has_curvature == 0u || is_flat_triangle(face_normal[tri_id * 2].w)) {
         return face_normal[tri_id * 2].xyz;
     }
 
     vec4 vidx_raw = face_normal[tri_id * 2 + 1];
     vec3 NB = vec3(0.0);
 
-    // Process each vertex sequentially to reduce live registers
     for (int vi = 0; vi < 3; vi++) {
         uint idx = floatBitsToUint(vidx_raw[vi]);
-        vec4 nk = node_curv[idx].vnorm_k1;  // .xyz=N, .w=k1
-        vec4 pk = node_curv[idx].pdir_k2;   // .xyz=u, .w=k2
+        vec4 nk = node_curv[idx].vnorm_k1;
+        vec4 pk = node_curv[idx].pdir_k2;
         vec3 di = hit_pos - node_curv[idx].node_pos.xyz;
         vec3 vi2 = cross(pk.xyz, nk.xyz);
-        NB += nk.xyz - nk.w * dot(di, pk.xyz) * pk.xyz
-              - pk.w * dot(di, vi2) * vi2;
+
+        // CORRECTED: Add curvature correction for convex surfaces
+        NB += nk.xyz + nk.w * dot(di, pk.xyz) * pk.xyz
+              + pk.w * dot(di, vi2) * vi2;
     }
 
     NB = normalize(NB);
 
-    // Ensure consistent with outward face normal
     if (dot(NB, face_normal[tri_id * 2].xyz) < 0.0) {
         NB = -NB;
     }
@@ -540,6 +540,10 @@ void main() {
         return;
     }
 
+    if (tid == 0u) {
+        atomicExchange(output_data[grid_stride.w - 11u], has_curvature);
+    }
+
     uvec4 rng = thread_seeds[tid];
     int done = 0, maxph = photons_per_thread + int(tid < uint(extra_photons));
 
@@ -611,21 +615,27 @@ void main() {
                     }
 
                 } else {
+                    // MESH mode
                     uint new_mid = ff ? bm : fm;
+                    bool reflected = false;
 
-                    if (do_reflect > 0u && new_mid != MEDIUM_AMBIENT
-                            && prop.n != media[new_mid].n) {
-                        vec3 N = ff ? face_normal[tri * 2].xyz : -face_normal[tri * 2].xyz;
+                    // Attempt reflection if crossing a refractive boundary
+                    // Allow reflection at medium-to-ambient boundaries (tissue-to-air)
+                    if (do_reflect > 0u && mid < num_media) {
+                        float n_out = (new_mid < num_media) ? media[new_mid].n : 1.0;
 
-                        if (do_reflection(N, prop.n, media[new_mid].n, rng, pos, dir)) {
-                            new_mid = ff ? fm : bm;
+                        if (prop.n != n_out) {
+                            vec3 N = ff ? face_normal[tri * 2].xyz : -face_normal[tri * 2].xyz;
+                            reflected = do_reflection(N, prop.n, n_out, rng, pos, dir);
                         }
                     }
 
-                    mid = new_mid;
+                    if (!reflected) {
+                        mid = new_mid;
 
-                    if (mid == MEDIUM_AMBIENT) {
-                        mid = MEDIUM_DEAD;
+                        if (mid == MEDIUM_AMBIENT) {
+                            mid = MEDIUM_DEAD;
+                        }
                     }
                 }
 
