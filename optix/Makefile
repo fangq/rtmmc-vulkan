@@ -9,7 +9,7 @@
 CUDA_DIR = /usr/local/cuda
 OPTIX_DIR = /usr/local/optix
 SRC_DIR = ../src
-NVCC = /usr/bin/nvcc
+NVCC = nvcc
 CXX = g++
 
 NVCC_FLAGS = -ptx --expt-relaxed-constexpr --use_fast_math -std=c++11
