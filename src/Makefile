@@ -1,14 +1,11 @@
 # Vulkan RT-MMC Makefile
-# Usage:
-#   make            — build host + shader (portable, CAS atomic)
-#   make nvidia     — build host + shader with native atomicAdd(float)
-#   make shader     — compile shader only (portable)
-#   make host       — compile host only
-#   make clean      — remove build artifacts
-#   make listgpu    — list available Vulkan GPUs
-#   make run        — run with default input
-
-# ==================== Configuration ====================
+#
+# Build variants:
+#   make                       — mesh-only (fastest, no CSG/curvature)
+#   make CSG=1                 — CSG shapes, no curvature
+#   make CSG=1 CURV=1          — CSG + curvature
+#   make nvidia                — NVIDIA native atomicAdd (combine with CSG/CURV)
+#   make CSG=1 CURV=1 nvidia   — full featured NVIDIA build
 
 CXX      ?= g++
 CXXFLAGS  = -std=c++11 -O2 -Wall -I. -Iminiz
@@ -20,17 +17,29 @@ GLSLFLAGS = --target-env vulkan1.2 -e main
 BINARY    = vkmmc
 SHADER    = vkmmc_core.spv
 SOURCES   = vkmmc.cpp miniz/miniz.c
-HEADERS   = vkmmc_io.h vkmmc_shapes.h nlohmann/json.hpp
+HEADERS   = vkmmc_io.h vkmmc_shapes.h vkmmc_curvature.h nlohmann/json.hpp
 COMP_SRC  = vkmmc_core.comp
 
-# Default input for 'make run'
 INPUT    ?= input.json
 NPHOTON  ?= 100000
 GPUID    ?= 1
 
-# ==================== Targets ====================
+# CSG support
+ifdef CSG
+    GLSLFLAGS += -DUSE_CSG
+    CXXFLAGS  += -DUSE_CSG
+endif
 
-.PHONY: all nvidia host shader clean listgpu run help
+# Curvature support (requires CSG)
+ifdef CURV
+    ifndef CSG
+        $(error CURV=1 requires CSG=1)
+    endif
+    GLSLFLAGS += -DUSE_CURVATURE
+    CXXFLAGS  += -DUSE_CURVATURE
+endif
+
+.PHONY: all nvidia host shader shader-nvidia clean listgpu run help pretty
 
 all: $(BINARY) $(SHADER)
 
@@ -40,19 +49,15 @@ help:
 	@echo "Vulkan RT-MMC Build System"
 	@echo ""
 	@echo "Targets:"
-	@echo "  make            build host + portable shader"
-	@echo "  make nvidia     build host + NVIDIA shader (native atomicAdd float)"
-	@echo "  make host       build host binary only"
-	@echo "  make shader     build portable shader only"
-	@echo "  make clean      remove build artifacts"
-	@echo "  make listgpu    list Vulkan GPU devices"
-	@echo "  make run        run simulation (INPUT=file NPHOTON=n GPUID=id)"
-	@echo ""
-	@echo "Variables:"
-	@echo "  CXX=$(CXX)  GLSLC=$(GLSLC)"
-	@echo "  INPUT=$(INPUT)  NPHOTON=$(NPHOTON)  GPUID=$(GPUID)"
-
-# ---- Host binary ----
+	@echo "  make                 mesh-only (fastest)"
+	@echo "  make CSG=1           CSG shapes, no curvature"
+	@echo "  make CSG=1 CURV=1    CSG + curvature"
+	@echo "  make nvidia          NVIDIA atomicAdd (combine with CSG/CURV)"
+	@echo "  make host            host binary only"
+	@echo "  make shader          shader only"
+	@echo "  make clean           remove artifacts"
+	@echo "  make listgpu         list Vulkan GPUs"
+	@echo "  make run             run simulation"
 
 $(BINARY): $(SOURCES) $(HEADERS)
 	$(CXX) $(CXXFLAGS) -o $@ $(SOURCES) $(LDFLAGS)
@@ -60,23 +65,25 @@ $(BINARY): $(SOURCES) $(HEADERS)
 
 host: $(BINARY)
 
-# ---- Shader (portable — CAS atomic fallback) ----
+# Force shader rebuild when flags change
+SHADER_FLAGS_FILE = .shader_flags
+CURRENT_FLAGS := $(GLSLFLAGS)
 
-$(SHADER): $(COMP_SRC)
+.PHONY: check_flags
+check_flags:
+	@echo '$(CURRENT_FLAGS)' | cmp -s - $(SHADER_FLAGS_FILE) || echo '$(CURRENT_FLAGS)' > $(SHADER_FLAGS_FILE)
+
+$(SHADER): $(COMP_SRC) check_flags $(SHADER_FLAGS_FILE)
 	$(GLSLC) $(GLSLFLAGS) -o $@ $<
-	@echo "Built: $@ (portable)"
+	@echo "Built: $@ (flags: $(GLSLFLAGS))"
 
 shader: $(SHADER)
-
-# ---- Shader (NVIDIA — native atomicAdd float) ----
 
 shader-nvidia: $(COMP_SRC)
 	sed 's|^//#define USE_ATOMIC_FLOAT|#define USE_ATOMIC_FLOAT|' $< > _mc_nvidia.comp
 	$(GLSLC) $(GLSLFLAGS) -o $(SHADER) _mc_nvidia.comp
 	@rm -f _mc_nvidia.comp
 	@echo "Built: $(SHADER) (NVIDIA atomicAdd float)"
-
-# ---- Utilities ----
 
 listgpu: $(BINARY)
 	./$(BINARY) -L
@@ -85,22 +92,16 @@ run: $(BINARY) $(SHADER)
 	./$(BINARY) -f $(INPUT) -n $(NPHOTON) -G $(GPUID)
 
 clean:
-	rm -f $(BINARY) $(SHADER) _mc_nvidia.comp *.jdat *.o
-
-# ---- Dependencies ----
+	rm -f $(BINARY) $(SHADER) _mc_nvidia.comp .shader_flags *.jdat *.o
 
 miniz/miniz.c:
 	@echo "Error: miniz.c not found. Download from https://github.com/richgel999/miniz"
-	@echo "  mkdir -p miniz"
-	@echo "  curl -sL https://raw.githubusercontent.com/richgel999/miniz/master/miniz.c -o miniz/miniz.c"
-	@echo "  curl -sL https://raw.githubusercontent.com/richgel999/miniz/master/miniz.h -o miniz/miniz.h"
 	@exit 1
 
 nlohmann/json.hpp:
-	@echo "Error: nlohmann/json.hpp not found. Download with:"
-	@echo "  mkdir -p nlohmann"
-	@echo "  curl -sL https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp -o nlohmann/json.hpp"
+	@echo "Error: nlohmann/json.hpp not found."
 	@exit 1
+
 pretty:
 	astyle \
 	    --style=attach \
@@ -122,5 +123,3 @@ pretty:
 	    --formatted \
 	    --break-blocks \
 	   "*.h" "*.cpp" "*.comp"
-
-.PHONY: clean

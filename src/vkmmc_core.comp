@@ -8,16 +8,24 @@
  *      Highest media ID among all enclosing surfaces determines the current medium.
  *
  * Curvature-informed reflection: when has_curvature=1, uses per-node principal
- * curvature to estimate the true surface normal at the intersection point,
+ * curvature to estimate the true surface normal at the intersection point.
+ *
+ * Compile-time flags (passed via -D to glslangValidator):
+ *   USE_CSG         — enable CSG shape-based media state tracking
+ *   USE_CURVATURE   — enable curvature-corrected normals (requires USE_CSG)
+ *   USE_ATOMIC_FLOAT — NVIDIA native atomicAdd(float)
  *
  * Optimizations for curvature mode:
  *   - Main ray trace uses trace_ray (no barycentrics) always
  *   - Barycentrics only fetched via a second trace when curvature normal is needed
  *   - Curvature normal computed by accumulating per-vertex contributions sequentially
  *     to reduce register pressure (no 3x simultaneous vec4 loads)
- *   - Single get_reflection_normal() used everywhere (no inlined duplication)
+ *   - Single get_normal() used everywhere (no inlined duplication)
  *
- * Compile: glslangValidator --target-env vulkan1.2 -e main -o vkmmc_core.spv vkmmc_core.comp
+ * Build examples:
+ *   glslangValidator --target-env vulkan1.2 -e main -o vkmmc_core.spv vkmmc_core.comp
+ *   glslangValidator --target-env vulkan1.2 -e main -DUSE_CSG -o vkmmc_core.spv vkmmc_core.comp
+ *   glslangValidator --target-env vulkan1.2 -e main -DUSE_CSG -DUSE_CURVATURE -o vkmmc_core.spv vkmmc_core.comp
  */
 #version 460
 #extension GL_EXT_ray_query : require
@@ -97,7 +105,7 @@ layout(std140, set = 0, binding = 4) uniform SimParams {
     int   photons_per_thread;// 168
     int   extra_photons;     // 172
 
-    // offset 176: scalar row 4 (NEW — Russian Roulette)
+    // offset 176: scalar row 4 (Russian Roulette)
     float minenergy;         // 176
     float roulettesize;      // 180
     float _pad1;             // 184
@@ -115,22 +123,25 @@ layout(std430, set = 0, binding = 6) readonly buffer CurvBuffer { NodeCurv node_
 
 // ==================== Constants ====================
 
-const float INV_C0       = 3.335640951981520e-12;
-const float SAFETY_DIST  = 0.001;
+const float INV_C0       = 3.335640951981520e-12;  // 1/C0 in s/mm
+const float SAFETY_DIST  = 0.001;       // heuristic to ensure ray crosses triangle
 const float DOUBLE_SAFETY = 0.002;
-const float TWO_PI       = 6.28318530717959;
-const float FEPS         = 1.19209290E-07;
-const float FMAX         = 3.402823466e+38;
-const float RAY_TMIN     = 1e-5;
+const float TWO_PI       = 6.28318530717959;       // 2*pi
+const float FEPS         = 1.19209290E-07;         // float epsilon / round-off limit
+const float FMAX         = 3.402823466e+38;        // float max
+const float RAY_TMIN     = 1e-5;                   // minimum ray distance
 
 const uint MEDIUM_UNKNOWN = 0xFFFFFFFFu;
 const uint MEDIUM_DEAD    = 0xFFFFFFFEu;
 const uint MEDIUM_AMBIENT = 0u;
 const uint MEDIUM_BBOX    = 0xFFFFu;   // bounding box termination label
 const int  OUT_FLUX = 0, OUT_FLUENCE = 1, OUT_ENERGY = 2;
-const uint FLAT_FLAG = 0x80000000u;
 
-// ==================== RNG ====================
+#ifdef USE_CURVATURE
+    const uint FLAT_FLAG = 0x80000000u;    // bit 31 marks geometrically flat triangles
+#endif
+
+// ==================== RNG (xorshift128+) ====================
 
 float rand01(inout uvec4 st) {
     uvec2 s1 = st.xy, s0 = st.zw;
@@ -152,6 +163,10 @@ float rand_scatlen(inout uvec4 s) {
 
 // ==================== Ray Tracing ====================
 
+/**
+ * Trace a ray against the acceleration structure.
+ * Returns true if a triangle is hit, with distance, triangle ID, and face orientation.
+ */
 bool trace_ray(vec3 o, vec3 d, float tmin, float tmax,
                out float dist, out int tri_id, out bool front_face) {
     rayQueryEXT q;
@@ -169,18 +184,33 @@ bool trace_ray(vec3 o, vec3 d, float tmin, float tmax,
     return false;
 }
 
+/**
+ * Unpack front and back media IDs from packed float.
+ * Bits [31] = flat flag (ignored here via mask), [30:16] = front, [15:0] = back.
+ */
 void unpack_media(float pw, out uint front_med, out uint back_med) {
-    uint p = floatBitsToUint(pw) & 0x7FFFFFFFu;
+    uint p = floatBitsToUint(pw) & 0x7FFFFFFFu;  // mask off flat flag
     front_med = p >> 16u;
     back_med  = p & 0xFFFFu;
 }
 
+#ifdef USE_CURVATURE
+/**
+ * Check if a triangle is flat-flagged (bit 31 of packed_media).
+ * Flat triangles skip curvature correction and use the face normal directly.
+ */
 bool is_flat_triangle(float pw) {
     return (floatBitsToUint(pw) & FLAT_FLAG) != 0u;
 }
+#endif
 
-// ==================== Media State Buffer ====================
+// ==================== Media State Buffer (CSG mode) ====================
+//
+// In CSG mode, each photon carries an 8-byte (uvec2) state that tracks
+// which shapes the photon is currently inside. The highest-priority
+// (highest Tag value) shape determines the current medium.
 
+#ifdef USE_CSG
 uint ms_get(uvec2 ms, int slot) {
     uint word = (slot < 4) ? ms.x : ms.y;
     return (word >> (uint(slot & 3) * 8u)) & 0xFFu;
@@ -199,6 +229,10 @@ uvec2 ms_set(uvec2 ms, int slot, uint val) {
     return ms;
 }
 
+/**
+ * Enter a shape: add its media ID to the state buffer.
+ * The highest ID becomes the active medium (slot 0).
+ */
 uvec2 ms_enter(uvec2 ms, uint back_id) {
     if (back_id == 0u) {
         return ms;
@@ -218,6 +252,10 @@ uvec2 ms_enter(uvec2 ms, uint back_id) {
     return ms;
 }
 
+/**
+ * Leave a shape: remove its media ID from the state buffer.
+ * Recalculate the highest remaining ID as the active medium.
+ */
 uvec2 ms_leave(uvec2 ms, uint back_id) {
     if (back_id == 0u) {
         return ms;
@@ -250,9 +288,14 @@ uvec2 ms_leave(uvec2 ms, uint back_id) {
 
     return ms;
 }
+#endif
 
 // ==================== Output ====================
 
+/**
+ * Atomic float addition to output buffer.
+ * Uses native atomicAdd when available, otherwise CAS loop fallback.
+ */
 void atomic_add_float(uint idx, float val) {
 #ifdef USE_ATOMIC_FLOAT
     atomicAdd(output_data[idx], val);
@@ -268,6 +311,9 @@ void atomic_add_float(uint idx, float val) {
 #endif
 }
 
+/**
+ * Convert 3D position (relative to grid origin) to 1D voxel index.
+ */
 uint voxel_index(vec3 rp) {
     uint ix = rp.x > 0.0 ? uint(min(rp.x, grid_extent.x) * voxel_scale) : 0u;
     uint iy = rp.y > 0.0 ? uint(min(rp.y, grid_extent.y) * voxel_scale) : 0u;
@@ -275,27 +321,39 @@ uint voxel_index(vec3 rp) {
     return iz * grid_stride.y + iy * grid_stride.x + ix;
 }
 
+/**
+ * Get the offset of the current time frame in the output buffer.
+ */
 uint time_offset(float tof) {
     return uint(min(int((tof - time_start) * inv_timestep), max_gate - 1)) * grid_stride.z;
 }
 
+/**
+ * Accumulate output quantities to the 3D grid.
+ * Divides path into segments of equal length, depositing weight loss
+ * of each segment to the corresponding grid voxel.
+ */
 void accumulate(vec3 p, vec3 d, uint mid, float w, float tof, float L) {
     Medium pr = media[mid];
     int sc = (int(L * voxel_scale) + 1) << 1;
     float sl = L / float(sc), decay = exp(-pr.mua * sl);
     float loss = (output_type == OUT_ENERGY) ? w * (1.0 - decay)
                  : (pr.mua > 0.0 ? w * (1.0 - decay) / pr.mua : 0.0);
+
+    // deposit weight loss of each segment to the corresponding grid
     vec3 step = sl * d, sm = p - grid_min.xyz + 0.5 * step;
     float ct = tof + sl * INV_C0 * pr.n;
     uint oe = time_offset(ct) + voxel_index(sm);
     float ow = loss;
 
+    // iterate over the rest of the segments
     for (int i = 1; i < sc; ++i) {
         loss *= decay;
         sm += step;
         ct += sl * INV_C0 * pr.n;
         uint ne = time_offset(ct) + voxel_index(sm);
 
+        // save when entering a new element
         if (ne != oe) {
             atomic_add_float(oe, ow);
             oe = ne;
@@ -305,11 +363,15 @@ void accumulate(vec3 p, vec3 d, uint mid, float w, float tof, float L) {
         ow += loss;
     }
 
+    // save the weight loss of the last segment
     atomic_add_float(oe, ow);
 }
 
 // ==================== Scattering ====================
 
+/**
+ * Rotate a vector with given azimuth and zenith angles.
+ */
 vec3 rotate_dir(vec3 v, vec2 z, vec2 a) {
     if (v.z > -1.0 + FEPS && v.z < 1.0 - FEPS) {
         float s2 = 1.0 - v.z * v.z, sc = z.x * inversesqrt(s2);
@@ -319,6 +381,10 @@ vec3 rotate_dir(vec3 v, vec2 z, vec2 a) {
     return vec3(z.x * a.y, z.x * a.x, v.z > 0.0 ? z.y : -z.y);
 }
 
+/**
+ * Update ray direction after a scattering event.
+ * Uses Henyey-Greenstein phase function.
+ */
 vec3 scatter_dir(vec3 d, float g, inout uvec4 rng) {
     float ct;
 
@@ -333,8 +399,12 @@ vec3 scatter_dir(vec3 d, float g, inout uvec4 rng) {
     return rotate_dir(d, vec2(sin(acos(ct)), ct), vec2(sin(phi), cos(phi)));
 }
 
-// ==================== Fresnel ====================
+// ==================== Fresnel Reflection/Refraction ====================
 
+/**
+ * Reflect or refract a ray at a mismatched boundary.
+ * Returns true if reflected, false if transmitted.
+ */
 bool do_reflection(vec3 N, float n1, float n2, inout uvec4 rng, inout vec3 p, inout vec3 d) {
     float ci = -dot(d, N);
 
@@ -347,82 +417,101 @@ bool do_reflection(vec3 N, float n1, float n2, inout uvec4 rng, inout vec3 p, in
     float ct2 = 1.0 - n12 / n22 * (1.0 - ci * ci);
 
     if (ct2 > 0.0) {
+        // if no total internal reflection
         float ct = sqrt(ct2);
         float re = n12 * ci * ci + n22 * ct2, im = 2.0 * n1 * n2 * ci * ct;
-        float rp = (re - im) / (re + im);
+        float rp = (re - im) / (re + im);       // Rp
         re = n22 * ci * ci + n12 * ct * ct;
-        float rt = (rp + (re - im) / (re + im)) * 0.5;
+        float rt = (rp + (re - im) / (re + im)) * 0.5;  // (Rp+Rs)/2
 
         if (rand01(rng) <= rt) {
+            // do reflection, correct photon position
             p -= d * DOUBLE_SAFETY;
             d = d + 2.0 * ci * N;
         } else {
+            // do transmission
             float ratio = n1 / n2;
             d = ratio * d + (ratio * ci - ct) * N;
             d *= inversesqrt(dot(d, d));
             return false;
         }
     } else {
+        // total internal reflection, correct photon position
         p -= d * DOUBLE_SAFETY;
         d = d + 2.0 * ci * N;
     }
 
+    // normalize new direction
     d *= inversesqrt(dot(d, d));
     return true;
 }
 
 // ==================== Curvature Normal ====================
+//
 // Accumulates per-vertex curvature contributions sequentially
 // to minimize register pressure. Only reads 2 vec4s per vertex
 // (vnorm_k1 and pdir_k2), plus node_pos.
+//
+// For each vertex of the hit triangle:
+//   N_corrected += N_vertex + k1 * dot(d, u1) * u1 + k2 * dot(d, u2) * u2
+// where d = hit_pos - vertex_pos, u1 = principal direction, u2 = cross(u1, N)
 
+#ifdef USE_CURVATURE
 vec3 get_curvature_normal_at(int tri_id, vec3 hit_pos) {
+    // Skip curvature for flat-flagged triangles (box faces, cylinder caps)
     if (has_curvature == 0u || is_flat_triangle(face_normal[tri_id * 2].w)) {
         return face_normal[tri_id * 2].xyz;
     }
 
+    // face_normal[tri_id*2+1] stores vertex indices as floatBitsToUint
     vec4 vidx_raw = face_normal[tri_id * 2 + 1];
     vec3 NB = vec3(0.0);
 
     for (int vi = 0; vi < 3; vi++) {
         uint idx = floatBitsToUint(vidx_raw[vi]);
-        vec4 nk = node_curv[idx].vnorm_k1;
-        vec4 pk = node_curv[idx].pdir_k2;
+        vec4 nk = node_curv[idx].vnorm_k1;   // .xyz = normal, .w = k1
+        vec4 pk = node_curv[idx].pdir_k2;     // .xyz = principal dir, .w = k2
         vec3 di = hit_pos - node_curv[idx].node_pos.xyz;
-        vec3 vi2 = cross(pk.xyz, nk.xyz);
+        vec3 vi2 = cross(pk.xyz, nk.xyz);     // second principal direction
 
-        // CORRECTED: Add curvature correction for convex surfaces
+        // Curvature correction: add displacement-scaled curvature terms
         NB += nk.xyz + nk.w * dot(di, pk.xyz) * pk.xyz
               + pk.w * dot(di, vi2) * vi2;
     }
 
     NB = normalize(NB);
 
+    // Ensure consistent orientation with face normal
     if (dot(NB, face_normal[tri_id * 2].xyz) < 0.0) {
         NB = -NB;
     }
 
     return NB;
 }
+#endif
 
-// ==================== Reflection Normal ====================
-// Returns normal oriented toward photon's incoming side.
-// Only computes curvature when actually needed (refractive boundary).
+// ==================== Surface Normal Helper ====================
+//
+// Returns the outward-pointing surface normal at a hit point.
+// With USE_CURVATURE: uses curvature-corrected normal for curved triangles.
+// Without: uses the precomputed flat face normal.
 
-vec3 get_reflection_normal(int tri_id, bool front_face, vec3 hit_pos) {
-    vec3 N_out;
-
-    if (has_curvature > 0u) {
-        N_out = get_curvature_normal_at(tri_id, hit_pos);
-    } else {
-        N_out = face_normal[tri_id * 2].xyz;
-    }
-
-    return front_face ? N_out : -N_out;
+vec3 get_normal(int tri_id, vec3 hit_pos) {
+#ifdef USE_CURVATURE
+    return get_curvature_normal_at(tri_id, hit_pos);
+#else
+    return face_normal[tri_id * 2].xyz;
+#endif
 }
 
 // ==================== Photon Launch ====================
 
+/**
+ * Launch a new photon from the source.
+ * Determines the initial medium by either:
+ *   - CSG parity walk (counting boundary crossings to determine enclosure)
+ *   - Mesh mode (single ray probe to find enclosing element)
+ */
 void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
                    inout float tof, inout uint mid, inout uvec2 mstate, inout uvec4 rng) {
     p = src_pos.xyz;
@@ -431,9 +520,12 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
     tof = 0.0;
     mstate = uvec2(0u, 0u);
 
+    // ---- Source type handling ----
     if (src_type == 4) {
+        // Planar source: random point on quadrilateral
         p = src_pos.xyz + rand01(rng) * src_param1.xyz + rand01(rng) * src_param2.xyz;
     } else if (src_type == 8) {
+        // Disk source: uniform random point on disk
         float r0 = sqrt(rand01(rng)) * src_param1.x, phi = TWO_PI * rand01(rng);
         float cp = cos(phi), sp = sin(phi);
         vec3 sd = src_dir.xyz;
@@ -451,7 +543,13 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
 
     slen = rand_scatlen(rng);
 
+    // ---- Determine initial medium ----
+
+#ifdef USE_CSG
+
     if (do_csg > 0u) {
+        // CSG parity walk: cast ray forward, count boundary crossings
+        // to determine which shapes enclose the source point
         mstate = uvec2(0u, 0u);
         uint parity = 0u;
         vec3 wp = p;
@@ -475,6 +573,7 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
             wp += d * (hd + SAFETY_DIST);
         }
 
+        // Set media state from parity bits
         for (int i = 0; i < 8; i++)
             if ((parity & (1u << i)) != 0u) {
                 mstate = ms_enter(mstate, uint(i + 1));
@@ -482,6 +581,7 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
 
         mid = ms_get(mstate, 0);
 
+        // If source is outside all shapes, try to enter the first shape
         if (mid == 0u) {
             float hd;
             int tid;
@@ -494,12 +594,17 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
                 mstate = ms_enter(mstate, bm);
                 mid = ms_get(mstate, 0);
 
+                // Handle Fresnel reflection at entry boundary
                 if (do_reflect > 0u && mid < num_media) {
                     float n_out = media[mid].n;
 
                     if (1.0 != n_out) {
                         vec3 hp = p - d * SAFETY_DIST;
-                        vec3 N = get_reflection_normal(tid, true, hp);
+                        vec3 N = get_normal(tid, hp);
+
+                        if (!ff) {
+                            N = -N;
+                        }
 
                         if (do_reflection(N, 1.0, n_out, rng, p, d)) {
                             mstate = uvec2(0u, 0u);
@@ -512,7 +617,10 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
                 mid = MEDIUM_DEAD;
             }
         }
-    } else {
+    } else
+#endif
+    {
+        // Mesh mode: initial medium is pre-determined or probed
         mid = initial_medium;
 
         if (mid == MEDIUM_UNKNOWN) {
@@ -531,7 +639,7 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
     }
 }
 
-// ==================== Main ====================
+// ==================== Main Loop ====================
 
 void main() {
     uint tid = gl_GlobalInvocationID.x;
@@ -540,6 +648,7 @@ void main() {
         return;
     }
 
+    // Debug: store has_curvature flag for host readback
     if (tid == 0u) {
         atomicExchange(output_data[grid_stride.w - 11u], has_curvature);
     }
@@ -569,29 +678,42 @@ void main() {
             // Curvature normal is computed from hit_pos, not barycentrics
             bool hit = trace_ray(pos, dir, RAY_TMIN, max_dist, hd, tri, ff);
 
+            // ---- Transparent medium, no hit → photon escapes ----
             if (!hit && is_transparent) {
                 mid = MEDIUM_DEAD;
+
+                // ---- Hit a boundary ----
             } else if (hit) {
                 uint fm, bm;
                 unpack_media(face_normal[tri * 2].w, fm, bm);
                 float L = is_transparent ? hd : min(hd, slen / prop.mus);
 
+                // save output
                 accumulate(pos, dir, mid, weight, tof, L);
+
+                // update photon position, weight, timer
                 pos += dir * (L + SAFETY_DIST);
                 weight *= exp(-prop.mua * L);
                 tof += L * INV_C0 * prop.n;
 
+                // update remaining scattering length
                 if (!is_transparent) {
                     slen -= L * prop.mus;
                 }
 
+                // ---- Boundary crossing: determine new medium ----
+
+#ifdef USE_CSG
+
                 if (do_csg > 0u) {
+                    // CSG mode: update media state buffer
                     uint old_mid = mid;
                     uvec2 new_ms = ff ? ms_enter(mstate, bm) : ms_leave(mstate, bm);
                     uint new_mid = ms_get(new_ms, 0);
 
                     bool reflected = false;
 
+                    // Check for refractive index mismatch at boundary
                     if (do_reflect > 0u && new_mid != old_mid
                             && new_mid < num_media && old_mid < num_media) {
                         float n_in = media[old_mid].n;
@@ -600,7 +722,12 @@ void main() {
                         if (n_in != n_out) {
                             // Only compute curvature normal at actual refractive boundary
                             vec3 hp = pos - dir * SAFETY_DIST;
-                            vec3 N = get_reflection_normal(tri, ff, hp);
+                            vec3 N = get_normal(tri, hp);
+
+                            if (!ff) {
+                                N = -N;
+                            }
+
                             reflected = do_reflection(N, n_in, n_out, rng, pos, dir);
                         }
                     }
@@ -613,9 +740,10 @@ void main() {
                             mid = MEDIUM_DEAD;
                         }
                     }
-
-                } else {
-                    // MESH mode
+                } else
+#endif
+                {
+                    // Mesh mode: new medium from triangle's front/back labels
                     uint new_mid = ff ? bm : fm;
                     bool reflected = false;
 
@@ -625,7 +753,12 @@ void main() {
                         float n_out = (new_mid < num_media) ? media[new_mid].n : 1.0;
 
                         if (prop.n != n_out) {
-                            vec3 N = ff ? face_normal[tri * 2].xyz : -face_normal[tri * 2].xyz;
+                            vec3 N = get_normal(tri, pos - dir * SAFETY_DIST);
+
+                            if (!ff) {
+                                N = -N;
+                            }
+
                             reflected = do_reflection(N, prop.n, n_out, rng, pos, dir);
                         }
                     }
@@ -639,10 +772,17 @@ void main() {
                     }
                 }
 
+                // ---- No hit, not transparent → scattering event ----
             } else if (!hit && !is_transparent) {
+#ifdef USE_CSG
+
+                // In CSG mode, if photon is outside all shapes, terminate
                 if (do_csg > 0u && ms_get(mstate, 0) == 0u) {
                     mid = MEDIUM_DEAD;
-                } else {
+                } else
+#endif
+                {
+                    // Scatter: move to scattering site, update weight, pick new direction
                     float L = slen / prop.mus;
                     accumulate(pos, dir, mid, weight, tof, L);
                     pos += dir * L;
@@ -654,6 +794,7 @@ void main() {
             }
         }
 
+        // When a photon escapes or tof reaches the upper limit, launch a new one
         if (mid == MEDIUM_DEAD || mid == MEDIUM_AMBIENT || tof >= time_end) {
             launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng);
             ++done;
