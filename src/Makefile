@@ -14,11 +14,12 @@ LDFLAGS   = -lvulkan
 GLSLC    ?= glslangValidator
 GLSLFLAGS = --target-env vulkan1.2 -e main
 
-BINARY    = vkmmc
-SHADER    = vkmmc_core.spv
-SOURCES   = vkmmc.cpp miniz/miniz.c
-HEADERS   = vkmmc_io.h vkmmc_shapes.h vkmmc_curvature.h nlohmann/json.hpp
-COMP_SRC  = vkmmc_core.comp
+BINARY        = vkmmc
+SHADER        = vkmmc_core.spv
+SHADER_HEADER = vkmmc_core_spv.h
+SOURCES       = vkmmc.cpp miniz/miniz.c
+HEADERS       = vkmmc_io.h vkmmc_shapes.h vkmmc_curvature.h nlohmann/json.hpp $(SHADER_HEADER)
+COMP_SRC      = vkmmc_core.comp
 
 INPUT    ?= input.json
 NPHOTON  ?= 100000
@@ -63,6 +64,10 @@ $(BINARY): $(SOURCES) $(HEADERS)
 	$(CXX) $(CXXFLAGS) -o $@ $(SOURCES) $(LDFLAGS)
 	@echo "Built: $@"
 
+$(SHADER_HEADER): $(SHADER)
+	xxd -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
+	@echo "Built: $@"
+
 host: $(BINARY)
 
 # Force shader rebuild when flags change
@@ -83,6 +88,7 @@ shader-nvidia: $(COMP_SRC)
 	sed 's|^//#define USE_ATOMIC_FLOAT|#define USE_ATOMIC_FLOAT|' $< > _mc_nvidia.comp
 	$(GLSLC) $(GLSLFLAGS) -o $(SHADER) _mc_nvidia.comp
 	@rm -f _mc_nvidia.comp
+	xxd -i $(SHADER) | sed 's/^unsigned char/alignas(4) unsigned char/' > $(SHADER_HEADER)
 	@echo "Built: $(SHADER) (NVIDIA atomicAdd float)"
 
 listgpu: $(BINARY)
@@ -92,7 +98,7 @@ run: $(BINARY) $(SHADER)
 	./$(BINARY) -f $(INPUT) -n $(NPHOTON) -G $(GPUID)
 
 clean:
-	rm -f $(BINARY) $(SHADER) _mc_nvidia.comp .shader_flags *.jdat *.o
+	rm -f $(BINARY) $(SHADER) $(SHADER_HEADER) _mc_nvidia.comp .shader_flags *.jdat *.o
 
 miniz/miniz.c:
 	@echo "Error: miniz.c not found. Download from https://github.com/richgel999/miniz"

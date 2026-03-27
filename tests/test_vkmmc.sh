@@ -8,7 +8,7 @@
 
 set -uo pipefail
 
-EXEC="${1:-./vkmmc}"
+EXEC="${1:-../src/vkmmc}"
 shift || true
 
 if [ -f "$EXEC" ]; then

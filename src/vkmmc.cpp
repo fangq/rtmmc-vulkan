@@ -25,6 +25,7 @@
 #include "vkmmc_io.h"
 #include "vkmmc_shapes.h"
 #include "vkmmc_curvature.h"
+#include "vkmmc_core_spv.h"
 
 #ifndef VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME
     #define VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME "VK_EXT_shader_atomic_float"
@@ -550,10 +551,18 @@ ComputePipe create_pipeline(VulkanCtx& c, const char* spirv) {
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &cp.descLayout;
     VK_CHECK(vkCreatePipelineLayout(c.device, &pl, NULL, &cp.pipeLayout));
-    std::vector<uint32_t> code = load_spirv(spirv);
+    std::vector<uint32_t> code;
     VkShaderModuleCreateInfo sm = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    sm.codeSize = code.size() * 4;
-    sm.pCode = code.data();
+
+    if (spirv) {
+        code = load_spirv(spirv);
+        sm.codeSize = code.size() * 4;
+        sm.pCode = code.data();
+    } else {
+        sm.codeSize = vkmmc_core_spv_len;
+        sm.pCode = reinterpret_cast<const uint32_t*>(vkmmc_core_spv);
+    }
+
     VkShaderModule mod;
     VK_CHECK(vkCreateShaderModule(c.device, &sm, NULL, &mod));
     VkPipelineShaderStageCreateInfo st = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -747,7 +756,7 @@ SimConfig parse_cmdline(int argc, char** argv, CmdOverrides& ovr) {
 /*                             Main                                 */
 /* ================================================================ */
 int main(int argc, char** argv) {
-    const char* spirvFile = "vkmmc_core.spv";
+    const char* spirvFile = NULL; /* use embedded SPIR-V by default */
 
     if (argc > 2) {
         std::string la(argv[argc - 1]);
