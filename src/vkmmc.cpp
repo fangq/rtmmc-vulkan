@@ -1502,8 +1502,9 @@ int main(int argc, char** argv) {
     params.has_curvature = has_curvature ? 1u : 0u;
     params.minenergy = cfg.minenergy;
     params.roulettesize = cfg.roulettesize;
-    params.do_traj = cfg.do_traj ? 1u : 0u;
-    params.max_traj = cfg.do_traj ? cfg.maxjumpdebug : 0u;
+    bool do_traj = (cfg.debuglevel & 8192u) != 0u;
+    params.do_traj = do_traj ? 1u : 0u;
+    params.max_traj = do_traj ? cfg.maxjumpdebug : 0u;
     printf("DEBUG: has_curvature=%d, params.has_curvature=%u\n",
            has_curvature, params.has_curvature);
 
@@ -1523,7 +1524,7 @@ int main(int argc, char** argv) {
     upload_to_device(ctx, seedBuf, seeds.data(), tt * sizeof(uint4_t));
 
     /* Trajectory buffer: [0]=atomic counter, [1..6*N]=records (6 uints each) */
-    uint32_t traj_cap = cfg.do_traj ? cfg.maxjumpdebug : 0u;
+    uint32_t traj_cap = do_traj ? cfg.maxjumpdebug : 0u;
 
     VkDeviceSize traj_buf_sz = (1 + (VkDeviceSize)traj_cap * 6) * sizeof(uint32_t);
 
@@ -1660,7 +1661,7 @@ int main(int argc, char** argv) {
     }
 
     // Save trajectory
-    if (cfg.do_traj && traj_cap > 0) {
+    if (do_traj && traj_cap > 0) {
         std::vector<uint32_t> trajRaw(1 + (size_t)traj_cap * 6);
         download_from_device(ctx, trajBuf, trajRaw.data(), traj_buf_sz);
         uint32_t n = std::min(trajRaw[0], traj_cap);
