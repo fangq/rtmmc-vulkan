@@ -61,11 +61,14 @@ struct SimConfig {
     int mesh_res;
     float minenergy;
     float roulettesize;
+    bool do_traj;
+    uint32_t maxjumpdebug;
 
     SimConfig() : nphoton(1000000), rng_seed(29012391), do_mismatch(true),
         do_normalize(true), output_type(2), t0(0), t1(5e-9f), dt(5e-9f),
         maxgate(1), unitinmm(1.0f), srctype(0), init_elem(-1),
-        mediumid0(0xFFFFFFFFu), has_grid_dim(false), has_steps(false), is_csg(false), mesh_res(24), minenergy(1e-6f), roulettesize(10.0f) {
+        mediumid0(0xFFFFFFFFu), has_grid_dim(false), has_steps(false), is_csg(false), mesh_res(24), minenergy(1e-6f), roulettesize(10.0f),
+        do_traj(false), maxjumpdebug(1000000) {
         memset(srcpos, 0, sizeof(srcpos));
         memset(srcdir, 0, sizeof(srcdir));
         srcdir[2] = 1.0f;
@@ -691,6 +694,8 @@ static SimConfig load_json_input(const char* filepath) {
         cfg.output_type = parse_outputtype(s.value("OutputType", "x"));
         cfg.minenergy = s.value("RussianRoulette", 1e-6f);
         cfg.roulettesize = s.value("RussianRouletteSize", 10.0f);
+        cfg.do_traj = s.value("SaveTraj", false);
+        cfg.maxjumpdebug = s.value("MaxJump", 1000000u);
     }
 
     // Forward

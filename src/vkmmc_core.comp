@@ -70,7 +70,7 @@ layout(std430, set = 0, binding = 3) buffer OutputBuffer { uint output_data[]; }
 // offset 128: srctype, maxgate, outputtype, isreflect   3 ints + 1 uint
 // offset 144: mediumid0, total_threads, num_media, seed  4 uints
 // offset 160: do_csg, has_curvature, threadphoton, oddphoton  2 uint + 2 int
-// offset 176: minenergy, roulettesize, pad, pad    4 floats
+// offset 176: minenergy, roulettesize, do_traj, max_traj    2 floats + 2 uints
 
 layout(std140, set = 0, binding = 4) uniform SimParams {
     vec4  src_pos;           // offset 0
@@ -105,11 +105,11 @@ layout(std140, set = 0, binding = 4) uniform SimParams {
     int   photons_per_thread;// 168
     int   extra_photons;     // 172
 
-    // offset 176: scalar row 4 (Russian Roulette)
+    // offset 176: scalar row 4
     float minenergy;         // 176
     float roulettesize;      // 180
-    float _pad1;             // 184
-    float _pad2;             // 188
+    uint  do_traj;           // 184
+    uint  max_traj;          // 188
 };
 
 layout(std430, set = 0, binding = 5) readonly buffer SeedBuffer { uvec4 thread_seeds[]; };
@@ -120,6 +120,7 @@ struct NodeCurv {
     vec4 node_pos;   // .xyz = node world position
 };
 layout(std430, set = 0, binding = 6) readonly buffer CurvBuffer { NodeCurv node_curv[]; };
+layout(std430, set = 0, binding = 7) buffer TrajBuffer { uint traj_data[]; };
 
 // ==================== Constants ====================
 
@@ -639,6 +640,31 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
     }
 }
 
+// ==================== Trajectory ====================
+
+// Record one trajectory event: photon_id, position, weight, event type.
+// event: 0=launch, 1=scatter, 2=terminated
+// traj_data[0] is the atomic counter; data starts at index 1 (6 uints per record).
+void save_traj(vec3 p, float w, uint photon_id, uint event) {
+    if (do_traj == 0u) {
+        return;
+    }
+
+    uint slot = atomicAdd(traj_data[0], 1u);
+
+    if (slot >= max_traj) {
+        return;
+    }
+
+    uint base = 1u + slot * 6u;
+    traj_data[base]      = photon_id;
+    traj_data[base + 1u] = floatBitsToUint(p.x);
+    traj_data[base + 2u] = floatBitsToUint(p.y);
+    traj_data[base + 3u] = floatBitsToUint(p.z);
+    traj_data[base + 4u] = floatBitsToUint(w);
+    traj_data[base + 5u] = event;
+}
+
 // ==================== Main Loop ====================
 
 void main() {
@@ -660,8 +686,10 @@ void main() {
     float weight, slen, tof;
     uint mid;
     uvec2 mstate;
+    uint photon_id = tid;  // globally unique: total_threads * done + tid
 
     launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng);
+    save_traj(pos, weight, photon_id, 0u);
 
     while (done < maxph) {
 
@@ -790,14 +818,21 @@ void main() {
                     tof += L * INV_C0 * prop.n;
                     dir = scatter_dir(dir, prop.g, rng);
                     slen = rand_scatlen(rng);
+                    save_traj(pos, weight, photon_id, 1u);
                 }
             }
         }
 
         // When a photon escapes or tof reaches the upper limit, launch a new one
         if (mid == MEDIUM_DEAD || mid == MEDIUM_AMBIENT || tof >= time_end) {
+            save_traj(pos, weight, photon_id, 2u);
             launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng);
             ++done;
+            photon_id = total_threads * uint(done) + tid;
+
+            if (done < maxph) {
+                save_traj(pos, weight, photon_id, 0u);
+            }
         }
     }
 }

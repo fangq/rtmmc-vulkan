@@ -68,7 +68,7 @@ struct MCParams {
     uint32_t do_csg, has_curvature;         // 160: 2 uints
     int      threadphoton, oddphoton;       // 160+8: 2 ints
     float    minenergy, roulettesize;       // 176: 2 floats
-    float    _pad1, _pad2;                  // 176+8: padding to 16-byte align
+    uint32_t do_traj, max_traj;             // 184: trajectory flags
 };
 // Total: 192 bytes
 
@@ -517,7 +517,7 @@ std::vector<uint32_t> load_spirv(const char* path) {
 ComputePipe create_pipeline(VulkanCtx& c, const char* spirv) {
     ComputePipe cp;
     memset(&cp, 0, sizeof(cp));
-    VkDescriptorSetLayoutBinding bn[7];
+    VkDescriptorSetLayoutBinding bn[8];
     memset(bn, 0, sizeof(bn));
     bn[0].binding = 0;
     bn[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
@@ -543,8 +543,12 @@ ComputePipe create_pipeline(VulkanCtx& c, const char* spirv) {
     bn[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bn[6].descriptorCount = 1;
     bn[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bn[7].binding = 7;
+    bn[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bn[7].descriptorCount = 1;
+    bn[7].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutCreateInfo dl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dl.bindingCount = 7;
+    dl.bindingCount = 8;
     dl.pBindings = bn;
     VK_CHECK(vkCreateDescriptorSetLayout(c.device, &dl, NULL, &cp.descLayout));
     VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -576,7 +580,7 @@ ComputePipe create_pipeline(VulkanCtx& c, const char* spirv) {
     vkDestroyShaderModule(c.device, mod, NULL);
     VkDescriptorPoolSize ps[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}
     };
     VkDescriptorPoolCreateInfo dp = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -593,14 +597,15 @@ ComputePipe create_pipeline(VulkanCtx& c, const char* spirv) {
 }
 
 void update_desc(VulkanCtx& c, ComputePipe& cp, VkAccelerationStructureKHR tlas,
-                 Buffer& fb, Buffer& mb, Buffer& ob, Buffer& pb, Buffer& sb, Buffer& cb) {
+                 Buffer& fb, Buffer& mb, Buffer& ob, Buffer& pb, Buffer& sb, Buffer& cb, Buffer& tb) {
     VkWriteDescriptorSetAccelerationStructureKHR aw = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
     aw.accelerationStructureCount = 1;
     aw.pAccelerationStructures = &tlas;
     VkDescriptorBufferInfo fi = {fb.buf, 0, VK_WHOLE_SIZE}, mi = {mb.buf, 0, VK_WHOLE_SIZE},
                            oi = {ob.buf, 0, VK_WHOLE_SIZE}, pi = {pb.buf, 0, VK_WHOLE_SIZE},
-                           si = {sb.buf, 0, VK_WHOLE_SIZE}, ci = {cb.buf, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet w[7];
+                           si = {sb.buf, 0, VK_WHOLE_SIZE}, ci = {cb.buf, 0, VK_WHOLE_SIZE},
+                           ti = {tb.buf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w[8];
     memset(w, 0, sizeof(w));
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w[0].pNext = &aw;
@@ -609,7 +614,7 @@ void update_desc(VulkanCtx& c, ComputePipe& cp, VkAccelerationStructureKHR tlas,
     w[0].descriptorCount = 1;
     w[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 
-    for (int i = 1; i <= 6; i++) {
+    for (int i = 1; i <= 7; i++) {
         w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[i].dstSet = cp.descSet;
         w[i].dstBinding = (uint32_t)i;
@@ -623,7 +628,8 @@ void update_desc(VulkanCtx& c, ComputePipe& cp, VkAccelerationStructureKHR tlas,
     w[4].pBufferInfo = &pi;
     w[5].pBufferInfo = &si;
     w[6].pBufferInfo = &ci;
-    vkUpdateDescriptorSets(c.device, 7, w, 0, NULL);
+    w[7].pBufferInfo = &ti;
+    vkUpdateDescriptorSets(c.device, 8, w, 0, NULL);
 }
 
 /* ================================================================ */
@@ -966,6 +972,15 @@ int main(int argc, char** argv) {
                         N.x = rx / rl;
                         N.y = ry / rl;
                         N.z = rz / rl;
+                    }
+                } else if (so.type == 3) { // lens spherical cap: standard outward normal (P - C)
+                    float dx = px - so.cx, dy = py - so.cy, dz = pz - so.cz;
+                    float dl2 = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+                    if (dl2 > 1e-10f) {
+                        N.x = dx / dl2;
+                        N.y = dy / dl2;
+                        N.z = dz / dl2;
                     }
                 }
             }
@@ -1487,6 +1502,8 @@ int main(int argc, char** argv) {
     params.has_curvature = has_curvature ? 1u : 0u;
     params.minenergy = cfg.minenergy;
     params.roulettesize = cfg.roulettesize;
+    params.do_traj = cfg.do_traj ? 1u : 0u;
+    params.max_traj = cfg.do_traj ? cfg.maxjumpdebug : 0u;
     printf("DEBUG: has_curvature=%d, params.has_curvature=%u\n",
            has_curvature, params.has_curvature);
 
@@ -1505,6 +1522,19 @@ int main(int argc, char** argv) {
 
     upload_to_device(ctx, seedBuf, seeds.data(), tt * sizeof(uint4_t));
 
+    /* Trajectory buffer: [0]=atomic counter, [1..6*N]=records (6 uints each) */
+    uint32_t traj_cap = cfg.do_traj ? cfg.maxjumpdebug : 0u;
+
+    VkDeviceSize traj_buf_sz = (1 + (VkDeviceSize)traj_cap * 6) * sizeof(uint32_t);
+
+    Buffer trajBuf = create_device_buffer(ctx, traj_buf_sz, ssbo);
+
+    {
+        VkCommandBuffer zcmd = begin_cmd(ctx);
+        vkCmdFillBuffer(zcmd, trajBuf.buf, 0, sizeof(uint32_t), 0);  // zero counter
+        end_submit(ctx, zcmd);
+    }
+
     if (has_curvature && !curvData.empty()) {
         gpuCurv.resize(curvData.size());
 
@@ -1520,7 +1550,7 @@ int main(int argc, char** argv) {
 
     ComputePipe cp = create_pipeline(ctx, spirvFile);
 
-    update_desc(ctx, cp, tlas.handle, faceBuf, mediaBuf, outBuf, paramBuf, seedBuf, curvBuf);
+    update_desc(ctx, cp, tlas.handle, faceBuf, mediaBuf, outBuf, paramBuf, seedBuf, curvBuf, trajBuf);
 
     // Batched dispatch
     uint64_t batchsz;
@@ -1629,6 +1659,42 @@ int main(int argc, char** argv) {
         printf(")\n");
     }
 
+    // Save trajectory
+    if (cfg.do_traj && traj_cap > 0) {
+        std::vector<uint32_t> trajRaw(1 + (size_t)traj_cap * 6);
+        download_from_device(ctx, trajBuf, trajRaw.data(), traj_buf_sz);
+        uint32_t n = std::min(trajRaw[0], traj_cap);
+        printf("Trajectory: %u events recorded (max %u)\n", n, traj_cap);
+
+        if (n > 0) {
+            // Extract separate arrays: photon_id (uint32), position (float32 [N,3]),
+            // weight (float32), event (uint32)
+            std::vector<uint32_t> tpid(n), tevt(n);
+            std::vector<float> tpos(n * 3), twgt(n);
+
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t base = 1u + i * 6u;
+                tpid[i]        = trajRaw[base + 0];
+                memcpy(&tpos[i * 3 + 0], &trajRaw[base + 1], 4);
+                memcpy(&tpos[i * 3 + 1], &trajRaw[base + 2], 4);
+                memcpy(&tpos[i * 3 + 2], &trajRaw[base + 3], 4);
+                memcpy(&twgt[i],          &trajRaw[base + 4], 4);
+                tevt[i]        = trajRaw[base + 5];
+            }
+
+            json troot;
+            troot["Trajectory"]["PhotonID"] = jdata_encode("uint32", {n}, tpid.data(), n * sizeof(uint32_t));
+            troot["Trajectory"]["Position"] = jdata_encode("single", {n, 3}, tpos.data(), n * 3 * sizeof(float));
+            troot["Trajectory"]["Weight"]   = jdata_encode("single", {n}, twgt.data(), n * sizeof(float));
+            troot["Trajectory"]["Event"]    = jdata_encode("uint32", {n}, tevt.data(), n * sizeof(uint32_t));
+
+            std::string tname = cfg.session_id + "_traj.jdat";
+            std::ofstream tf(tname.c_str());
+            tf << troot.dump(2) << std::endl;
+            printf("Trajectory saved: %s\n", tname.c_str());
+        }
+    }
+
     // Cleanup
     ctx.pfnDestroyAS(ctx.device, tlas.handle, NULL);
     ctx.pfnDestroyAS(ctx.device, blas.handle, NULL);
@@ -1640,6 +1706,7 @@ int main(int argc, char** argv) {
     destroy_buf(ctx, paramBuf);
     destroy_buf(ctx, seedBuf);
     destroy_buf(ctx, curvBuf);
+    destroy_buf(ctx, trajBuf);
     vkDestroyPipeline(ctx.device, cp.pipeline, NULL);
     vkDestroyPipelineLayout(ctx.device, cp.pipeLayout, NULL);
     vkDestroyDescriptorPool(ctx.device, cp.descPool, NULL);

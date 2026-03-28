@@ -282,11 +282,246 @@ static void gen_slab(ShapeMesh& m, int dir, float lo, float hi,
     }
 }
 
+/* Returns number of ShapeOrigin entries contributed by each shape type.
+   Must stay in sync with extract_shape_origins() in vkmmc_curvature.h. */
+static int shape_origin_count(const std::string& key) {
+    if (key == "Lens") {
+        return 2;    /* front spherical cap + back spherical cap */
+    }
+
+    return 1;
+}
+
+/* ================================================================ */
+/*  Lens: two spherical caps + cylindrical edge ring                */
+/*                                                                  */
+/*  Front sphere center: O + n*(Ff-Df),  radius Rc_f = |Ff-2*Df|  */
+/*  Back  sphere center: O - n*(Fb-Db),  radius Rc_b = |Fb-2*Db|  */
+/*                                                                  */
+/*  front_oid / back_oid: 1-based origin IDs written to shape_id   */
+/* ================================================================ */
+static void gen_lens(ShapeMesh& m,
+                     float ox, float oy, float oz,
+                     float ddx, float ddy, float ddz,
+                     float R,
+                     float Df, float Rf,   /* front: apex dist, sphere radius (signed) */
+                     float Db, float Rb,   /* back:  apex dist, sphere radius (signed) */
+                     uint32_t tag,
+                     uint32_t front_oid, uint32_t back_oid,
+                     int nseg = 32, int nrings = 12) {
+    float dl = std::sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+
+    if (dl < 1e-10f || nseg < 3 || nrings < 1) {
+        return;
+    }
+
+    float nx = ddx / dl, ny = ddy / dl, nz = ddz / dl;
+
+    /* Perpendicular basis u, v */
+    float ux, uy, uz;
+
+    if (std::fabs(nz) < 0.9f) {
+        float t = std::sqrt(nx * nx + ny * ny);
+        ux = -ny / t;
+        uy =  nx / t;
+        uz = 0.0f;
+    } else {
+        float t = std::sqrt(ny * ny + nz * nz);
+        ux = 0.0f;
+        uy = -nz / t;
+        uz =  ny / t;
+    }
+
+    float vx = ny * uz - nz * uy;
+    float vy = nz * ux - nx * uz;
+    float vz = nx * uy - ny * ux;
+
+    /* Front sphere: center C_f = O + n*(Df-Rf), radius |Rf|
+       sf = sign(Rf) so that zf_at(0) = (Df-Rf) + sf*|Rf| = Df */
+    float af  = Df - Rf;
+    float Rcf = std::fabs(Rf);
+    float sf  = (Rf >= 0.0f) ? 1.0f : -1.0f;
+
+    /* Back sphere: center C_b = O + n*(Rb-Db), radius |Rb|
+       sb = -sign(Rb) so that zb_at(0) = (Rb-Db) + sb*|Rb| = -Db */
+    float ab  = Rb - Db;
+    float Rcb = std::fabs(Rb);
+    float sb  = (Rb >= 0.0f) ? -1.0f : 1.0f;
+
+    /* Edge radius: clamp to sphere radii */
+    float r_edge = R;
+
+    if (Rcf > 1e-6f) {
+        r_edge = std::min(r_edge, Rcf);
+    }
+
+    if (Rcb > 1e-6f) {
+        r_edge = std::min(r_edge, Rcb);
+    }
+
+    /* If both R positive (both faces convex outward), check sphere–sphere intersection */
+    if (Rf > 0.0f && Rb > 0.0f && std::fabs(ab - af) > 1e-10f) {
+        float z_int = (Rcf * Rcf - Rcb * Rcb - af * af + ab * ab) / (2.0f * (ab - af));
+        float r2    = Rcf * Rcf - (z_int - af) * (z_int - af);
+
+        if (r2 > 0.0f) {
+            float r_int = std::sqrt(r2);
+
+            if (r_int < R) {
+                r_edge = std::min(r_edge, r_int);
+            }
+        }
+    }
+
+    if (r_edge < 1e-6f) {
+        return;
+    }
+
+    /* z-offset from O (along n) for each face at lateral radius r */
+    auto zf_at = [&](float r) -> float {
+        return af + sf * std::sqrt(std::max(0.0f, Rcf * Rcf - r * r));
+    };
+    auto zb_at = [&](float r) -> float {
+        return ab + sb * std::sqrt(std::max(0.0f, Rcb * Rcb - r * r));
+    };
+
+    float zeb = zb_at(r_edge);   /* back rim z (front rim computed per-node in ring loop) */
+
+    /* Node at (lateral r, azimuth segment j, axial offset zoff from O) */
+    const float TWO_PI = 6.28318530718f;
+    auto make_node = [&](float r, int jseg, float zoff) -> Vec3 {
+        float phi = TWO_PI * jseg / nseg;
+        float cp  = std::cos(phi), sp2 = std::sin(phi);
+        return {
+            ox + nx* zoff + r* (cp * ux + sp2 * vx),
+            oy + ny* zoff + r* (cp * uy + sp2 * vy),
+            oz + nz* zoff + r* (cp * uz + sp2 * vz)};
+    };
+
+    uint32_t b = (uint32_t)m.nodes.size();
+    Vec3 center = {ox, oy, oz};
+
+    /* ---- Nodes ---- */
+
+    /* b+0: front apex */
+    m.nodes.push_back({ox + nx * Df, oy + ny * Df, oz + nz * Df});
+
+    /* b+1 .. b+nrings*nseg: front rings, ring i at r=r_edge*(i+1)/nrings */
+    for (int i = 0; i < nrings; i++) {
+        float r = r_edge * (i + 1) / nrings;
+        float z = zf_at(r);
+
+        for (int j = 0; j < nseg; j++) {
+            m.nodes.push_back(make_node(r, j, z));
+        }
+    }
+
+    /* b+1+nrings*nseg .. b+(nrings+1)*nseg: back rim (separate ring) */
+    for (int j = 0; j < nseg; j++) {
+        m.nodes.push_back(make_node(r_edge, j, zeb));
+    }
+
+    /* b+1+(nrings+1)*nseg .. b+2*nrings*nseg: back inner rings,
+       ring 0 at r=r_edge*(nrings-1)/nrings down to r=r_edge/nrings */
+    for (int i = nrings - 2; i >= 0; i--) {
+        float r = r_edge * (i + 1) / nrings;
+        float z = zb_at(r);
+
+        for (int j = 0; j < nseg; j++) {
+            m.nodes.push_back(make_node(r, j, z));
+        }
+    }
+
+    /* b+1+2*nrings*nseg: back apex */
+    uint32_t apex_b = (uint32_t)m.nodes.size();
+    m.nodes.push_back({ox - nx * Db, oy - ny * Db, oz - nz * Db});
+
+    /* Index helpers (seg wraps mod nseg) */
+    auto f_apex = [&]() -> uint32_t { return b; };
+    auto f_ring = [&](int ring, int seg) -> uint32_t {
+        return b + 1 + (uint32_t)ring * nseg + (uint32_t)((seg % nseg + nseg) % nseg);
+    };
+    auto b_rim = [&](int seg) -> uint32_t {
+        return b + 1 + (uint32_t)nrings * nseg + (uint32_t)((seg % nseg + nseg) % nseg);
+    };
+    auto b_ring = [&](int ring, int seg) -> uint32_t {
+        return b + 1 + (uint32_t)(nrings + 1) * nseg
+        + (uint32_t)ring * nseg + (uint32_t)((seg % nseg + nseg) % nseg);
+    };
+
+    /* ---- Faces ---- */
+
+    size_t fi0 = m.faces.size();  /* start of front cap */
+
+    /* Front cap: fan apex → ring 0 */
+    for (int j = 0; j < nseg; j++) {
+        add_tri_outward(m, f_apex(), f_ring(0, j), f_ring(0, j + 1), tag, center);
+    }
+
+    /* Front cap: rings 0 → nrings-1 (front rim) */
+    for (int i = 0; i < nrings - 1; i++) {
+        for (int j = 0; j < nseg; j++) {
+            add_quad_outward(m, f_ring(i, j), f_ring(i, j + 1),
+                             f_ring(i + 1, j + 1), f_ring(i + 1, j), tag, center);
+        }
+    }
+
+    /* Edge: front rim → back rim (flat) */
+    for (int j = 0; j < nseg; j++) {
+        add_quad_outward(m, f_ring(nrings - 1, j), f_ring(nrings - 1, j + 1),
+                         b_rim(j + 1), b_rim(j), tag, center, true);
+    }
+
+    size_t fi2 = m.faces.size();  /* start of back cap */
+
+    /* Back cap */
+    if (nrings > 1) {
+        /* back rim → back ring 0 */
+        for (int j = 0; j < nseg; j++) {
+            add_quad_outward(m, b_rim(j), b_rim(j + 1),
+                             b_ring(0, j + 1), b_ring(0, j), tag, center);
+        }
+
+        /* back rings 0 → nrings-2 */
+        for (int i = 0; i < nrings - 2; i++) {
+            for (int j = 0; j < nseg; j++) {
+                add_quad_outward(m, b_ring(i, j), b_ring(i, j + 1),
+                                 b_ring(i + 1, j + 1), b_ring(i + 1, j), tag, center);
+            }
+        }
+
+        /* fan: back ring nrings-2 → apex_b */
+        for (int j = 0; j < nseg; j++) {
+            add_tri_outward(m, b_ring(nrings - 2, j), b_ring(nrings - 2, j + 1),
+                            apex_b, tag, center);
+        }
+    } else {
+        /* nrings == 1: direct fan from back rim to apex */
+        for (int j = 0; j < nseg; j++) {
+            add_tri_outward(m, b_rim(j), b_rim(j + 1), apex_b, tag, center);
+        }
+    }
+
+    size_t fi3 = m.faces.size();
+
+    /* Assign origin IDs to faces:
+       front cap + edge → front_oid (edge is flat-flagged so curvature unused)
+       back cap         → back_oid  */
+    for (size_t fi = fi0; fi < fi2; fi++) {
+        m.shape_id.push_back(front_oid);
+    }
+
+    for (size_t fi = fi2; fi < fi3; fi++) {
+        m.shape_id.push_back(back_oid);
+    }
+}
+
 /* ================================================================ */
 /*  Parse JSON Shapes array → combined mesh                         */
 /* ================================================================ */
 static ShapeMesh parse_shapes(const json& arr, float ext[6], int mesh_res = 24) {
     ShapeMesh m;
+    int origin_counter = 0;
 
     for (size_t si = 0; si < arr.size(); si++) {
         const json& shape = arr[si];
@@ -376,13 +611,33 @@ static ShapeMesh parse_shapes(const json& arr, float ext[6], int mesh_res = 24) 
             }
 
             printf("  Shape[%zu]: %s (%zu tri)\n", si, key.c_str(), m.faces.size());
+        } else if (key == "Lens") {
+            float lox = obj["O"][0].get<float>(), loy = obj["O"][1].get<float>(), loz = obj["O"][2].get<float>();
+            float ldx = obj["Dir"][0].get<float>(), ldy = obj["Dir"][1].get<float>(), ldz = obj["Dir"][2].get<float>();
+            float lR = obj["R"].get<float>();
+            uint32_t tag = obj.value("Tag", 1u);
+            float Df = obj["Front"]["D"].get<float>();
+            float Rf = obj["Front"]["R"].get<float>();
+            float Db = obj["Back"]["D"].get<float>();
+            float Rb = obj["Back"]["R"].get<float>();
+            int nseg   = mesh_res;
+            int nrings = std::max(mesh_res / 2, 4);
+            uint32_t foid = (uint32_t)(origin_counter + 1);
+            uint32_t boid = (uint32_t)(origin_counter + 2);
+            gen_lens(m, lox, loy, loz, ldx, ldy, ldz, lR, Df, Rf, Db, Rb, tag, foid, boid, nseg, nrings);
+            printf("  Shape[%zu]: Lens O=[%.1f,%.1f,%.1f] R=%.2f Df=%.2f Rf=%.2f Db=%.2f Rb=%.2f tag=%u (%zu tri)\n",
+                   si, lox, loy, loz, lR, Df, Rf, Db, Rb, tag, m.faces.size() - faces_before);
+            origin_counter += shape_origin_count(key);
+            continue;   /* gen_lens already pushed shape_ids */
         } else if (key != "Name" && key != "Origin") {
             printf("  Shape[%zu]: unknown '%s'\n", si, key.c_str());
         }
 
         for (size_t fi = faces_before; fi < m.faces.size(); fi++) {
-            m.shape_id.push_back((uint32_t)(si + 1));
+            m.shape_id.push_back((uint32_t)(origin_counter + 1));
         }
+
+        origin_counter += shape_origin_count(key);
     }
 
     printf("Shape mesh total: %zu nodes, %zu triangles\n", m.nodes.size(), m.faces.size());

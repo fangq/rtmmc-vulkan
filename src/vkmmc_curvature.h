@@ -165,6 +165,30 @@ static bool compute_node_curvature_for_shape(
             return false;
         }
 
+    } else if (so.type == 3) {
+        /* ---- Lens spherical cap ----
+           Standard sphere outward normal: (P - C) / R */
+        float dx = px - so.cx, dy = py - so.cy, dz = pz - so.cz;
+        float l = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+        if (l < 1e-10f) {
+            l = 1e-10f;
+        }
+
+        float nx2 = dx / l, ny2 = dy / l, nz2 = dz / l;
+        float k = (so.R > 1e-10f) ? 1.0f / so.R : 0.0f;
+        float tx, ty, tz;
+        make_tangent(nx2, ny2, nz2, tx, ty, tz);
+        out.nx = nx2;
+        out.ny = ny2;
+        out.nz = nz2;
+        out.k1 = k;
+        out.k2 = k;
+        out.px = tx;
+        out.py = ty;
+        out.pz = tz;
+        return true;
+
     } else {
         /* ---- Box / Slab (flat) ---- */
         out.k1 = 0;
@@ -352,6 +376,41 @@ static std::vector<ShapeOrigin> extract_shape_origins(const json& arr) {
             }
 
             so.R = obj["R"].get<float>();
+        } else if (key == "Lens") {
+            /* Lens produces TWO ShapeOrigin entries: front cap then back cap.
+               Must match the origin_counter logic in parse_shapes. */
+            float lox = obj["O"][0].get<float>(), loy = obj["O"][1].get<float>(), loz = obj["O"][2].get<float>();
+            float ldx = obj["Dir"][0].get<float>(), ldy = obj["Dir"][1].get<float>(), ldz = obj["Dir"][2].get<float>();
+            float Df = obj["Front"]["D"].get<float>(), Rf = obj["Front"]["R"].get<float>();
+            float Db = obj["Back"]["D"].get<float>(),  Rb = obj["Back"]["R"].get<float>();
+            float dl = std::sqrt(ldx * ldx + ldy * ldy + ldz * ldz);
+
+            if (dl > 1e-10f) {
+                ldx /= dl;
+                ldy /= dl;
+                ldz /= dl;
+            }
+
+            /* Front spherical cap: center = O + n*(Df-Rf), radius = |Rf| */
+            ShapeOrigin sf2;
+            memset(&sf2, 0, sizeof(sf2));
+            sf2.type = 3;
+            sf2.cx = lox + ldx * (Df - Rf);
+            sf2.cy = loy + ldy * (Df - Rf);
+            sf2.cz = loz + ldz * (Df - Rf);
+            sf2.R  = std::fabs(Rf);
+            origins.push_back(sf2);
+
+            /* Back spherical cap: center = O + n*(Rb-Db), radius = |Rb| */
+            ShapeOrigin sb2;
+            memset(&sb2, 0, sizeof(sb2));
+            sb2.type = 3;
+            sb2.cx = lox + ldx * (Rb - Db);
+            sb2.cy = loy + ldy * (Rb - Db);
+            sb2.cz = loz + ldz * (Rb - Db);
+            sb2.R  = std::fabs(Rb);
+            origins.push_back(sb2);
+            continue;  /* already pushed both entries */
         } else {
             so.type = 0;
         }
