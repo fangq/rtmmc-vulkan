@@ -40,6 +40,16 @@ ifdef CURV
     CXXFLAGS  += -DUSE_CURVATURE
 endif
 
+# Interactive viewer support
+GLFW_INC  ?= $(shell pkg-config --cflags glfw3 2>/dev/null || echo "-I/usr/local/optix/SDK/support/GLFW/include")
+GLFW_LIB  ?= $(shell pkg-config --libs   glfw3 2>/dev/null || echo "-L/usr/local/optix/SDK/lib -Wl,-rpath,/usr/local/optix/SDK/lib -lglfw")
+ifdef SHOW
+    CXXFLAGS  += -DUSE_SHOW $(GLFW_INC)
+    LDFLAGS   += $(GLFW_LIB)
+    SHOW_DEPS  = vkmmc_show_vert_spv.h vkmmc_show_frag_spv.h
+    HEADERS   += $(SHOW_DEPS)
+endif
+
 .PHONY: all nvidia host shader shader-nvidia clean listgpu run help pretty
 
 all: $(BINARY) $(SHADER)
@@ -67,6 +77,18 @@ $(BINARY): $(SOURCES) $(HEADERS)
 $(SHADER_HEADER): $(SHADER)
 	xxd -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
 	@echo "Built: $@"
+
+vkmmc_show_vert.spv: vkmmc_show.vert
+	glslangValidator --target-env vulkan1.2 -e main -S vert -o $@ $<
+
+vkmmc_show_frag.spv: vkmmc_show.frag
+	glslangValidator --target-env vulkan1.2 -e main -S frag -o $@ $<
+
+vkmmc_show_vert_spv.h: vkmmc_show_vert.spv
+	xxd -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
+
+vkmmc_show_frag_spv.h: vkmmc_show_frag.spv
+	xxd -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
 
 host: $(BINARY)
 
@@ -98,7 +120,8 @@ run: $(BINARY) $(SHADER)
 	./$(BINARY) -f $(INPUT) -n $(NPHOTON) -G $(GPUID)
 
 clean:
-	rm -f $(BINARY) $(SHADER) $(SHADER_HEADER) _mc_nvidia.comp .shader_flags *.jdat *.o
+	rm -f $(BINARY) $(SHADER) $(SHADER_HEADER) _mc_nvidia.comp .shader_flags *.jdat *.o \
+	    vkmmc_show_vert.spv vkmmc_show_frag.spv vkmmc_show_vert_spv.h vkmmc_show_frag_spv.h
 
 miniz/miniz.c:
 	@echo "Error: miniz.c not found. Download from https://github.com/richgel999/miniz"

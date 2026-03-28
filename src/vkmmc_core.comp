@@ -71,6 +71,7 @@ layout(std430, set = 0, binding = 3) buffer OutputBuffer { uint output_data[]; }
 // offset 144: mediumid0, total_threads, num_media, seed  4 uints
 // offset 160: do_csg, has_curvature, threadphoton, oddphoton  2 uint + 2 int
 // offset 176: minenergy, roulettesize, do_traj, max_traj    2 floats + 2 uints
+// offset 192: photon_base                                   1 uint
 
 layout(std140, set = 0, binding = 4) uniform SimParams {
     vec4  src_pos;           // offset 0
@@ -110,6 +111,9 @@ layout(std140, set = 0, binding = 4) uniform SimParams {
     float roulettesize;      // 180
     uint  do_traj;           // 184
     uint  max_traj;          // 188
+
+    // offset 192: scalar row 5
+    uint  photon_base;       // 192 — global photon index offset for this batch
 };
 
 layout(std430, set = 0, binding = 5) readonly buffer SeedBuffer { uvec4 thread_seeds[]; };
@@ -514,7 +518,8 @@ vec3 get_normal(int tri_id, vec3 hit_pos) {
  *   - Mesh mode (single ray probe to find enclosing element)
  */
 void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
-                   inout float tof, inout uint mid, inout uvec2 mstate, inout uvec4 rng) {
+                   inout float tof, inout uint mid, inout uvec2 mstate, inout uvec4 rng,
+                   out vec3 launch_pos) {
     p = src_pos.xyz;
     d = src_dir.xyz;
     w = 1.0;
@@ -543,6 +548,7 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
     }
 
     slen = rand_scatlen(rng);
+    launch_pos = p;  // capture source position before any medium-entry move
 
     // ---- Determine initial medium ----
 
@@ -682,14 +688,23 @@ void main() {
     uvec4 rng = thread_seeds[tid];
     int done = 0, maxph = photons_per_thread + int(tid < uint(extra_photons));
 
+    if (maxph <= 0) {
+        return;
+    }
+
     vec3 pos, dir;
     float weight, slen, tof;
     uint mid;
     uvec2 mstate;
-    uint photon_id = tid;  // globally unique: total_threads * done + tid
+    uint photon_id = photon_base + tid;  // globally unique across batches
 
-    launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng);
-    save_traj(pos, weight, photon_id, 0u);
+    vec3 launch_pos;
+    launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng, launch_pos);
+    save_traj(launch_pos, 1.0, photon_id, 0u);         // save original source position
+    if (any(notEqual(launch_pos, pos))) {
+        save_traj(pos, weight, photon_id, 3u);          // save sphere-entry boundary
+    }
+    bool traj_need_term = (mid != MEDIUM_DEAD);
 
     while (done < maxph) {
 
@@ -768,10 +783,16 @@ void main() {
                             mid = MEDIUM_DEAD;
                         }
                     }
+
+                    if (new_mid != old_mid) {
+                        save_traj(pos, weight, photon_id, 3u);
+                        traj_need_term = false;
+                    }
                 } else
 #endif
                 {
                     // Mesh mode: new medium from triangle's front/back labels
+                    uint old_mid = mid;
                     uint new_mid = ff ? bm : fm;
                     bool reflected = false;
 
@@ -798,6 +819,11 @@ void main() {
                             mid = MEDIUM_DEAD;
                         }
                     }
+
+                    if (new_mid != old_mid) {
+                        save_traj(pos, weight, photon_id, 3u);
+                        traj_need_term = false;
+                    }
                 }
 
                 // ---- No hit, not transparent → scattering event ----
@@ -819,19 +845,26 @@ void main() {
                     dir = scatter_dir(dir, prop.g, rng);
                     slen = rand_scatlen(rng);
                     save_traj(pos, weight, photon_id, 1u);
+                    traj_need_term = true;
                 }
             }
         }
 
         // When a photon escapes or tof reaches the upper limit, launch a new one
         if (mid == MEDIUM_DEAD || mid == MEDIUM_AMBIENT || tof >= time_end) {
-            save_traj(pos, weight, photon_id, 2u);
-            launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng);
+            if (traj_need_term) {
+                save_traj(pos, weight, photon_id, 2u);
+            }
+            launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng, launch_pos);
             ++done;
-            photon_id = total_threads * uint(done) + tid;
+            photon_id = photon_base + total_threads * uint(done) + tid;
 
             if (done < maxph) {
-                save_traj(pos, weight, photon_id, 0u);
+                save_traj(launch_pos, 1.0, photon_id, 0u);  // original source position
+                if (any(notEqual(launch_pos, pos))) {
+                    save_traj(pos, weight, photon_id, 3u);   // sphere-entry boundary
+                }
+                traj_need_term = (mid != MEDIUM_DEAD);
             }
         }
     }
