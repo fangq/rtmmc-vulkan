@@ -1047,15 +1047,23 @@ static ShowTraj run_mc_simulation(VulkanCtx& ctx, SimConfig& cfg, CmdOverrides& 
 
     Buffer paramBuf = create_device_buffer(ctx, sizeof(MCParams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
-    /* RNG seeds — allocated once, re-seeded per batch to ensure unique photon paths */
+    /* RNG seeds — allocated once, re-seeded per batch to ensure unique photon paths.
+     * Hash-based per-thread seeding avoids the sequential correlations that arise
+     * when using consecutive rand() outputs (which also only provide 31-bit values). */
     uint32_t base_seed = (cfg.rng_seed > 0) ? cfg.rng_seed : (uint32_t)time(0);
     struct uint4_t {
         uint32_t x, y, z, w;
     };
     std::vector<uint4_t> seeds(tt);
 
-    srand(base_seed);
-    for (uint32_t i = 0; i < tt; i++) seeds[i] = {(uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand()};
+    auto make_seed = [](uint32_t base, uint32_t idx) -> uint32_t {
+        uint32_t v = base ^ (idx * 2654435761u);
+        v ^= v >> 16; v *= 0x45d9f3bu; v ^= v >> 16; v *= 0x45d9f3bu; v ^= v >> 16;
+        return v;
+    };
+    for (uint32_t i = 0; i < tt; i++)
+        seeds[i] = {make_seed(base_seed, i*4u+0u), make_seed(base_seed, i*4u+1u),
+                    make_seed(base_seed, i*4u+2u), make_seed(base_seed, i*4u+3u)};
 
     Buffer seedBuf = create_device_buffer(ctx, tt * sizeof(uint4_t), ssbo);
 
@@ -1120,8 +1128,10 @@ static ShowTraj run_mc_simulation(VulkanCtx& ctx, SimConfig& cfg, CmdOverrides& 
          * Without this, all batches start with the same RNG state and
          * simulate identical trajectories with only different photon IDs. */
         if (pdone > 0) {
-            srand(base_seed + (uint32_t)pdone);
-            for (uint32_t i = 0; i < tt; i++) seeds[i] = {(uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand()};
+            uint32_t batch_seed = base_seed + (uint32_t)pdone;
+            for (uint32_t i = 0; i < tt; i++)
+                seeds[i] = {make_seed(batch_seed, i*4u+0u), make_seed(batch_seed, i*4u+1u),
+                            make_seed(batch_seed, i*4u+2u), make_seed(batch_seed, i*4u+3u)};
             upload_to_device(ctx, seedBuf, seeds.data(), tt * sizeof(uint4_t));
         }
         upload_to_device(ctx, paramBuf, &params, sizeof(params));
@@ -2414,15 +2424,23 @@ int main(int argc, char** argv) {
 
     Buffer paramBuf = create_device_buffer(ctx, sizeof(MCParams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
-    /* RNG seeds — allocated once, re-seeded per batch to ensure unique photon paths */
+    /* RNG seeds — allocated once, re-seeded per batch to ensure unique photon paths.
+     * Hash-based per-thread seeding avoids the sequential correlations that arise
+     * when using consecutive rand() outputs (which also only provide 31-bit values). */
     uint32_t base_seed = (cfg.rng_seed > 0) ? cfg.rng_seed : (uint32_t)time(0);
     struct uint4_t {
         uint32_t x, y, z, w;
     };
     std::vector<uint4_t> seeds(tt);
 
-    srand(base_seed);
-    for (uint32_t i = 0; i < tt; i++) seeds[i] = {(uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand()};
+    auto make_seed = [](uint32_t base, uint32_t idx) -> uint32_t {
+        uint32_t v = base ^ (idx * 2654435761u);
+        v ^= v >> 16; v *= 0x45d9f3bu; v ^= v >> 16; v *= 0x45d9f3bu; v ^= v >> 16;
+        return v;
+    };
+    for (uint32_t i = 0; i < tt; i++)
+        seeds[i] = {make_seed(base_seed, i*4u+0u), make_seed(base_seed, i*4u+1u),
+                    make_seed(base_seed, i*4u+2u), make_seed(base_seed, i*4u+3u)};
 
     Buffer seedBuf = create_device_buffer(ctx, tt * sizeof(uint4_t), ssbo);
 
@@ -2486,8 +2504,10 @@ int main(int argc, char** argv) {
         params.photon_base = (uint32_t)pdone;
         /* Re-seed per batch so each batch simulates distinct photon paths. */
         if (pdone > 0) {
-            srand(base_seed + (uint32_t)pdone);
-            for (uint32_t i = 0; i < tt; i++) seeds[i] = {(uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand()};
+            uint32_t batch_seed = base_seed + (uint32_t)pdone;
+            for (uint32_t i = 0; i < tt; i++)
+                seeds[i] = {make_seed(batch_seed, i*4u+0u), make_seed(batch_seed, i*4u+1u),
+                            make_seed(batch_seed, i*4u+2u), make_seed(batch_seed, i*4u+3u)};
             upload_to_device(ctx, seedBuf, seeds.data(), tt * sizeof(uint4_t));
         }
         upload_to_device(ctx, paramBuf, &params, sizeof(params));

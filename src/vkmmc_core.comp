@@ -556,10 +556,17 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
 
     if (do_csg > 0u) {
         // CSG parity walk: cast ray forward, count boundary crossings
-        // to determine which shapes enclose the source point
+        // to determine which shapes enclose the source point.
+        // Perturb the start point slightly perpendicular to d to avoid
+        // degenerate ray-edge/vertex intersections: when the launch
+        // position lands exactly on a mesh edge (e.g. phi=0 ray through a
+        // mesh vertex at r_edge), only one of the two cap faces may be hit,
+        // giving an odd parity count and an incorrect initial medium.
         mstate = uvec2(0u, 0u);
         uint parity = 0u;
-        vec3 wp = p;
+        vec3 perp = (abs(d.z) < 0.999) ? normalize(cross(d, vec3(0.0, 0.0, 1.0)))
+                                        : normalize(cross(d, vec3(1.0, 0.0, 0.0)));
+        vec3 wp = p + perp * 2e-4;
 
         for (int wk = 0; wk < 64; wk++) {
             float hd;
