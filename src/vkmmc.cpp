@@ -1047,13 +1047,14 @@ static ShowTraj run_mc_simulation(VulkanCtx& ctx, SimConfig& cfg, CmdOverrides& 
 
     Buffer paramBuf = create_device_buffer(ctx, sizeof(MCParams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
-    /* RNG seeds */
-    srand(cfg.rng_seed > 0 ? cfg.rng_seed : (uint32_t)time(0));
+    /* RNG seeds — allocated once, re-seeded per batch to ensure unique photon paths */
+    uint32_t base_seed = (cfg.rng_seed > 0) ? cfg.rng_seed : (uint32_t)time(0);
     struct uint4_t {
         uint32_t x, y, z, w;
     };
     std::vector<uint4_t> seeds(tt);
 
+    srand(base_seed);
     for (uint32_t i = 0; i < tt; i++) seeds[i] = {(uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand()};
 
     Buffer seedBuf = create_device_buffer(ctx, tt * sizeof(uint4_t), ssbo);
@@ -1115,6 +1116,14 @@ static ShowTraj run_mc_simulation(VulkanCtx& ctx, SimConfig& cfg, CmdOverrides& 
         params.threadphoton = (int)(bp / tt);
         params.oddphoton    = (int)(bp - (uint64_t)params.threadphoton * tt);
         params.photon_base  = (uint32_t)pdone;
+        /* Re-seed per batch so each batch simulates distinct photon paths.
+         * Without this, all batches start with the same RNG state and
+         * simulate identical trajectories with only different photon IDs. */
+        if (pdone > 0) {
+            srand(base_seed + (uint32_t)pdone);
+            for (uint32_t i = 0; i < tt; i++) seeds[i] = {(uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand()};
+            upload_to_device(ctx, seedBuf, seeds.data(), tt * sizeof(uint4_t));
+        }
         upload_to_device(ctx, paramBuf, &params, sizeof(params));
         VkCommandBuffer cmd = begin_cmd(ctx);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeline);
@@ -2147,26 +2156,26 @@ int main(int argc, char** argv) {
             }
             run_viewer(vmesh, nullptr, static_traj.ids.empty() ? nullptr : &static_traj);
         } else {
-            /* Pre-create compute context so its lifetime spans the viewer window.
-               Destroying it inside the simulate callback (while the graphics VkDevice
-               is still live) corrupts driver state and causes vkQueueSubmit to fail. */
-            VulkanCtx compute_ctx = init_vulkan(ovr.gpuid);
-
-            /* In --show mode, cap each compute batch to 100 K photons by default.
-               The GPU watchdog (typically 2–5 s) fires if a single dispatch runs too
-               long, causing VK_ERROR_DEVICE_LOST on the graphics device.  The user
-               can override with an explicit -B flag. */
-            CmdOverrides show_ovr = ovr;
-
-            if (show_ovr.batch_size == UINT64_MAX) {
-                show_ovr.batch_size = 100000;
-            }
-
+            /* The simulate callback is invoked only after the preview window and its
+               graphics VkDevice are fully destroyed, so it is safe to create and
+               destroy the compute VkDevice entirely within the callback. */
             run_viewer(vmesh, [&]() -> ShowTraj {
-                return run_mc_simulation(compute_ctx, cfg, show_ovr, curvData, has_curvature, spirvFile);
+                /* In --show mode, cap each compute batch to 100 K photons by default.
+                   The GPU watchdog (typically 2–5 s) fires if a single dispatch runs
+                   too long.  The user can override with an explicit -B flag. */
+                CmdOverrides show_ovr = ovr;
+
+                if (show_ovr.batch_size == UINT64_MAX) {
+                    show_ovr.batch_size = 100000;
+                }
+
+                VulkanCtx compute_ctx = init_vulkan(ovr.gpuid);
+                ShowTraj result = run_mc_simulation(compute_ctx, cfg, show_ovr,
+                                                    curvData, has_curvature, spirvFile);
+                vkDestroyDevice(compute_ctx.device, NULL);
+                vkDestroyInstance(compute_ctx.instance, NULL);
+                return result;
             }, nullptr);
-            vkDestroyDevice(compute_ctx.device, NULL);
-            vkDestroyInstance(compute_ctx.instance, NULL);
         }
 
         return 0;
@@ -2405,13 +2414,14 @@ int main(int argc, char** argv) {
 
     Buffer paramBuf = create_device_buffer(ctx, sizeof(MCParams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
-    /* RNG seeds */
-    srand(cfg.rng_seed > 0 ? cfg.rng_seed : (uint32_t)time(0));
+    /* RNG seeds — allocated once, re-seeded per batch to ensure unique photon paths */
+    uint32_t base_seed = (cfg.rng_seed > 0) ? cfg.rng_seed : (uint32_t)time(0);
     struct uint4_t {
         uint32_t x, y, z, w;
     };
     std::vector<uint4_t> seeds(tt);
 
+    srand(base_seed);
     for (uint32_t i = 0; i < tt; i++) seeds[i] = {(uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand()};
 
     Buffer seedBuf = create_device_buffer(ctx, tt * sizeof(uint4_t), ssbo);
@@ -2474,6 +2484,12 @@ int main(int argc, char** argv) {
         params.threadphoton = (int)(bp / tt);
         params.oddphoton = (int)(bp - (uint64_t)params.threadphoton * tt);
         params.photon_base = (uint32_t)pdone;
+        /* Re-seed per batch so each batch simulates distinct photon paths. */
+        if (pdone > 0) {
+            srand(base_seed + (uint32_t)pdone);
+            for (uint32_t i = 0; i < tt; i++) seeds[i] = {(uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand()};
+            upload_to_device(ctx, seedBuf, seeds.data(), tt * sizeof(uint4_t));
+        }
         upload_to_device(ctx, paramBuf, &params, sizeof(params));
         VkCommandBuffer cmd = begin_cmd(ctx);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeline);

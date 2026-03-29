@@ -2104,181 +2104,195 @@ void run_viewer(const ShowMesh& mesh, std::function<ShowTraj()> simulate,
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
     const int WIN_W = 1280, WIN_H = 720;
-    const char* init_title = initial_traj ?
-                             "rtmmc-vulkan | Trajectory viewer - rotate to inspect" :
-                             "rtmmc-vulkan | SPACE = Start Simulation";
-    GLFWwindow* win = glfwCreateWindow(WIN_W, WIN_H, init_title, nullptr, nullptr);
 
-    if (!win) {
-        fprintf(stderr, "[show] glfwCreateWindow failed\n");
-        glfwTerminate();
-        return;
-    }
-
-    InputState inp;
-    inp.W = WIN_W;
-    inp.H = WIN_H;
-    glfwSetWindowUserPointer(win, &inp);
-    glfwSetCursorPosCallback(win, cb_cursor);
-    glfwSetMouseButtonCallback(win, cb_mouse_btn);
-    glfwSetScrollCallback(win, cb_scroll);
-    glfwSetKeyCallback(win, cb_key);
-    glfwSetFramebufferSizeCallback(win, cb_resize);
-
-    ShowCtx sc;
-    init_viewer(sc, win, (uint32_t)WIN_W, (uint32_t)WIN_H);
-    init_vol_pipeline(sc);
-    upload_mesh(sc, mesh);
-    upload_src(sc, mesh.src_lines);
-    upload_toolbar(sc);
-
-    if (!mesh.vol.data.empty()) {
-        upload_vol(sc, mesh.vol);
-    }
-
+    /* Camera and visual toggles persist across preview → result phases so the
+     * user sees the same viewpoint after simulation completes. */
     Camera cam;
-    cam.cx = mesh.cx;
-    cam.cy = mesh.cy;
-    cam.cz = mesh.cz;
+    cam.cx   = mesh.cx;
+    cam.cy   = mesh.cy;
+    cam.cz   = mesh.cz;
     cam.dist = mesh.radius * 2.5f;
-    cam.W = WIN_W;
-    cam.H = WIN_H;
+    cam.W    = WIN_W;
+    cam.H    = WIN_H;
 
-    int state = initial_traj ? 2 : 0; /* 0=waiting, 1=running, 2=done */
-    bool has_traj = (initial_traj != nullptr);
     bool wireframe = false;
     bool use_mip   = false;
+    bool has_traj  = (initial_traj != nullptr);
+    int  state     = has_traj ? 2 : 0;   /* 0=waiting, 1=N/A, 2=done */
     ShowTraj traj;
 
     if (initial_traj) {
         traj = *initial_traj;
-        upload_traj(sc, traj);
     }
-
-    g_frame_count = 0;
 
     auto clampf = [](float v, float lo, float hi) -> float {
         return v < lo ? lo : (v > hi ? hi : v);
     };
 
-    while (!glfwWindowShouldClose(win)) {
-        glfwPollEvents();
+    /* Open one viewer window, run its event loop, then tear it down completely.
+     * allow_sim: if true and user triggers simulate, break early and return true.
+     * Returns true  → caller should run simulation then open a result window.
+     * Returns false → user closed the window normally. */
+    auto open_window = [&](bool allow_sim) -> bool {
+        const char* title = (state == 2)
+            ? "rtmmc-vulkan | Trajectory viewer - rotate to inspect"
+            : "rtmmc-vulkan | SPACE = Start Simulation";
 
-        /* Handle window resize */
-        if (inp.resized) {
-            int fw = 0, fh = 0;
-            glfwGetFramebufferSize(win, &fw, &fh);
+        GLFWwindow* win = glfwCreateWindow(WIN_W, WIN_H, title, nullptr, nullptr);
 
-            if (fw > 0 && fh > 0) {
-                recreate_swap(sc, win);
-                cam.W = fw;
-                cam.H = fh;
+        if (!win) {
+            fprintf(stderr, "[show] glfwCreateWindow failed\n");
+            return false;
+        }
+
+        InputState inp;
+        inp.W = WIN_W;
+        inp.H = WIN_H;
+        glfwSetWindowUserPointer(win, &inp);
+        glfwSetCursorPosCallback(win, cb_cursor);
+        glfwSetMouseButtonCallback(win, cb_mouse_btn);
+        glfwSetScrollCallback(win, cb_scroll);
+        glfwSetKeyCallback(win, cb_key);
+        glfwSetFramebufferSizeCallback(win, cb_resize);
+
+        ShowCtx sc;
+        init_viewer(sc, win, (uint32_t)WIN_W, (uint32_t)WIN_H);
+        init_vol_pipeline(sc);
+        upload_mesh(sc, mesh);
+        upload_src(sc, mesh.src_lines);
+        upload_toolbar(sc);
+
+        if (!mesh.vol.data.empty()) {
+            upload_vol(sc, mesh.vol);
+        }
+
+        if (has_traj) {
+            upload_traj(sc, traj);
+        }
+
+        g_frame_count = 0;
+        bool sim_requested = false;
+
+        while (!glfwWindowShouldClose(win)) {
+            glfwPollEvents();
+
+            /* Handle window resize */
+            if (inp.resized) {
+                int fw = 0, fh = 0;
+                glfwGetFramebufferSize(win, &fw, &fh);
+
+                if (fw > 0 && fh > 0) {
+                    recreate_swap(sc, win);
+                    cam.W = fw;
+                    cam.H = fh;
+                }
+
+                inp.resized = false;
             }
 
-            inp.resized = false;
-        }
-
-        /* Apply quaternion trackball rotation */
-        if (inp.dYaw != 0.f || inp.dPitch != 0.f) {
-            /* Screen-up and screen-right in world space = rotate initial axes by q */
-            float up0[3] = {0.f, 0.f, -1.f};
-            float rt0[3] = {1.f, 0.f,  0.f};
-            float su[3], sr[3];
-            quat_rot(su, cam.q, up0);   /* current screen up   */
-            quat_rot(sr, cam.q, rt0);   /* current screen right */
-            /* dYaw: rotate around screen-up; dPitch: rotate around screen-right */
-            float qY[4], qP[4], tmp[4];
-            quat_aa(qY, su[0], su[1], su[2], inp.dYaw);
-            quat_aa(qP, sr[0], sr[1], sr[2], inp.dPitch);
-            quat_mul(tmp, qY, cam.q);
-            quat_mul(cam.q, qP, tmp);
-            quat_norm(cam.q);
-            inp.dYaw = inp.dPitch = 0.f;
-        }
-
-        /* Ctrl+drag pan: move center along current screen right/up axes */
-        if (inp.dPanX != 0.f || inp.dPanY != 0.f) {
-            float rt0[3] = {1.f, 0.f,  0.f};
-            float up0[3] = {0.f, 0.f, -1.f};
-            float sr[3], su[3];
-            quat_rot(sr, cam.q, rt0);
-            quat_rot(su, cam.q, up0);
-            /* scale: pan 1 pixel ≈ dist/W world units */
-            float scale = cam.dist / (float)cam.W;
-            cam.cx -= (inp.dPanX * sr[0] - inp.dPanY * su[0]) * scale;
-            cam.cy -= (inp.dPanX * sr[1] - inp.dPanY * su[1]) * scale;
-            cam.cz -= (inp.dPanX * sr[2] - inp.dPanY * su[2]) * scale;
-            inp.dPanX = inp.dPanY = 0.f;
-        }
-
-        cam.dist  *= (1.f - inp.dScroll * 0.1f);
-        cam.dist   = clampf(cam.dist, mesh.radius * 0.1f, mesh.radius * 10.f);
-        inp.dScroll = 0;
-
-        /* M key: toggle MIP / compositing volume rendering mode */
-        if (inp.toggleMip) {
-            use_mip = !use_mip;
-            inp.toggleMip = false;
-            glfwSetWindowTitle(win, use_mip ? "rtmmc-vulkan | Volume MIP (M=toggle)"
-                               : "rtmmc-vulkan | Volume compositing (M=toggle)");
-        }
-
-        /* Handle toolbar button clicks */
-        if (inp.toolbarClicked >= 0) {
-            int tc = inp.toolbarClicked;
-            inp.toolbarClicked = -1;
-
-            if (tc == 0) {                             /* wireframe toggle */
-                wireframe = !wireframe;
-            } else if (tc == 1) {                      /* run simulation */
-                inp.startSim = true;
-            } else if (tc == 2) {                      /* close window */
-                glfwSetWindowShouldClose(win, GLFW_TRUE);
+            /* Apply quaternion trackball rotation */
+            if (inp.dYaw != 0.f || inp.dPitch != 0.f) {
+                float up0[3] = {0.f, 0.f, -1.f};
+                float rt0[3] = {1.f, 0.f,  0.f};
+                float su[3], sr[3];
+                quat_rot(su, cam.q, up0);
+                quat_rot(sr, cam.q, rt0);
+                float qY[4], qP[4], tmp[4];
+                quat_aa(qY, su[0], su[1], su[2], inp.dYaw);
+                quat_aa(qP, sr[0], sr[1], sr[2], inp.dPitch);
+                quat_mul(tmp, qY, cam.q);
+                quat_mul(cam.q, qP, tmp);
+                quat_norm(cam.q);
+                inp.dYaw = inp.dPitch = 0.f;
             }
-        }
 
-        /* Check if simulation should start */
-        if ((inp.startSim || inp.clicked) && state == 0 && simulate) {
-            state = 1;
-            glfwSetWindowTitle(win, "rtmmc-vulkan | Running simulation...");
-            /* state change reflected in toolbar color — no separate button buffer */
+            /* Ctrl+drag pan: move center along current screen right/up axes */
+            if (inp.dPanX != 0.f || inp.dPanY != 0.f) {
+                float rt0[3] = {1.f, 0.f,  0.f};
+                float up0[3] = {0.f, 0.f, -1.f};
+                float sr[3], su[3];
+                quat_rot(sr, cam.q, rt0);
+                quat_rot(su, cam.q, up0);
+                float scale = cam.dist / (float)cam.W;
+                cam.cx -= (inp.dPanX * sr[0] - inp.dPanY * su[0]) * scale;
+                cam.cy -= (inp.dPanX * sr[1] - inp.dPanY * su[1]) * scale;
+                cam.cz -= (inp.dPanX * sr[2] - inp.dPanY * su[2]) * scale;
+                inp.dPanX = inp.dPanY = 0.f;
+            }
 
-            /* Show the "running" state before blocking */
+            cam.dist  *= (1.f - inp.dScroll * 0.1f);
+            cam.dist   = clampf(cam.dist, mesh.radius * 0.1f, mesh.radius * 10.f);
+            inp.dScroll = 0;
+
+            /* M key: toggle MIP / compositing volume rendering mode */
+            if (inp.toggleMip) {
+                use_mip = !use_mip;
+                inp.toggleMip = false;
+                glfwSetWindowTitle(win, use_mip
+                    ? "rtmmc-vulkan | Volume MIP (M=toggle)"
+                    : "rtmmc-vulkan | Volume compositing (M=toggle)");
+            }
+
+            /* Handle toolbar button clicks */
+            if (inp.toolbarClicked >= 0) {
+                int tc = inp.toolbarClicked;
+                inp.toolbarClicked = -1;
+
+                if (tc == 0) {
+                    wireframe = !wireframe;
+                } else if (tc == 1) {
+                    inp.startSim = true;
+                } else if (tc == 2) {
+                    glfwSetWindowShouldClose(win, GLFW_TRUE);
+                }
+            }
+
+            /* Simulate trigger: close this window so the graphics device is fully
+             * destroyed before the compute device is created for the simulation. */
+            if (allow_sim && (inp.startSim || inp.clicked) && state == 0 && simulate) {
+                sim_requested = true;
+                break;
+            }
+
+            inp.startSim = false;
+            inp.clicked  = false;
+
             if (!draw_frame(sc, cam, state, has_traj, wireframe, inp.toolbarHovered, use_mip)) {
+                /* GPU device lost. Close window; any saved output is still on disk. */
                 glfwSetWindowShouldClose(win, GLFW_TRUE);
-                goto done;
+                continue;
             }
 
             g_frame_count++;
-            vkQueueWaitIdle(sc.gq);
-
-            /* Run the actual simulation (blocking) */
-            traj = simulate();
-
-            if (!traj.pts.empty()) {
-                upload_traj(sc, traj);
-                has_traj = true;
-            }
-
-            state = 2;
-            glfwSetWindowTitle(win, "rtmmc-vulkan | Simulation done - rotate to inspect");
         }
 
-        inp.startSim = false;
-        inp.clicked  = false;
+        /* Fully destroy graphics device before returning to caller. */
+        vkDeviceWaitIdle(sc.dev);
+        destroy_viewer(sc);
+        glfwDestroyWindow(win);
+        return sim_requested;
+    };
 
-        if (!draw_frame(sc, cam, state, has_traj, wireframe, inp.toolbarHovered, use_mip)) {
-            /* GPU device lost (watchdog). Close the window; trajectory was saved to disk. */
-            glfwSetWindowShouldClose(win, GLFW_TRUE);
-            continue;
-        }
+    /* Phase 1 — preview: show domain, wait for simulate trigger or close.
+     * Skip if we already have trajectories (static viewer mode). */
+    bool do_sim = false;
 
-        g_frame_count++;
+    if (state != 2) {
+        do_sim = open_window(/*allow_sim=*/simulate != nullptr);
     }
 
-done:
-    vkDeviceWaitIdle(sc.dev);
-    destroy_viewer(sc);
-    glfwDestroyWindow(win);
+    /* Phase 2 — simulation: graphics device is gone, safe to create compute device. */
+    if (do_sim && simulate) {
+        printf("[show] Preview closed; running simulation...\n");
+        traj     = simulate();
+        has_traj = !traj.pts.empty();
+        state    = 2;
+    }
+
+    /* Phase 3 — result: open a fresh window to display domain + trajectories. */
+    if (state == 2) {
+        open_window(/*allow_sim=*/false);
+    }
+
     glfwTerminate();
 }
