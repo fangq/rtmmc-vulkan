@@ -701,9 +701,11 @@ void main() {
     vec3 launch_pos;
     launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng, launch_pos);
     save_traj(launch_pos, 1.0, photon_id, 0u);         // save original source position
+
     if (any(notEqual(launch_pos, pos))) {
         save_traj(pos, weight, photon_id, 3u);          // save sphere-entry boundary
     }
+
     bool traj_need_term = (mid != MEDIUM_DEAD);
 
     while (done < maxph) {
@@ -735,7 +737,8 @@ void main() {
                 accumulate(pos, dir, mid, weight, tof, L);
 
                 // update photon position, weight, timer
-                pos += dir * (L + SAFETY_DIST);
+                vec3 hit_pos = pos + dir * L;   /* exact surface hit point for trajectory */
+                pos = hit_pos + dir * SAFETY_DIST;
                 weight *= exp(-prop.mua * L);
                 tof += L * INV_C0 * prop.n;
 
@@ -764,8 +767,7 @@ void main() {
 
                         if (n_in != n_out) {
                             // Only compute curvature normal at actual refractive boundary
-                            vec3 hp = pos - dir * SAFETY_DIST;
-                            vec3 N = get_normal(tri, hp);
+                            vec3 N = get_normal(tri, hit_pos);
 
                             if (!ff) {
                                 N = -N;
@@ -785,7 +787,7 @@ void main() {
                     }
 
                     if (new_mid != old_mid) {
-                        save_traj(pos, weight, photon_id, 3u);
+                        save_traj(hit_pos, weight, photon_id, reflected ? 4u : 3u);
                         traj_need_term = false;
                     }
                 } else
@@ -802,7 +804,7 @@ void main() {
                         float n_out = (new_mid < num_media) ? media[new_mid].n : 1.0;
 
                         if (prop.n != n_out) {
-                            vec3 N = get_normal(tri, pos - dir * SAFETY_DIST);
+                            vec3 N = get_normal(tri, hit_pos);
 
                             if (!ff) {
                                 N = -N;
@@ -821,7 +823,7 @@ void main() {
                     }
 
                     if (new_mid != old_mid) {
-                        save_traj(pos, weight, photon_id, 3u);
+                        save_traj(hit_pos, weight, photon_id, reflected ? 4u : 3u);
                         traj_need_term = false;
                     }
                 }
@@ -855,15 +857,18 @@ void main() {
             if (traj_need_term) {
                 save_traj(pos, weight, photon_id, 2u);
             }
+
             launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng, launch_pos);
             ++done;
             photon_id = photon_base + total_threads * uint(done) + tid;
 
             if (done < maxph) {
                 save_traj(launch_pos, 1.0, photon_id, 0u);  // original source position
+
                 if (any(notEqual(launch_pos, pos))) {
                     save_traj(pos, weight, photon_id, 3u);   // sphere-entry boundary
                 }
+
                 traj_need_term = (mid != MEDIUM_DEAD);
             }
         }

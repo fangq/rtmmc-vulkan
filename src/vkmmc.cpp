@@ -27,7 +27,7 @@
 #include "vkmmc_curvature.h"
 #include "vkmmc_core_spv.h"
 #ifdef USE_SHOW
-#include "vkmmc_show.h"
+    #include "vkmmc_show.h"
 #endif
 
 #ifndef VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME
@@ -643,11 +643,16 @@ static const char debugflag[] = {'S', 'C', 'B', 'W', 'D', 'I', 'O', 'X', 'A', 'T
 
 static uint32_t parse_debugopt(const char* s) {
     uint32_t level = 0;
+
     for (const char* c = s; *c; c++) {
         char u = (*c >= 'a' && *c <= 'z') ? (*c - 'a' + 'A') : *c;
         const char* p = strchr(debugflag, u);
-        if (p) level |= (1u << (uint32_t)(p - debugflag));
+
+        if (p) {
+            level |= (1u << (uint32_t)(p - debugflag));
+        }
     }
+
     return level;
 }
 
@@ -663,6 +668,7 @@ struct CmdOverrides {
     int debuglevel;     // -1 = not set
     int maxjumpdebug;   // -1 = not set
     bool show;          // launch interactive viewer
+    std::string traj_file;  // optional _traj.jdat to display without simulating
     std::string session_id, json_str, inputfile;
     CmdOverrides(): nphoton(0), batch_size(UINT64_MAX), rng_seed(0), totalthread(0), unitinmm(0),
         outputtype(-1), isreflect(-1), isnormalize(-1), gpuid(0), listgpu(false), dumpjson(false), dumpmesh(false), meshres(0), docurv(-1), debugcurv(false), debuglevel(-1), maxjumpdebug(-1), show(false) {}
@@ -737,6 +743,14 @@ SimConfig parse_cmdline(int argc, char** argv, CmdOverrides& ovr) {
             ovr.maxjumpdebug = (int)atof(argv[++i]);
         } else if (a == "--show") {
             ovr.show = true;
+
+            if (i + 1 < argc) {
+                std::string next = argv[i + 1];
+
+                if (next.size() > 5 && next.compare(next.size() - 5, 5, ".jdat") == 0) {
+                    ovr.traj_file = argv[++i];
+                }
+            }
         } else if (a == "-h" || a == "--help") {
             printhelp(argv[0]);
         } else if (a[0] != '-' && inputfile.empty()) {
@@ -807,9 +821,8 @@ SimConfig parse_cmdline(int argc, char** argv, CmdOverrides& ovr) {
  */
 #ifdef USE_SHOW
 static ShowTraj run_mc_simulation(VulkanCtx& ctx, SimConfig& cfg, CmdOverrides& ovr,
-                                   const std::vector<NodeCurvature>& curvData,
-                                   bool has_curvature, const char* spirvFile)
-{
+                                  const std::vector<NodeCurvature>& curvData,
+                                  bool has_curvature, const char* spirvFile) {
     ShowTraj vtraj_out;
 
     /* Build BLAS */
@@ -1044,11 +1057,14 @@ static ShowTraj run_mc_simulation(VulkanCtx& ctx, SimConfig& cfg, CmdOverrides& 
     for (uint32_t i = 0; i < tt; i++) seeds[i] = {(uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand()};
 
     Buffer seedBuf = create_device_buffer(ctx, tt * sizeof(uint4_t), ssbo);
+
     upload_to_device(ctx, seedBuf, seeds.data(), tt * sizeof(uint4_t));
 
     /* Trajectory buffer: [0]=atomic counter, [1..6*N]=records (6 uints each) */
     uint32_t traj_cap = do_traj ? cfg.maxjumpdebug : 0u;
+
     VkDeviceSize traj_buf_sz = (1 + (VkDeviceSize)traj_cap * 6) * sizeof(uint32_t);
+
     Buffer trajBuf = create_device_buffer(ctx, traj_buf_sz, ssbo);
 
     {
@@ -1062,7 +1078,8 @@ static ShowTraj run_mc_simulation(VulkanCtx& ctx, SimConfig& cfg, CmdOverrides& 
 
         for (size_t i = 0; i < curvData.size(); i++) {
             gpuCurv[i] = { curvData[i].nx, curvData[i].ny, curvData[i].nz, curvData[i].k1,
-                           curvData[i].px, curvData[i].py, curvData[i].pz, curvData[i].k2
+                           curvData[i].px, curvData[i].py, curvData[i].pz, curvData[i].k2,
+                           cfg.nodes[i].x, cfg.nodes[i].y, cfg.nodes[i].z, 0
                          };
         }
     } else {
@@ -1206,6 +1223,7 @@ static ShowTraj run_mc_simulation(VulkanCtx& ctx, SimConfig& cfg, CmdOverrides& 
             json& mdata = troot["MCXData"];
 
             json media_arr = json::array();
+
             for (const auto& m : cfg.media) {
                 media_arr.push_back({{"mua", m.mua / cfg.unitinmm}, {"mus", m.mus / cfg.unitinmm}, {"g", m.g}, {"n", m.n}});
             }
@@ -1228,23 +1246,27 @@ static ShowTraj run_mc_simulation(VulkanCtx& ctx, SimConfig& cfg, CmdOverrides& 
             };
 
             json& tdat = mdata["Trajectory"];
-            tdat["photonid"] = jdata_encode("uint32", {n},    tpid.data(), n * sizeof(uint32_t));
-            tdat["p"]        = jdata_encode("single", {n, 3}, tpos.data(), n * 3 * sizeof(float));
-            tdat["w0"]       = jdata_encode("single", {n},    twgt.data(), n * sizeof(float));
+            tdat["photonid"] = jdata_encode("uint32", {n, 1}, tpid.data(), n * sizeof(uint32_t), true);
+            tdat["p"]        = jdata_encode("single", {n, 3}, tpos.data(), n * 3 * sizeof(float), true);
+            tdat["w0"]       = jdata_encode("single", {n, 1}, twgt.data(), n * sizeof(float), true);
+            tdat["e0"]       = jdata_encode("uint32", {n, 1}, tevt.data(), n * sizeof(uint32_t), true);
 
             std::string tname = cfg.session_id + "_traj.jdat";
             std::ofstream tf(tname.c_str());
-            tf << troot.dump(2) << std::endl;
+            tf << troot.dump() << std::endl;
             printf("Trajectory saved: %s\n", tname.c_str());
 
             /* Populate ShowTraj for viewer */
             vtraj_out.pts.resize(n * 3);
             vtraj_out.ids.resize(n);
+            vtraj_out.evts.resize(n);
+
             for (uint32_t i = 0; i < n; i++) {
                 vtraj_out.pts[i * 3 + 0] = tpos[i * 3 + 0];
                 vtraj_out.pts[i * 3 + 1] = tpos[i * 3 + 1];
                 vtraj_out.pts[i * 3 + 2] = tpos[i * 3 + 2];
                 vtraj_out.ids[i]          = tpid[i];
+                vtraj_out.evts[i]         = tevt[i];
             }
         }
     }
@@ -1380,7 +1402,7 @@ int main(int argc, char** argv) {
         }
 
         std::vector<size_t> ndim = {nn, 3};
-        dump["Shapes"]["MeshNode"] = jdata_encode("single", ndim, nd.data(), nn * 3 * sizeof(float), false);
+        dump["Shapes"]["MeshNode"] = jdata_encode("single", ndim, nd.data(), nn * 3 * sizeof(float), true);
         std::vector<int32_t> sd(nf * 4);
 
         for (size_t i = 0; i < nf; i++) {
@@ -1398,7 +1420,7 @@ int main(int argc, char** argv) {
         }
 
         std::vector<size_t> sdim = {nf, 4};
-        dump["Shapes"]["MeshSurf"] = jdata_encode("int32", sdim, sd.data(), nf * 4 * sizeof(int32_t), false);
+        dump["Shapes"]["MeshSurf"] = jdata_encode("int32", sdim, sd.data(), nf * 4 * sizeof(int32_t), true);
         std::string mf = cfg.session_id + "_mesh.json";
         std::ofstream of(mf.c_str());
         of << dump.dump(2) << std::endl;
@@ -1486,7 +1508,7 @@ int main(int argc, char** argv) {
                         N.y = ry / rl;
                         N.z = rz / rl;
                     }
-                } else if (so.type == 3) { // lens spherical cap: standard outward normal (P - C)
+                } else if (so.type == 3) { // lens spherical cap: (P - C), flip for concave
                     float dx = px - so.cx, dy = py - so.cy, dz = pz - so.cz;
                     float dl2 = std::sqrt(dx * dx + dy * dy + dz * dz);
 
@@ -1494,6 +1516,14 @@ int main(int argc, char** argv) {
                         N.x = dx / dl2;
                         N.y = dy / dl2;
                         N.z = dz / dl2;
+
+                        /* Concave cap (R<0): sphere center is on far side,
+                           so (P-C) points inward — flip to outward */
+                        if (so.R < 0.0f) {
+                            N.x = -N.x;
+                            N.y = -N.y;
+                            N.z = -N.z;
+                        }
                     }
                 }
             }
@@ -1775,7 +1805,7 @@ int main(int argc, char** argv) {
         // MeshNode: Nx5 (x, y, z, curv_error, flat_error)
         std::vector<size_t> ndim = {nn_fine, 5};
         dump["Shapes"]["MeshNode"] = jdata_encode("single", ndim,
-                                     out_nodes.data(), nn_fine * 5 * sizeof(float), false);
+                                     out_nodes.data(), nn_fine * 5 * sizeof(float), true);
 
         // MeshSurf from fine mesh: Mx4 (v1, v2, v3, shape_id) — 1-based
         std::vector<int32_t> surf_data(nf_fine * 4);
@@ -1789,7 +1819,7 @@ int main(int argc, char** argv) {
 
         std::vector<size_t> sdim = {nf_fine, 4};
         dump["Shapes"]["MeshSurf"] = jdata_encode("int32", sdim,
-                                     surf_data.data(), nf_fine * 4 * sizeof(int32_t), false);
+                                     surf_data.data(), nf_fine * 4 * sizeof(int32_t), true);
 
         std::string outf = cfg.session_id + "_curv.json";
         std::ofstream ofs(outf.c_str());
@@ -1800,9 +1830,11 @@ int main(int argc, char** argv) {
     }
 
 #ifdef USE_SHOW
+
     /* ---- Phase 3a: Interactive viewer (--show flag) ---- */
     if (ovr.show) {
         ShowMesh vmesh;
+
         for (auto& n : cfg.nodes)
             vmesh.verts.push_back({n.x, n.y, n.z, 0.f, 0.f, 0.f});
 
@@ -1814,8 +1846,14 @@ int main(int argc, char** argv) {
             memcpy(&pk, &cfg.facedata[i].packed_media, 4);
             uint32_t front = (pk >> 16) & 0x7FFFu;
             uint32_t back  =  pk        & 0xFFFFu;
-            if (front >= cfg.media.size() || back >= cfg.media.size()) continue;
-            if (fabsf(cfg.media[front].n - cfg.media[back].n) < 0.001f) continue;
+
+            if (front >= cfg.media.size() || back >= cfg.media.size()) {
+                continue;
+            }
+
+            if (fabsf(cfg.media[front].n - cfg.media[back].n) < 0.001f) {
+                continue;
+            }
 
             vmesh.inds.push_back(cfg.faces[i][0]);
             vmesh.inds.push_back(cfg.faces[i][1]);
@@ -1825,24 +1863,54 @@ int main(int argc, char** argv) {
             float fnx = cfg.facedata[i].nx;
             float fny = cfg.facedata[i].ny;
             float fnz = cfg.facedata[i].nz;
-            for (uint32_t vi : {cfg.faces[i][0], cfg.faces[i][1], cfg.faces[i][2]}) {
+
+            for (uint32_t vi : {
+                        cfg.faces[i][0], cfg.faces[i][1], cfg.faces[i][2]
+                    }) {
                 vmesh.verts[vi].nx += fnx;
                 vmesh.verts[vi].ny += fny;
                 vmesh.verts[vi].nz += fnz;
             }
         }
+
         /* Normalize accumulated vertex normals */
         for (auto& v : vmesh.verts) {
-            float len = sqrtf(v.nx*v.nx + v.ny*v.ny + v.nz*v.nz);
-            if (len > 1e-10f) { v.nx /= len; v.ny /= len; v.nz /= len; }
+            float len = sqrtf(v.nx * v.nx + v.ny * v.ny + v.nz * v.nz);
+
+            if (len > 1e-10f) {
+                v.nx /= len;
+                v.ny /= len;
+                v.nz /= len;
+            }
         }
-        /* Compute bounding sphere center and radius */
+
+        /* Compute bounding sphere center and radius from visible vertices only
+         * (those referenced by vmesh.inds = optical interface faces).
+         * Using all vertices would include the large domain-box corners and
+         * shift the rotation pivot away from the actual optics. */
         float xlo = 1e9f, xhi = -1e9f, ylo = 1e9f, yhi = -1e9f, zlo = 1e9f, zhi = -1e9f;
-        for (auto& v : vmesh.verts) {
-            xlo = std::min(xlo, v.x); xhi = std::max(xhi, v.x);
-            ylo = std::min(ylo, v.y); yhi = std::max(yhi, v.y);
-            zlo = std::min(zlo, v.z); zhi = std::max(zhi, v.z);
+
+        if (!vmesh.inds.empty()) {
+            for (uint32_t vi : vmesh.inds) {
+                const auto& v = vmesh.verts[vi];
+                xlo = std::min(xlo, v.x);
+                xhi = std::max(xhi, v.x);
+                ylo = std::min(ylo, v.y);
+                yhi = std::max(yhi, v.y);
+                zlo = std::min(zlo, v.z);
+                zhi = std::max(zhi, v.z);
+            }
+        } else {
+            for (auto& v : vmesh.verts) {
+                xlo = std::min(xlo, v.x);
+                xhi = std::max(xhi, v.x);
+                ylo = std::min(ylo, v.y);
+                yhi = std::max(yhi, v.y);
+                zlo = std::min(zlo, v.z);
+                zhi = std::max(zhi, v.z);
+            }
         }
+
         vmesh.cx = (xlo + xhi) * 0.5f;
         vmesh.cy = (ylo + yhi) * 0.5f;
         vmesh.cz = (zlo + zhi) * 0.5f;
@@ -1854,81 +1922,139 @@ int main(int argc, char** argv) {
             float px = cfg.srcpos[0], py = cfg.srcpos[1], pz = cfg.srcpos[2];
             /* Normalize direction */
             float dx = cfg.srcdir[0], dy = cfg.srcdir[1], dz = cfg.srcdir[2];
-            float dlen = sqrtf(dx*dx + dy*dy + dz*dz);
-            if (dlen < 1e-10f) { dlen = 1.0f; dz = 1.0f; }
-            dx /= dlen; dy /= dlen; dz /= dlen;
+            float dlen = sqrtf(dx * dx + dy * dy + dz * dz);
+
+            if (dlen < 1e-10f) {
+                dlen = 1.0f;
+                dz = 1.0f;
+            }
+
+            dx /= dlen;
+            dy /= dlen;
+            dz /= dlen;
 
             /* Two vectors perpendicular to the direction (Gram-Schmidt) */
             float ux, uy, uz;
+
             if (fabsf(dz) < 0.9f) {
-                ux = dy; uy = -dx; uz = 0.0f;
+                ux = dy;
+                uy = -dx;
+                uz = 0.0f;
             } else {
-                ux = 0.0f; uy = dz; uz = -dy;
+                ux = 0.0f;
+                uy = dz;
+                uz = -dy;
             }
-            float ulen = sqrtf(ux*ux + uy*uy + uz*uz);
-            ux /= ulen; uy /= ulen; uz /= ulen;
-            float vx = dy*uz - dz*uy;
-            float vy = dz*ux - dx*uz;
-            float vz = dx*uy - dy*ux;
+
+            float ulen = sqrtf(ux * ux + uy * uy + uz * uz);
+            ux /= ulen;
+            uy /= ulen;
+            uz /= ulen;
+            float vx = dy * uz - dz * uy;
+            float vy = dz * ux - dx * uz;
+            float vz = dx * uy - dy * ux;
 
             float sc_r = vmesh.radius;
             auto& sl = vmesh.src_lines;
             auto push2 = [&](float x0, float y0, float z0, float x1, float y1, float z1) {
-                sl.push_back(x0); sl.push_back(y0); sl.push_back(z0);
-                sl.push_back(x1); sl.push_back(y1); sl.push_back(z1);
+                sl.push_back(x0);
+                sl.push_back(y0);
+                sl.push_back(z0);
+                sl.push_back(x1);
+                sl.push_back(y1);
+                sl.push_back(z1);
             };
 
             /* Cross at source position (3 axis-aligned lines) */
             float cs = sc_r * 0.04f;
-            push2(px-cs, py, pz, px+cs, py, pz);
-            push2(px, py-cs, pz, px, py+cs, pz);
-            push2(px, py, pz-cs, px, py, pz+cs);
+            push2(px - cs, py, pz, px + cs, py, pz);
+            push2(px, py - cs, pz, px, py + cs, pz);
+            push2(px, py, pz - cs, px, py, pz + cs);
 
             /* Arrow shaft in direction */
             float alen = sc_r * 0.25f;
-            push2(px, py, pz, px+dx*alen, py+dy*alen, pz+dz*alen);
+            push2(px, py, pz, px + dx * alen, py + dy * alen, pz + dz * alen);
 
             /* Arrowhead: short lines back from tip */
-            float tx = px+dx*alen, ty = py+dy*alen, tz = pz+dz*alen;
+            float tx = px + dx * alen, ty = py + dy * alen, tz = pz + dz * alen;
             float hs = alen * 0.2f;
-            push2(tx, ty, tz, tx - dx*hs + ux*hs, ty - dy*hs + uy*hs, tz - dz*hs + uz*hs);
-            push2(tx, ty, tz, tx - dx*hs - ux*hs, ty - dy*hs - uy*hs, tz - dz*hs - uz*hs);
-            push2(tx, ty, tz, tx - dx*hs + vx*hs, ty - dy*hs + vy*hs, tz - dz*hs + vz*hs);
-            push2(tx, ty, tz, tx - dx*hs - vx*hs, ty - dy*hs - vy*hs, tz - dz*hs - vz*hs);
+            push2(tx, ty, tz, tx - dx * hs + ux * hs, ty - dy * hs + uy * hs, tz - dz * hs + uz * hs);
+            push2(tx, ty, tz, tx - dx * hs - ux * hs, ty - dy * hs - uy * hs, tz - dz * hs - uz * hs);
+            push2(tx, ty, tz, tx - dx * hs + vx * hs, ty - dy * hs + vy * hs, tz - dz * hs + vz * hs);
+            push2(tx, ty, tz, tx - dx * hs - vx * hs, ty - dy * hs - vy * hs, tz - dz * hs - vz * hs);
 
             /* For disk/gaussian/planar sources: draw circle showing source extent */
             float src_r = cfg.srcparam1[0];  /* radius from Param1[0] */
+
             if ((cfg.srctype == 8 || cfg.srctype == 3 || cfg.srctype == 4) && src_r > 0.0f) {
                 const int N = 48;
+
                 for (int j = 0; j < N; j++) {
                     float a0 = j * 6.2831853f / N;
                     float a1 = (j + 1) * 6.2831853f / N;
                     float c0 = cosf(a0) * src_r, s0 = sinf(a0) * src_r;
                     float c1 = cosf(a1) * src_r, s1 = sinf(a1) * src_r;
-                    push2(px + c0*ux + s0*vx, py + c0*uy + s0*vy, pz + c0*uz + s0*vz,
-                          px + c1*ux + s1*vx, py + c1*uy + s1*vy, pz + c1*uz + s1*vz);
+                    push2(px + c0 * ux + s0 * vx, py + c0 * uy + s0 * vy, pz + c0 * uz + s0 * vz,
+                          px + c1 * ux + s1 * vx, py + c1 * uy + s1 * vy, pz + c1 * uz + s1 * vz);
                 }
             }
         }
 
-        /* Pre-create compute context so its lifetime spans the viewer window.
-           Destroying it inside the simulate callback (while the graphics VkDevice
-           is still live) corrupts driver state and causes vkQueueSubmit to fail. */
-        VulkanCtx compute_ctx = init_vulkan(ovr.gpuid);
+        if (!ovr.traj_file.empty()) {
+            /* Static viewer: load trajectory from jdat file, skip simulation */
+            ShowTraj static_traj;
+            {
+                std::ifstream tf(ovr.traj_file);
 
-        /* In --show mode, cap each compute batch to 100 K photons by default.
-           The GPU watchdog (typically 2–5 s) fires if a single dispatch runs too
-           long, causing VK_ERROR_DEVICE_LOST on the graphics device.  The user
-           can override with an explicit -B flag. */
-        CmdOverrides show_ovr = ovr;
-        if (show_ovr.batch_size == UINT64_MAX)
-            show_ovr.batch_size = 100000;
+                if (!tf) {
+                    fprintf(stderr, "Cannot open trajectory file: %s\n", ovr.traj_file.c_str());
+                    return 1;
+                }
 
-        run_viewer(vmesh, [&]() -> ShowTraj {
-            return run_mc_simulation(compute_ctx, cfg, show_ovr, curvData, has_curvature, spirvFile);
-        });
-        vkDestroyDevice(compute_ctx.device, NULL);
-        vkDestroyInstance(compute_ctx.instance, NULL);
+                json jroot = json::parse(tf);
+                const json& tr = jroot["MCXData"]["Trajectory"];
+                auto pid_raw = jdata_decode(tr["photonid"]);
+                uint32_t n = (uint32_t)(pid_raw.size() / sizeof(uint32_t));
+                static_traj.ids.resize(n);
+                memcpy(static_traj.ids.data(), pid_raw.data(), n * sizeof(uint32_t));
+                auto p_raw = jdata_decode(tr["p"]);
+                static_traj.pts.resize(n * 3);
+                memcpy(static_traj.pts.data(), p_raw.data(), n * 3 * sizeof(float));
+
+                if (tr.contains("e0")) {
+                    auto e0_raw = jdata_decode(tr["e0"]);
+                    static_traj.evts.resize(n);
+                    memcpy(static_traj.evts.data(), e0_raw.data(), n * sizeof(uint32_t));
+                } else {
+                    static_traj.evts.assign(n, 0u);
+                }
+
+                printf("Loaded %u trajectory events from %s\n", n, ovr.traj_file.c_str());
+            }
+            run_viewer(vmesh, nullptr, &static_traj);
+        } else {
+            /* Pre-create compute context so its lifetime spans the viewer window.
+               Destroying it inside the simulate callback (while the graphics VkDevice
+               is still live) corrupts driver state and causes vkQueueSubmit to fail. */
+            VulkanCtx compute_ctx = init_vulkan(ovr.gpuid);
+
+            /* In --show mode, cap each compute batch to 100 K photons by default.
+               The GPU watchdog (typically 2–5 s) fires if a single dispatch runs too
+               long, causing VK_ERROR_DEVICE_LOST on the graphics device.  The user
+               can override with an explicit -B flag. */
+            CmdOverrides show_ovr = ovr;
+
+            if (show_ovr.batch_size == UINT64_MAX) {
+                show_ovr.batch_size = 100000;
+            }
+
+            run_viewer(vmesh, [&]() -> ShowTraj {
+                return run_mc_simulation(compute_ctx, cfg, show_ovr, curvData, has_curvature, spirvFile);
+            }, nullptr);
+            vkDestroyDevice(compute_ctx.device, NULL);
+            vkDestroyInstance(compute_ctx.instance, NULL);
+        }
+
         return 0;
     }
 
@@ -2196,7 +2322,8 @@ int main(int argc, char** argv) {
 
         for (size_t i = 0; i < curvData.size(); i++) {
             gpuCurv[i] = { curvData[i].nx, curvData[i].ny, curvData[i].nz, curvData[i].k1,
-                           curvData[i].px, curvData[i].py, curvData[i].pz, curvData[i].k2
+                           curvData[i].px, curvData[i].py, curvData[i].pz, curvData[i].k2,
+                           cfg.nodes[i].x, cfg.nodes[i].y, cfg.nodes[i].z, 0
                          };
         }
     } else {
@@ -2303,7 +2430,7 @@ int main(int argc, char** argv) {
         root["Session"] = {{"ID", cfg.session_id}, {"Photons", cfg.nphoton}};
         root["Forward"] = {{"T0", cfg.t0}, {"T1", cfg.t1}, {"Dt", cfg.dt}};
         root["Domain"] = {{"LengthUnit", cfg.unitinmm}, {"VoxelSize", vs}, {"Dim", {nx, ny, nz}}, {"Origin", {gmin[0], gmin[1], gmin[2]}}};
-        root["Fluence"] = jdata_encode("single", dims, fluence.data(), crop0w * sizeof(float));
+        root["Fluence"] = jdata_encode("single", dims, fluence.data(), crop0w * sizeof(float), false);
         std::string outname = cfg.session_id + ".jdat";
         std::ofstream of(outname.c_str());
         of << root.dump(2) << std::endl;
@@ -2343,6 +2470,7 @@ int main(int argc, char** argv) {
             json& mdata = troot["MCXData"];
 
             json media_arr = json::array();
+
             for (const auto& m : cfg.media) {
                 media_arr.push_back({{"mua", m.mua / cfg.unitinmm}, {"mus", m.mus / cfg.unitinmm}, {"g", m.g}, {"n", m.n}});
             }
@@ -2365,13 +2493,14 @@ int main(int argc, char** argv) {
             };
 
             json& tdat = mdata["Trajectory"];
-            tdat["photonid"] = jdata_encode("uint32", {n},    tpid.data(), n * sizeof(uint32_t));
+            tdat["photonid"] = jdata_encode("uint32", {n, 1}, tpid.data(), n * sizeof(uint32_t));
             tdat["p"]        = jdata_encode("single", {n, 3}, tpos.data(), n * 3 * sizeof(float));
-            tdat["w0"]       = jdata_encode("single", {n},    twgt.data(), n * sizeof(float));
+            tdat["w0"]       = jdata_encode("single", {n, 1}, twgt.data(), n * sizeof(float));
+            tdat["e0"]       = jdata_encode("uint32", {n, 1}, tevt.data(), n * sizeof(uint32_t));
 
             std::string tname = cfg.session_id + "_traj.jdat";
             std::ofstream tf(tname.c_str());
-            tf << troot.dump(2) << std::endl;
+            tf << troot.dump() << std::endl;
             printf("Trajectory saved: %s\n", tname.c_str());
         }
     }

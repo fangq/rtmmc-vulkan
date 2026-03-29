@@ -230,7 +230,7 @@ static json jdata_encode(const std::string& atype, const std::vector<size_t>& as
     jd["_ArrayType_"] = atype;
     jd["_ArraySize_"] = asize;
 
-    if (row_major) {
+    if (!row_major) {
         jd["_ArrayOrder_"] = "c";
     }
 

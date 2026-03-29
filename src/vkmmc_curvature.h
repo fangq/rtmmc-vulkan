@@ -167,7 +167,9 @@ static bool compute_node_curvature_for_shape(
 
     } else if (so.type == 3) {
         /* ---- Lens spherical cap ----
-           Standard sphere outward normal: (P - C) / R */
+           Normal: (P - C) / |P - C|, but for concave caps (R < 0)
+           the sphere center is on the far side so (P-C) points
+           inward — flip to get the outward-pointing normal. */
         float dx = px - so.cx, dy = py - so.cy, dz = pz - so.cz;
         float l = std::sqrt(dx * dx + dy * dy + dz * dz);
 
@@ -176,7 +178,16 @@ static bool compute_node_curvature_for_shape(
         }
 
         float nx2 = dx / l, ny2 = dy / l, nz2 = dz / l;
-        float k = (so.R > 1e-10f) ? 1.0f / so.R : 0.0f;
+
+        /* Concave cap: (P-C) points inward, flip to outward */
+        if (so.R < 0.0f) {
+            nx2 = -nx2;
+            ny2 = -ny2;
+            nz2 = -nz2;
+        }
+
+        float absR = std::fabs(so.R);
+        float k = (absR > 1e-10f) ? 1.0f / absR : 0.0f;
         float tx, ty, tz;
         make_tangent(nx2, ny2, nz2, tx, ty, tz);
         out.nx = nx2;
@@ -391,24 +402,24 @@ static std::vector<ShapeOrigin> extract_shape_origins(const json& arr) {
                 ldz /= dl;
             }
 
-            /* Front spherical cap: center = O + n*(Df-Rf), radius = |Rf| */
+            /* Front spherical cap: center = O + n*(Df-Rf), radius = Rf (signed) */
             ShapeOrigin sf2;
             memset(&sf2, 0, sizeof(sf2));
             sf2.type = 3;
             sf2.cx = lox + ldx * (Df - Rf);
             sf2.cy = loy + ldy * (Df - Rf);
             sf2.cz = loz + ldz * (Df - Rf);
-            sf2.R  = std::fabs(Rf);
+            sf2.R  = Rf;   /* keep sign: negative = concave cap */
             origins.push_back(sf2);
 
-            /* Back spherical cap: center = O + n*(Rb-Db), radius = |Rb| */
+            /* Back spherical cap: center = O + n*(Rb-Db), radius = Rb (signed) */
             ShapeOrigin sb2;
             memset(&sb2, 0, sizeof(sb2));
             sb2.type = 3;
             sb2.cx = lox + ldx * (Rb - Db);
             sb2.cy = loy + ldy * (Rb - Db);
             sb2.cz = loz + ldz * (Rb - Db);
-            sb2.R  = std::fabs(Rb);
+            sb2.R  = Rb;   /* keep sign: negative = concave cap */
             origins.push_back(sb2);
             continue;  /* already pushed both entries */
         } else {
