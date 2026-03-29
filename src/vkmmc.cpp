@@ -2046,8 +2046,8 @@ int main(int argc, char** argv) {
                                 for (uint32_t ix = 0; ix < nx; ix++)
                                     for (uint32_t iy = 0; iy < ny; iy++)
                                         for (uint32_t iz = 0; iz < nz; iz++)
-                                            vol3d[ix + iy*nx + iz*nx*ny] +=
-                                                gate[ix*(uint32_t)(ny*nz) + iy*nz + iz];
+                                            vol3d[ix + iy * nx + iz * nx * ny] +=
+                                                gate[ix * (uint32_t)(ny * nz) + iy * nz + iz];
                             } else {
                                 /* Source already ix-fastest */
                                 for (uint32_t i = 0; i < nvox; i++) {
@@ -2063,8 +2063,13 @@ int main(int argc, char** argv) {
                             if (vol3d[i] > 0.f) {
                                 float lv = log10f(vol3d[i]);
 
-                                if (lv < log_min) { log_min = lv; }
-                                if (lv > log_max) { log_max = lv; }
+                                if (lv < log_min) {
+                                    log_min = lv;
+                                }
+
+                                if (lv > log_max) {
+                                    log_max = lv;
+                                }
                             }
                         }
 
@@ -2079,7 +2084,9 @@ int main(int argc, char** argv) {
 
                         /* World-space bbox from Domain metadata */
                         ShowVol sv;
-                        sv.nx = nx; sv.ny = ny; sv.nz = nz;
+                        sv.nx = nx;
+                        sv.ny = ny;
+                        sv.nz = nz;
                         sv.data = std::move(vol3d);
 
                         if (jroot.contains("Domain")) {
@@ -2111,7 +2118,7 @@ int main(int argc, char** argv) {
                 /* ---- Load Trajectory (if present) ---- */
                 bool has_traj_data = false;
 
-                auto load_traj = [&](const json& tr) {
+                auto load_traj = [&](const json & tr) {
                     auto pid_raw = jdata_decode(tr["photonid"]);
                     uint32_t n = (uint32_t)(pid_raw.size() / sizeof(uint32_t));
                     static_traj.ids.resize(n);

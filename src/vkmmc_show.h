@@ -119,9 +119,10 @@ static void m4_persp(float* m, float fovY, float asp, float nr, float fr) {
     m[14] = (fr * nr) / (nr - fr);
 }
 
-/* LookAt: eye=(ex,ey,ez), center=(cx,cy,cz), up=(0,1,0) */
+/* LookAt: eye=(ex,ey,ez), center=(cx,cy,cz), explicit world up=(upx,upy,upz) */
 static void m4_lookat(float* m, float ex, float ey, float ez,
-                      float cx, float cy, float cz) {
+                      float cx, float cy, float cz,
+                      float upx, float upy, float upz) {
     float fx = cx - ex, fy = cy - ey, fz = cz - ez;
     float fl = sqrtf(fx * fx + fy * fy + fz * fz);
 
@@ -133,8 +134,10 @@ static void m4_lookat(float* m, float ex, float ey, float ez,
     fy /= fl;
     fz /= fl;
 
-    /* right = forward x up(0,1,0) */
-    float rx = fz, ry = 0.f, rz = -fx;
+    /* right = forward x up */
+    float rx = fy * upz - fz * upy;
+    float ry = fz * upx - fx * upz;
+    float rz = fx * upy - fy * upx;
     float rl = sqrtf(rx * rx + ry * ry + rz * rz);
 
     if (rl < 1e-10f) {
@@ -174,43 +177,87 @@ static void m4_lookat(float* m, float ex, float ey, float ez,
 /* Column-major 4x4 matrix inverse via cofactor expansion.
  * Returns false if the matrix is singular. */
 static bool m4_inv(float* out, const float* m) {
-    float s0 = m[0]*m[5]  - m[4]*m[1];
-    float s1 = m[0]*m[9]  - m[8]*m[1];
-    float s2 = m[0]*m[13] - m[12]*m[1];
-    float s3 = m[4]*m[9]  - m[8]*m[5];
-    float s4 = m[4]*m[13] - m[12]*m[5];
-    float s5 = m[8]*m[13] - m[12]*m[9];
-    float c0 = m[2]*m[7]  - m[6]*m[3];
-    float c1 = m[2]*m[11] - m[10]*m[3];
-    float c2 = m[2]*m[15] - m[14]*m[3];
-    float c3 = m[6]*m[11] - m[10]*m[7];
-    float c4 = m[6]*m[15] - m[14]*m[7];
-    float c5 = m[10]*m[15]- m[14]*m[11];
+    float s0 = m[0] * m[5]  - m[4] * m[1];
+    float s1 = m[0] * m[9]  - m[8] * m[1];
+    float s2 = m[0] * m[13] - m[12] * m[1];
+    float s3 = m[4] * m[9]  - m[8] * m[5];
+    float s4 = m[4] * m[13] - m[12] * m[5];
+    float s5 = m[8] * m[13] - m[12] * m[9];
+    float c0 = m[2] * m[7]  - m[6] * m[3];
+    float c1 = m[2] * m[11] - m[10] * m[3];
+    float c2 = m[2] * m[15] - m[14] * m[3];
+    float c3 = m[6] * m[11] - m[10] * m[7];
+    float c4 = m[6] * m[15] - m[14] * m[7];
+    float c5 = m[10] * m[15] - m[14] * m[11];
 
-    float det = s0*c5 - s1*c4 + s2*c3 + s3*c2 - s4*c1 + s5*c0;
+    float det = s0 * c5 - s1 * c4 + s2 * c3 + s3 * c2 - s4 * c1 + s5 * c0;
 
     if (fabsf(det) < 1e-10f) {
         return false;
     }
 
     float id = 1.f / det;
-    out[0]  = ( m[5]*c5  - m[9]*c4  + m[13]*c3) * id;
-    out[1]  = (-m[1]*c5  + m[9]*c2  - m[13]*c1) * id;
-    out[2]  = ( m[1]*c4  - m[5]*c2  + m[13]*c0) * id;
-    out[3]  = (-m[1]*c3  + m[5]*c1  - m[9]*c0 ) * id;
-    out[4]  = (-m[4]*c5  + m[8]*c4  - m[12]*c3) * id;
-    out[5]  = ( m[0]*c5  - m[8]*c2  + m[12]*c1) * id;
-    out[6]  = (-m[0]*c4  + m[4]*c2  - m[12]*c0) * id;
-    out[7]  = ( m[0]*c3  - m[4]*c1  + m[8]*c0 ) * id;
-    out[8]  = ( m[7]*s5  - m[11]*s4 + m[15]*s3) * id;
-    out[9]  = (-m[3]*s5  + m[11]*s2 - m[15]*s1) * id;
-    out[10] = ( m[3]*s4  - m[7]*s2  + m[15]*s0) * id;
-    out[11] = (-m[3]*s3  + m[7]*s1  - m[11]*s0) * id;
-    out[12] = (-m[6]*s5  + m[10]*s4 - m[14]*s3) * id;
-    out[13] = ( m[2]*s5  - m[10]*s2 + m[14]*s1) * id;
-    out[14] = (-m[2]*s4  + m[6]*s2  - m[14]*s0) * id;
-    out[15] = ( m[2]*s3  - m[6]*s1  + m[10]*s0) * id;
+    out[0]  = ( m[5] * c5  - m[9] * c4  + m[13] * c3) * id;
+    out[1]  = (-m[1] * c5  + m[9] * c2  - m[13] * c1) * id;
+    out[2]  = ( m[1] * c4  - m[5] * c2  + m[13] * c0) * id;
+    out[3]  = (-m[1] * c3  + m[5] * c1  - m[9] * c0 ) * id;
+    out[4]  = (-m[4] * c5  + m[8] * c4  - m[12] * c3) * id;
+    out[5]  = ( m[0] * c5  - m[8] * c2  + m[12] * c1) * id;
+    out[6]  = (-m[0] * c4  + m[4] * c2  - m[12] * c0) * id;
+    out[7]  = ( m[0] * c3  - m[4] * c1  + m[8] * c0 ) * id;
+    out[8]  = ( m[7] * s5  - m[11] * s4 + m[15] * s3) * id;
+    out[9]  = (-m[3] * s5  + m[11] * s2 - m[15] * s1) * id;
+    out[10] = ( m[3] * s4  - m[7] * s2  + m[15] * s0) * id;
+    out[11] = (-m[3] * s3  + m[7] * s1  - m[11] * s0) * id;
+    out[12] = (-m[6] * s5  + m[10] * s4 - m[14] * s3) * id;
+    out[13] = ( m[2] * s5  - m[10] * s2 + m[14] * s1) * id;
+    out[14] = (-m[2] * s4  + m[6] * s2  - m[14] * s0) * id;
+    out[15] = ( m[2] * s3  - m[6] * s1  + m[10] * s0) * id;
     return true;
+}
+
+/* ================================================================ */
+/*                      Quaternion helpers                          */
+/* ================================================================ */
+
+/* Rotate vector v by unit quaternion q=(w,x,y,z) */
+static void quat_rot(float* o, const float* q, const float* v) {
+    /* t = 2 * (q.xyz cross v) */
+    float tx = 2.f * (q[2] * v[2] - q[3] * v[1]);
+    float ty = 2.f * (q[3] * v[0] - q[1] * v[2]);
+    float tz = 2.f * (q[1] * v[1] - q[2] * v[0]);
+    o[0] = v[0] + q[0] * tx + q[2] * tz - q[3] * ty;
+    o[1] = v[1] + q[0] * ty + q[3] * tx - q[1] * tz;
+    o[2] = v[2] + q[0] * tz + q[1] * ty - q[2] * tx;
+}
+
+/* Build unit quaternion from axis (ax,ay,az) and angle a (radians) */
+static void quat_aa(float* q, float ax, float ay, float az, float a) {
+    float s = sinf(a * 0.5f);
+    q[0] = cosf(a * 0.5f);
+    q[1] = ax * s;
+    q[2] = ay * s;
+    q[3] = az * s;
+}
+
+/* Quaternion multiply: r = a * b */
+static void quat_mul(float* r, const float* a, const float* b) {
+    r[0] = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3];
+    r[1] = a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2];
+    r[2] = a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1];
+    r[3] = a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0];
+}
+
+/* Normalize quaternion in place */
+static void quat_norm(float* q) {
+    float l = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+
+    if (l > 1e-10f) {
+        q[0] /= l;
+        q[1] /= l;
+        q[2] /= l;
+        q[3] /= l;
+    }
 }
 
 /* ================================================================ */
@@ -220,21 +267,31 @@ static bool m4_inv(float* out, const float* m) {
 struct Camera {
     float cx = 0, cy = 0, cz = 0;
     float dist = 100.f;
-    float yaw = 0.3f, pitch = 0.3f;
+    /* Quaternion trackball: q rotates the initial eye dir (0,1,0) and up (0,0,-1).
+     * q = (w, x, y, z), initialised to identity. */
+    float q[4] = {1.f, 0.f, 0.f, 0.f};
     int W = 1280, H = 720;
 
     void eye_pos(float* e) const {
-        e[0] = cx + dist * cosf(pitch) * sinf(yaw);
-        e[1] = cy + dist * sinf(pitch);
-        e[2] = cz + dist * cosf(pitch) * cosf(yaw);
+        /* Initial eye direction: +y side view; rotate by q */
+        float dir0[3] = {0.f, 1.f, 0.f};
+        float dir[3];
+        quat_rot(dir, q, dir0);
+        e[0] = cx + dist * dir[0];
+        e[1] = cy + dist * dir[1];
+        e[2] = cz + dist * dir[2];
     }
 
     void mvp(float* out) const {
         float e[3];
         eye_pos(e);
+        /* Initial screen-up: (0,0,-1) so z increases downward on screen; rotate by q */
+        float up0[3] = {0.f, 0.f, -1.f};
+        float up[3];
+        quat_rot(up, q, up0);
         float proj[16], view[16];
         m4_persp(proj, 0.7854f /* 45 deg */, (float)W / (float)H, dist * 0.001f, dist * 10.f);
-        m4_lookat(view, e[0], e[1], e[2], cx, cy, cz);
+        m4_lookat(view, e[0], e[1], e[2], cx, cy, cz, up[0], up[1], up[2]);
         m4_mul(out, proj, view);
     }
 };
@@ -1107,7 +1164,11 @@ static void upload_traj(ShowCtx& sc, const ShowTraj& traj) {
         linePts.push_back(traj.pts[i1 * 3 + 2]);
     }
 
-    /* Collect launch markers (event type 0) for non-reflected photons */
+    /* Collect launch markers (event type 0) for non-reflected photons.
+     * Draw a single short arm pointing in the actual launch direction (inferred
+     * from event-0 → next-event).  World-axis-aligned cross arms are intentionally
+     * avoided: for disk/planar sources they create dense lateral lines that look
+     * like phantom lateral trajectories. */
     if (have_evts) {
         for (size_t j = 0; j < N; j++) {
             uint32_t i = order[j];
@@ -1125,24 +1186,31 @@ static void upload_traj(ShowCtx& sc, const ShowTraj& traj) {
             float lx = traj.pts[i * 3 + 0];
             float ly = traj.pts[i * 3 + 1];
             float lz = traj.pts[i * 3 + 2];
-            launchPts.push_back(lx - cs);
+
+            /* Infer photon direction from next event for this photon */
+            float ddx = 0.f, ddy = 0.f, ddz = cs;   /* fallback: +z */
+
+            if (j + 1 < N && traj.ids[order[j + 1]] == pid) {
+                uint32_t i1 = order[j + 1];
+                float ex = traj.pts[i1 * 3 + 0] - lx;
+                float ey = traj.pts[i1 * 3 + 1] - ly;
+                float ez = traj.pts[i1 * 3 + 2] - lz;
+                float el = sqrtf(ex * ex + ey * ey + ez * ez);
+
+                if (el > 1e-6f) {
+                    ddx = ex / el * cs;
+                    ddy = ey / el * cs;
+                    ddz = ez / el * cs;
+                }
+            }
+
+            /* Single forward arm in the launch direction */
+            launchPts.push_back(lx);
             launchPts.push_back(ly);
             launchPts.push_back(lz);
-            launchPts.push_back(lx + cs);
-            launchPts.push_back(ly);
-            launchPts.push_back(lz);
-            launchPts.push_back(lx);
-            launchPts.push_back(ly - cs);
-            launchPts.push_back(lz);
-            launchPts.push_back(lx);
-            launchPts.push_back(ly + cs);
-            launchPts.push_back(lz);
-            launchPts.push_back(lx);
-            launchPts.push_back(ly);
-            launchPts.push_back(lz - cs);
-            launchPts.push_back(lx);
-            launchPts.push_back(ly);
-            launchPts.push_back(lz + cs);
+            launchPts.push_back(lx + ddx);
+            launchPts.push_back(ly + ddy);
+            launchPts.push_back(lz + ddz);
         }
     }
 
@@ -1230,11 +1298,30 @@ static void upload_vol(ShowCtx& sc, const ShowVol& vol) {
     }
 
     /* Destroy previous volume resources if any */
-    if (sc.volSampler)  { vkDestroySampler(sc.dev, sc.volSampler, nullptr);  sc.volSampler  = VK_NULL_HANDLE; }
-    if (sc.volImgView)  { vkDestroyImageView(sc.dev, sc.volImgView, nullptr); sc.volImgView  = VK_NULL_HANDLE; }
-    if (sc.volImg)      { vkDestroyImage(sc.dev, sc.volImg, nullptr);         sc.volImg      = VK_NULL_HANDLE; }
-    if (sc.volImgMem)   { vkFreeMemory(sc.dev, sc.volImgMem, nullptr);        sc.volImgMem   = VK_NULL_HANDLE; }
-    if (sc.volPool)     { vkDestroyDescriptorPool(sc.dev, sc.volPool, nullptr); sc.volPool    = VK_NULL_HANDLE; }
+    if (sc.volSampler)  {
+        vkDestroySampler(sc.dev, sc.volSampler, nullptr);
+        sc.volSampler  = VK_NULL_HANDLE;
+    }
+
+    if (sc.volImgView)  {
+        vkDestroyImageView(sc.dev, sc.volImgView, nullptr);
+        sc.volImgView  = VK_NULL_HANDLE;
+    }
+
+    if (sc.volImg)      {
+        vkDestroyImage(sc.dev, sc.volImg, nullptr);
+        sc.volImg      = VK_NULL_HANDLE;
+    }
+
+    if (sc.volImgMem)   {
+        vkFreeMemory(sc.dev, sc.volImgMem, nullptr);
+        sc.volImgMem   = VK_NULL_HANDLE;
+    }
+
+    if (sc.volPool)     {
+        vkDestroyDescriptorPool(sc.dev, sc.volPool, nullptr);
+        sc.volPool    = VK_NULL_HANDLE;
+    }
 
     VkDeviceSize dataSize = (VkDeviceSize)vol.nx * vol.ny * vol.nz * sizeof(float);
 
@@ -1357,7 +1444,9 @@ static void upload_toolbar(ShowCtx& sc) {
     /* Three small buttons at top-right, each 0.09 wide × 0.07 tall, gap 0.01.
      * NDC y∈[0.90, 0.97] = screen top (Y-flip viewport: NDC +1 = screen top).
      * Layout (right→left): 2=close [0.88..0.97], 1=run [0.78..0.87], 0=wire [0.68..0.77] */
-    struct Btn { float x0, x1, y0, y1; };
+    struct Btn {
+        float x0, x1, y0, y1;
+    };
     const Btn btns[3] = {
         {0.68f, 0.77f, 0.90f, 0.97f},  /* 0: wireframe toggle */
         {0.78f, 0.87f, 0.90f, 0.97f},  /* 1: run simulation   */
@@ -1374,8 +1463,8 @@ static void upload_toolbar(ShowCtx& sc) {
         float x0 = btns[k].x0, x1 = btns[k].x1;
         float y0 = btns[k].y0, y1 = btns[k].y1;
         float q[] = {
-            x0,y0,z,0,0,1,  x1,y0,z,0,0,1,  x0,y1,z,0,0,1,
-            x1,y0,z,0,0,1,  x1,y1,z,0,0,1,  x0,y1,z,0,0,1,
+            x0, y0, z, 0, 0, 1,  x1, y0, z, 0, 0, 1,  x0, y1, z, 0, 0, 1,
+            x1, y0, z, 0, 0, 1,  x1, y1, z, 0, 0, 1,  x0, y1, z, 0, 0, 1,
         };
         memcpy(tverts + ti, q, sizeof(q));
         ti += 36;
@@ -1389,7 +1478,7 @@ static void upload_toolbar(ShowCtx& sc) {
         float pym = (b.y0 + b.y1) * 0.5f;
         float pyt = b.y0 + ph * 0.2f, pyb = b.y1 - ph * 0.2f;
         float tri[] = {
-            px0,pyt,iz,0,0,1,  px1,pym,iz,0,0,1,  px0,pyb,iz,0,0,1,
+            px0, pyt, iz, 0, 0, 1,  px1, pym, iz, 0, 0, 1,  px0, pyb, iz, 0, 0, 1,
         };
         memcpy(tverts + ti, tri, sizeof(tri));
         ti += 18;
@@ -1411,14 +1500,30 @@ static void upload_toolbar(ShowCtx& sc) {
         float cx = (b.x0 + b.x1) * 0.5f,   cy = (b.y0 + b.y1) * 0.5f;
         float ix0 = cx - hw, ix1 = cx + hw, iy0 = cy - hh, iy1 = cy + hh;
         /* top, bottom, left, right */
-        iverts[ii++]=ix0; iverts[ii++]=iy0; iverts[ii++]=iz;
-        iverts[ii++]=ix1; iverts[ii++]=iy0; iverts[ii++]=iz;
-        iverts[ii++]=ix0; iverts[ii++]=iy1; iverts[ii++]=iz;
-        iverts[ii++]=ix1; iverts[ii++]=iy1; iverts[ii++]=iz;
-        iverts[ii++]=ix0; iverts[ii++]=iy0; iverts[ii++]=iz;
-        iverts[ii++]=ix0; iverts[ii++]=iy1; iverts[ii++]=iz;
-        iverts[ii++]=ix1; iverts[ii++]=iy0; iverts[ii++]=iz;
-        iverts[ii++]=ix1; iverts[ii++]=iy1; iverts[ii++]=iz;
+        iverts[ii++] = ix0;
+        iverts[ii++] = iy0;
+        iverts[ii++] = iz;
+        iverts[ii++] = ix1;
+        iverts[ii++] = iy0;
+        iverts[ii++] = iz;
+        iverts[ii++] = ix0;
+        iverts[ii++] = iy1;
+        iverts[ii++] = iz;
+        iverts[ii++] = ix1;
+        iverts[ii++] = iy1;
+        iverts[ii++] = iz;
+        iverts[ii++] = ix0;
+        iverts[ii++] = iy0;
+        iverts[ii++] = iz;
+        iverts[ii++] = ix0;
+        iverts[ii++] = iy1;
+        iverts[ii++] = iz;
+        iverts[ii++] = ix1;
+        iverts[ii++] = iy0;
+        iverts[ii++] = iz;
+        iverts[ii++] = ix1;
+        iverts[ii++] = iy1;
+        iverts[ii++] = iz;
     }
 
     /* Close icon in button 2: X (two diagonals) */
@@ -1426,10 +1531,18 @@ static void upload_toolbar(ShowCtx& sc) {
         const Btn& b  = btns[2];
         float hw = (b.x1 - b.x0) * 0.28f, hh = (b.y1 - b.y0) * 0.28f;
         float cx = (b.x0 + b.x1) * 0.5f,   cy = (b.y0 + b.y1) * 0.5f;
-        iverts[ii++]=cx-hw; iverts[ii++]=cy-hh; iverts[ii++]=iz;
-        iverts[ii++]=cx+hw; iverts[ii++]=cy+hh; iverts[ii++]=iz;
-        iverts[ii++]=cx+hw; iverts[ii++]=cy-hh; iverts[ii++]=iz;
-        iverts[ii++]=cx-hw; iverts[ii++]=cy+hh; iverts[ii++]=iz;
+        iverts[ii++] = cx - hw;
+        iverts[ii++] = cy - hh;
+        iverts[ii++] = iz;
+        iverts[ii++] = cx + hw;
+        iverts[ii++] = cy + hh;
+        iverts[ii++] = iz;
+        iverts[ii++] = cx + hw;
+        iverts[ii++] = cy - hh;
+        iverts[ii++] = iz;
+        iverts[ii++] = cx - hw;
+        iverts[ii++] = cy + hh;
+        iverts[ii++] = iz;
     }
 
     sc.toolbarIconVB = make_buf(sc, (size_t)ii * sizeof(float),
@@ -1608,7 +1721,10 @@ static bool draw_frame(ShowCtx& sc, const Camera& cam, int state, bool has_traj,
         bclr[1][2] = (state == 0) ? 0.2f  : (state == 1) ? 0.1f : 0.9f;
         bclr[1][3] = 0.85f;
         /* Button 2: close — dark red */
-        bclr[2][0] = 0.5f; bclr[2][1] = 0.1f; bclr[2][2] = 0.1f; bclr[2][3] = 0.85f;
+        bclr[2][0] = 0.5f;
+        bclr[2][1] = 0.1f;
+        bclr[2][2] = 0.1f;
+        bclr[2][3] = 0.85f;
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sc.triPipe);
         VkDeviceSize off = 0;
@@ -1649,14 +1765,20 @@ static bool draw_frame(ShowCtx& sc, const Camera& cam, int state, bool has_traj,
             vkCmdBindVertexBuffers(cmd, 0, 1, &sc.toolbarIconVB.buf, &ioff);
 
             /* Wireframe icon (square outline) — light blue */
-            pc.color[0] = 0.8f; pc.color[1] = 0.95f; pc.color[2] = 1.0f; pc.color[3] = 1.0f;
+            pc.color[0] = 0.8f;
+            pc.color[1] = 0.95f;
+            pc.color[2] = 1.0f;
+            pc.color[3] = 1.0f;
             vkCmdPushConstants(cmd, sc.playout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, 80, &pc);
             vkCmdDraw(cmd, 8, 1, 0, 0);
 
             /* Close icon (X) — light red */
-            pc.color[0] = 1.0f; pc.color[1] = 0.7f; pc.color[2] = 0.7f; pc.color[3] = 1.0f;
+            pc.color[0] = 1.0f;
+            pc.color[1] = 0.7f;
+            pc.color[2] = 0.7f;
+            pc.color[3] = 1.0f;
             vkCmdPushConstants(cmd, sc.playout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, 80, &pc);
@@ -1710,6 +1832,7 @@ struct InputState {
     bool   leftDown = false, rightDown = false;
     double lastX = 0, lastY = 0;
     float  dYaw = 0, dPitch = 0, dScroll = 0;
+    float  dPanX = 0, dPanY = 0;
     bool   startSim = false, toggleMip = false;
     double mouseX = 0, mouseY = 0;
     bool   clicked = false;
@@ -1726,8 +1849,19 @@ static void cb_cursor(GLFWwindow* win, double x, double y) {
 
     if (inp->leftDown) {
         double dx = x - inp->lastX, dy = y - inp->lastY;
-        inp->dYaw   += (float)(dx * 0.005);
-        inp->dPitch += (float)(dy * 0.005);
+        bool ctrl = (glfwGetKey(win, GLFW_KEY_LEFT_CONTROL)  == GLFW_PRESS ||
+                     glfwGetKey(win, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
+
+        if (ctrl) {
+            /* Ctrl+drag: pan — accumulate screen-space pixel offsets */
+            inp->dPanX += (float)dx;
+            inp->dPanY += (float)dy;
+        } else {
+            /* three.js-like orbit: drag right → scene rotates right (camera left),
+             * drag down → camera descends (pitch decreases), hence both negated. */
+            inp->dYaw   -= (float)(dx * 0.005);
+            inp->dPitch -= (float)(dy * 0.005);
+        }
     }
 
     inp->lastX = x;
@@ -1738,10 +1872,15 @@ static void cb_cursor(GLFWwindow* win, double x, double y) {
     double ny = (y / inp->H) * 2.0 - 1.0;
     /* Toolbar buttons: vertex NDC y=[0.90,0.97] → screen top → GLFW ny≈[-0.97,-0.90] */
     inp->toolbarHovered = -1;
+
     if (ny >= -0.97 && ny <= -0.90) {
-        if      (nx >= 0.68 && nx <= 0.77) { inp->toolbarHovered = 0; }
-        else if (nx >= 0.78 && nx <= 0.87) { inp->toolbarHovered = 1; }
-        else if (nx >= 0.88 && nx <= 0.97) { inp->toolbarHovered = 2; }
+        if      (nx >= 0.68 && nx <= 0.77) {
+            inp->toolbarHovered = 0;
+        } else if (nx >= 0.78 && nx <= 0.87) {
+            inp->toolbarHovered = 1;
+        } else if (nx >= 0.88 && nx <= 0.97) {
+            inp->toolbarHovered = 2;
+        }
     }
 }
 
@@ -1861,16 +2000,45 @@ static void destroy_viewer(ShowCtx& sc) {
     sc.toolbarIconVB.destroy();
 
     /* Volume resources */
-    if (sc.volSampler)  vkDestroySampler(sc.dev, sc.volSampler, nullptr);
-    if (sc.volImgView)  vkDestroyImageView(sc.dev, sc.volImgView, nullptr);
-    if (sc.volImg)      vkDestroyImage(sc.dev, sc.volImg, nullptr);
-    if (sc.volImgMem)   vkFreeMemory(sc.dev, sc.volImgMem, nullptr);
-    if (sc.volPool)     vkDestroyDescriptorPool(sc.dev, sc.volPool, nullptr);
-    if (sc.volPipe)     vkDestroyPipeline(sc.dev, sc.volPipe, nullptr);
-    if (sc.volLayout)   vkDestroyPipelineLayout(sc.dev, sc.volLayout, nullptr);
-    if (sc.volDSL)      vkDestroyDescriptorSetLayout(sc.dev, sc.volDSL, nullptr);
-    if (sc.fsm_vol)     vkDestroyShaderModule(sc.dev, sc.fsm_vol, nullptr);
-    if (sc.vsm_vol)     vkDestroyShaderModule(sc.dev, sc.vsm_vol, nullptr);
+    if (sc.volSampler) {
+        vkDestroySampler(sc.dev, sc.volSampler, nullptr);
+    }
+
+    if (sc.volImgView) {
+        vkDestroyImageView(sc.dev, sc.volImgView, nullptr);
+    }
+
+    if (sc.volImg) {
+        vkDestroyImage(sc.dev, sc.volImg, nullptr);
+    }
+
+    if (sc.volImgMem) {
+        vkFreeMemory(sc.dev, sc.volImgMem, nullptr);
+    }
+
+    if (sc.volPool) {
+        vkDestroyDescriptorPool(sc.dev, sc.volPool, nullptr);
+    }
+
+    if (sc.volPipe) {
+        vkDestroyPipeline(sc.dev, sc.volPipe, nullptr);
+    }
+
+    if (sc.volLayout) {
+        vkDestroyPipelineLayout(sc.dev, sc.volLayout, nullptr);
+    }
+
+    if (sc.volDSL) {
+        vkDestroyDescriptorSetLayout(sc.dev, sc.volDSL, nullptr);
+    }
+
+    if (sc.fsm_vol) {
+        vkDestroyShaderModule(sc.dev, sc.fsm_vol, nullptr);
+    }
+
+    if (sc.vsm_vol) {
+        vkDestroyShaderModule(sc.dev, sc.vsm_vol, nullptr);
+    }
 
     for (int i = 0; i < ShowCtx::FRAMES; i++) {
         vkDestroyFence(sc.dev, sc.fence[i], nullptr);
@@ -1963,6 +2131,7 @@ void run_viewer(const ShowMesh& mesh, std::function<ShowTraj()> simulate,
     upload_mesh(sc, mesh);
     upload_src(sc, mesh.src_lines);
     upload_toolbar(sc);
+
     if (!mesh.vol.data.empty()) {
         upload_vol(sc, mesh.vol);
     }
@@ -2009,19 +2178,49 @@ void run_viewer(const ShowMesh& mesh, std::function<ShowTraj()> simulate,
             inp.resized = false;
         }
 
-        /* Apply camera orbit input */
-        cam.yaw   += inp.dYaw;
-        cam.pitch  = clampf(cam.pitch + inp.dPitch, -1.4f, 1.4f);
+        /* Apply quaternion trackball rotation */
+        if (inp.dYaw != 0.f || inp.dPitch != 0.f) {
+            /* Screen-up and screen-right in world space = rotate initial axes by q */
+            float up0[3] = {0.f, 0.f, -1.f};
+            float rt0[3] = {1.f, 0.f,  0.f};
+            float su[3], sr[3];
+            quat_rot(su, cam.q, up0);   /* current screen up   */
+            quat_rot(sr, cam.q, rt0);   /* current screen right */
+            /* dYaw: rotate around screen-up; dPitch: rotate around screen-right */
+            float qY[4], qP[4], tmp[4];
+            quat_aa(qY, su[0], su[1], su[2], inp.dYaw);
+            quat_aa(qP, sr[0], sr[1], sr[2], inp.dPitch);
+            quat_mul(tmp, qY, cam.q);
+            quat_mul(cam.q, qP, tmp);
+            quat_norm(cam.q);
+            inp.dYaw = inp.dPitch = 0.f;
+        }
+
+        /* Ctrl+drag pan: move center along current screen right/up axes */
+        if (inp.dPanX != 0.f || inp.dPanY != 0.f) {
+            float rt0[3] = {1.f, 0.f,  0.f};
+            float up0[3] = {0.f, 0.f, -1.f};
+            float sr[3], su[3];
+            quat_rot(sr, cam.q, rt0);
+            quat_rot(su, cam.q, up0);
+            /* scale: pan 1 pixel ≈ dist/W world units */
+            float scale = cam.dist / (float)cam.W;
+            cam.cx -= (inp.dPanX * sr[0] - inp.dPanY * su[0]) * scale;
+            cam.cy -= (inp.dPanX * sr[1] - inp.dPanY * su[1]) * scale;
+            cam.cz -= (inp.dPanX * sr[2] - inp.dPanY * su[2]) * scale;
+            inp.dPanX = inp.dPanY = 0.f;
+        }
+
         cam.dist  *= (1.f - inp.dScroll * 0.1f);
         cam.dist   = clampf(cam.dist, mesh.radius * 0.1f, mesh.radius * 10.f);
-        inp.dYaw = inp.dPitch = inp.dScroll = 0;
+        inp.dScroll = 0;
 
         /* M key: toggle MIP / compositing volume rendering mode */
         if (inp.toggleMip) {
             use_mip = !use_mip;
             inp.toggleMip = false;
             glfwSetWindowTitle(win, use_mip ? "rtmmc-vulkan | Volume MIP (M=toggle)"
-                                            : "rtmmc-vulkan | Volume compositing (M=toggle)");
+                               : "rtmmc-vulkan | Volume compositing (M=toggle)");
         }
 
         /* Handle toolbar button clicks */
