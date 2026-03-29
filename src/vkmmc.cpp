@@ -2001,37 +2001,144 @@ int main(int argc, char** argv) {
         }
 
         if (!ovr.traj_file.empty()) {
-            /* Static viewer: load trajectory from jdat file, skip simulation */
+            /* Static viewer: load trajectory and/or Fluence volume from jdat file */
             ShowTraj static_traj;
             {
                 std::ifstream tf(ovr.traj_file);
 
                 if (!tf) {
-                    fprintf(stderr, "Cannot open trajectory file: %s\n", ovr.traj_file.c_str());
+                    fprintf(stderr, "Cannot open file: %s\n", ovr.traj_file.c_str());
                     return 1;
                 }
 
                 json jroot = json::parse(tf);
-                const json& tr = jroot["MCXData"]["Trajectory"];
-                auto pid_raw = jdata_decode(tr["photonid"]);
-                uint32_t n = (uint32_t)(pid_raw.size() / sizeof(uint32_t));
-                static_traj.ids.resize(n);
-                memcpy(static_traj.ids.data(), pid_raw.data(), n * sizeof(uint32_t));
-                auto p_raw = jdata_decode(tr["p"]);
-                static_traj.pts.resize(n * 3);
-                memcpy(static_traj.pts.data(), p_raw.data(), n * 3 * sizeof(float));
 
-                if (tr.contains("e0")) {
-                    auto e0_raw = jdata_decode(tr["e0"]);
-                    static_traj.evts.resize(n);
-                    memcpy(static_traj.evts.data(), e0_raw.data(), n * sizeof(uint32_t));
-                } else {
-                    static_traj.evts.assign(n, 0u);
+                /* ---- Load Fluence volume (if present) ---- */
+                if (jroot.contains("Fluence")) {
+                    const json& fl = jroot["Fluence"];
+
+                    if (fl.contains("_ArraySize_") && fl.contains("_ArrayZipType_")) {
+                        auto sz = fl["_ArraySize_"];
+                        uint32_t nx = sz[0].get<uint32_t>();
+                        uint32_t ny = sz[1].get<uint32_t>();
+                        uint32_t nz = sz[2].get<uint32_t>();
+                        uint32_t ng = (sz.size() >= 4) ? sz[3].get<uint32_t>() : 1;
+
+                        /* Decode raw bytes — layout is always ix-fastest (GPU column-major).
+                         * JData default (no _ArrayOrder_ tag) = first dim (ix) varies fastest,
+                         * which matches the GPU's iz*nx*ny + iy*nx + ix voxel index formula.
+                         * If _ArrayOrder_: "c" is present it means C row-major = iz varies fastest;
+                         * in that case we transpose to ix-fastest before uploading. */
+                        bool iz_fastest = (fl.value("_ArrayOrder_", "") == "c");
+
+                        auto raw = jdata_decode(fl);
+                        const float* src = reinterpret_cast<const float*>(raw.data());
+                        uint32_t nvox = nx * ny * nz;
+
+                        /* Sum over gates and optionally transpose to ix-fastest */
+                        std::vector<float> vol3d(nvox, 0.f);
+
+                        for (uint32_t ig = 0; ig < ng; ig++) {
+                            const float* gate = src + (size_t)ig * nvox;
+
+                            if (iz_fastest) {
+                                /* Source: ix*ny*nz + iy*nz + iz — transpose to ix + iy*nx + iz*nx*ny */
+                                for (uint32_t ix = 0; ix < nx; ix++)
+                                    for (uint32_t iy = 0; iy < ny; iy++)
+                                        for (uint32_t iz = 0; iz < nz; iz++)
+                                            vol3d[ix + iy*nx + iz*nx*ny] +=
+                                                gate[ix*(uint32_t)(ny*nz) + iy*nz + iz];
+                            } else {
+                                /* Source already ix-fastest */
+                                for (uint32_t i = 0; i < nvox; i++) {
+                                    vol3d[i] += gate[i];
+                                }
+                            }
+                        }
+
+                        /* Compute log10 and normalise to [0,1] */
+                        float log_min =  1e30f, log_max = -1e30f;
+
+                        for (uint32_t i = 0; i < nvox; i++) {
+                            if (vol3d[i] > 0.f) {
+                                float lv = log10f(vol3d[i]);
+
+                                if (lv < log_min) { log_min = lv; }
+                                if (lv > log_max) { log_max = lv; }
+                            }
+                        }
+
+                        /* Clamp dynamic range to 6 decades below peak */
+                        log_min = std::max(log_min, log_max - 6.f);
+                        float log_range = (log_max > log_min) ? (log_max - log_min) : 1.f;
+
+                        for (uint32_t i = 0; i < nvox; i++) {
+                            float lv = (vol3d[i] > 0.f) ? log10f(vol3d[i]) : log_min - 1.f;
+                            vol3d[i] = std::max(0.f, std::min(1.f, (lv - log_min) / log_range));
+                        }
+
+                        /* World-space bbox from Domain metadata */
+                        ShowVol sv;
+                        sv.nx = nx; sv.ny = ny; sv.nz = nz;
+                        sv.data = std::move(vol3d);
+
+                        if (jroot.contains("Domain")) {
+                            const json& dom = jroot["Domain"];
+                            float vs = dom.value("VoxelSize", 1.f);
+
+                            if (dom.contains("Origin")) {
+                                sv.origin[0] = dom["Origin"][0].get<float>();
+                                sv.origin[1] = dom["Origin"][1].get<float>();
+                                sv.origin[2] = dom["Origin"][2].get<float>();
+                            }
+
+                            sv.extent[0] = nx * vs;
+                            sv.extent[1] = ny * vs;
+                            sv.extent[2] = nz * vs;
+                        } else {
+                            sv.origin[0] = sv.origin[1] = sv.origin[2] = 0.f;
+                            sv.extent[0] = (float)nx;
+                            sv.extent[1] = (float)ny;
+                            sv.extent[2] = (float)nz;
+                        }
+
+                        vmesh.vol = std::move(sv);
+                        printf("Loaded Fluence %ux%ux%u (ng=%u, log10 range [%.1f, %.1f])\n",
+                               nx, ny, nz, ng, log_min, log_max);
+                    }
                 }
 
-                printf("Loaded %u trajectory events from %s\n", n, ovr.traj_file.c_str());
+                /* ---- Load Trajectory (if present) ---- */
+                bool has_traj_data = false;
+
+                auto load_traj = [&](const json& tr) {
+                    auto pid_raw = jdata_decode(tr["photonid"]);
+                    uint32_t n = (uint32_t)(pid_raw.size() / sizeof(uint32_t));
+                    static_traj.ids.resize(n);
+                    memcpy(static_traj.ids.data(), pid_raw.data(), n * sizeof(uint32_t));
+                    auto p_raw = jdata_decode(tr["p"]);
+                    static_traj.pts.resize(n * 3);
+                    memcpy(static_traj.pts.data(), p_raw.data(), n * 3 * sizeof(float));
+
+                    if (tr.contains("e0")) {
+                        auto e0_raw = jdata_decode(tr["e0"]);
+                        static_traj.evts.resize(n);
+                        memcpy(static_traj.evts.data(), e0_raw.data(), n * sizeof(uint32_t));
+                    } else {
+                        static_traj.evts.assign(n, 0u);
+                    }
+
+                    printf("Loaded %u trajectory events\n", n);
+                    return n > 0;
+                };
+
+                if (jroot.contains("MCXData") && jroot["MCXData"].contains("Trajectory")) {
+                    has_traj_data = load_traj(jroot["MCXData"]["Trajectory"]);
+                }
+
+                (void)has_traj_data;
             }
-            run_viewer(vmesh, nullptr, &static_traj);
+            run_viewer(vmesh, nullptr, static_traj.ids.empty() ? nullptr : &static_traj);
         } else {
             /* Pre-create compute context so its lifetime spans the viewer window.
                Destroying it inside the simulate callback (while the graphics VkDevice

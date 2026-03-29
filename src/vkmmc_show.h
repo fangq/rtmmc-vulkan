@@ -27,8 +27,11 @@
 #include <cmath>
 #include <algorithm>
 
+#include <numeric>
 #include "vkmmc_show_vert_spv.h"
 #include "vkmmc_show_frag_spv.h"
+#include "vkmmc_show_vol_vert_spv.h"
+#include "vkmmc_show_vol_frag_spv.h"
 
 /* ================================================================ */
 /*                          Data structs                            */
@@ -44,11 +47,32 @@ struct ShowTraj {
     std::vector<uint32_t> evts;  // event type: 0=launch 1=scatter 2=term 3=boundary
 };
 
+/* Fluence volume for 3D rendering: data in column-major order ix + iy*nx + iz*nx*ny,
+ * normalised log10 values in [0,1].  Empty data == no volume. */
+struct ShowVol {
+    std::vector<float> data;   /* log10-normalised [0,1], ix-fastest layout */
+    uint32_t nx = 0, ny = 0, nz = 0;
+    float origin[3]  = {};     /* world-space bbox minimum corner */
+    float extent[3]  = {};     /* world-space bbox size per axis  */
+};
+
 struct ShowMesh {
     std::vector<ShowVert>   verts;
     std::vector<uint32_t>   inds;
     float cx, cy, cz, radius;
     std::vector<float>      src_lines; /* LINE_LIST: flat xyz triples, no normals */
+    ShowVol                 vol;       /* optional fluence volume */
+};
+
+/* Volume push constant: 128 bytes, all vec4-aligned.
+ * Matches the GLSL layout in vkmmc_show_vol.frag exactly. */
+struct VolPC {
+    float   inv_mvp[16];       /* 64 bytes: inverse(proj*view)           */
+    float   cam_logmin[4];     /* 16 bytes: .xyz=cam_pos, .w=log_min     */
+    float   origin_logmax[4];  /* 16 bytes: .xyz=vol_origin, .w=log_max  */
+    float   extent_opacity[4]; /* 16 bytes: .xyz=vol_extent, .w=opacity  */
+    int32_t use_mip;           /*  4 bytes                               */
+    int32_t _pad[3];           /* 12 bytes                               */
 };
 
 /* Push constant: mat4 (64 bytes) + vec4 (16 bytes) = 80 bytes */
@@ -147,6 +171,48 @@ static void m4_lookat(float* m, float ex, float ey, float ez,
     m[15] = 1.f;
 }
 
+/* Column-major 4x4 matrix inverse via cofactor expansion.
+ * Returns false if the matrix is singular. */
+static bool m4_inv(float* out, const float* m) {
+    float s0 = m[0]*m[5]  - m[4]*m[1];
+    float s1 = m[0]*m[9]  - m[8]*m[1];
+    float s2 = m[0]*m[13] - m[12]*m[1];
+    float s3 = m[4]*m[9]  - m[8]*m[5];
+    float s4 = m[4]*m[13] - m[12]*m[5];
+    float s5 = m[8]*m[13] - m[12]*m[9];
+    float c0 = m[2]*m[7]  - m[6]*m[3];
+    float c1 = m[2]*m[11] - m[10]*m[3];
+    float c2 = m[2]*m[15] - m[14]*m[3];
+    float c3 = m[6]*m[11] - m[10]*m[7];
+    float c4 = m[6]*m[15] - m[14]*m[7];
+    float c5 = m[10]*m[15]- m[14]*m[11];
+
+    float det = s0*c5 - s1*c4 + s2*c3 + s3*c2 - s4*c1 + s5*c0;
+
+    if (fabsf(det) < 1e-10f) {
+        return false;
+    }
+
+    float id = 1.f / det;
+    out[0]  = ( m[5]*c5  - m[9]*c4  + m[13]*c3) * id;
+    out[1]  = (-m[1]*c5  + m[9]*c2  - m[13]*c1) * id;
+    out[2]  = ( m[1]*c4  - m[5]*c2  + m[13]*c0) * id;
+    out[3]  = (-m[1]*c3  + m[5]*c1  - m[9]*c0 ) * id;
+    out[4]  = (-m[4]*c5  + m[8]*c4  - m[12]*c3) * id;
+    out[5]  = ( m[0]*c5  - m[8]*c2  + m[12]*c1) * id;
+    out[6]  = (-m[0]*c4  + m[4]*c2  - m[12]*c0) * id;
+    out[7]  = ( m[0]*c3  - m[4]*c1  + m[8]*c0 ) * id;
+    out[8]  = ( m[7]*s5  - m[11]*s4 + m[15]*s3) * id;
+    out[9]  = (-m[3]*s5  + m[11]*s2 - m[15]*s1) * id;
+    out[10] = ( m[3]*s4  - m[7]*s2  + m[15]*s0) * id;
+    out[11] = (-m[3]*s3  + m[7]*s1  - m[11]*s0) * id;
+    out[12] = (-m[6]*s5  + m[10]*s4 - m[14]*s3) * id;
+    out[13] = ( m[2]*s5  - m[10]*s2 + m[14]*s1) * id;
+    out[14] = (-m[2]*s4  + m[6]*s2  - m[14]*s0) * id;
+    out[15] = ( m[2]*s3  - m[6]*s1  + m[10]*s0) * id;
+    return true;
+}
+
 /* ================================================================ */
 /*                           Camera                                 */
 /* ================================================================ */
@@ -157,16 +223,18 @@ struct Camera {
     float yaw = 0.3f, pitch = 0.3f;
     int W = 1280, H = 720;
 
-    void mvp(float* out) const {
-        float eye[3] = {
-            cx + dist * cosf(pitch)* sinf(yaw),
-            cy + dist * sinf(pitch),
-            cz + dist * cosf(pitch)* cosf(yaw)
-        };
+    void eye_pos(float* e) const {
+        e[0] = cx + dist * cosf(pitch) * sinf(yaw);
+        e[1] = cy + dist * sinf(pitch);
+        e[2] = cz + dist * cosf(pitch) * cosf(yaw);
+    }
 
+    void mvp(float* out) const {
+        float e[3];
+        eye_pos(e);
         float proj[16], view[16];
         m4_persp(proj, 0.7854f /* 45 deg */, (float)W / (float)H, dist * 0.001f, dist * 10.f);
-        m4_lookat(view, eye[0], eye[1], eye[2], cx, cy, cz);
+        m4_lookat(view, e[0], e[1], e[2], cx, cy, cz);
         m4_mul(out, proj, view);
     }
 };
@@ -225,6 +293,7 @@ struct ShowCtx {
     VkPipelineLayout playout  = VK_NULL_HANDLE;
     VkPipeline       triPipe  = VK_NULL_HANDLE;
     VkPipeline       linePipe = VK_NULL_HANDLE;
+    VkPipeline       wirePipe = VK_NULL_HANDLE; /* wireframe: VK_NULL_HANDLE if unsupported */
 
     VkCommandPool   pool = VK_NULL_HANDLE;
     static const int FRAMES = 2;
@@ -232,8 +301,25 @@ struct ShowCtx {
     VkSemaphore     imgSem[2] = {}, renSem[2] = {};
     VkFence         fence[2]  = {};
 
-    ShowBuf meshVB, meshIB, trajVB, btnVB, srcVB;
+    ShowBuf meshVB, meshIB, trajVB, srcVB; /* btnVB removed — toolbar replaces big button */
+    ShowBuf toolbarVB, toolbarIconVB;
     uint32_t meshVtxCnt = 0, meshIdxCnt = 0, trajPtCnt = 0, srcPtCnt = 0;
+    uint32_t toolbarVtxCnt = 0, toolbarIconPtCnt = 0;
+
+    /* Volume rendering resources */
+    VkShaderModule        vsm_vol  = VK_NULL_HANDLE, fsm_vol  = VK_NULL_HANDLE;
+    VkDescriptorSetLayout volDSL   = VK_NULL_HANDLE;
+    VkDescriptorPool      volPool  = VK_NULL_HANDLE;
+    VkDescriptorSet       volDS    = VK_NULL_HANDLE;
+    VkPipelineLayout      volLayout = VK_NULL_HANDLE;
+    VkPipeline            volPipe  = VK_NULL_HANDLE;
+    VkImage               volImg   = VK_NULL_HANDLE;
+    VkDeviceMemory        volImgMem = VK_NULL_HANDLE;
+    VkImageView           volImgView = VK_NULL_HANDLE;
+    VkSampler             volSampler = VK_NULL_HANDLE;
+    float                 volOrigin[3] = {};
+    float                 volExtent[3] = {};
+    bool                  volReady = false;
 };
 
 /* ================================================================ */
@@ -512,7 +598,8 @@ static VkShaderModule make_shader(VkDevice dev, const uint8_t* spv, size_t sz) {
 }
 
 static VkPipeline create_pipe(ShowCtx& sc, VkPrimitiveTopology topo, bool blend,
-                              bool has_normal = false) {
+                              bool has_normal = false,
+                              VkPolygonMode poly_mode = VK_POLYGON_MODE_FILL) {
     VkVertexInputBindingDescription vbind = {};
     vbind.binding   = 0;
     vbind.stride    = has_normal ? 24u : 12u; /* 6 or 3 floats */
@@ -542,7 +629,7 @@ static VkPipeline create_pipe(ShowCtx& sc, VkPrimitiveTopology topo, bool blend,
     vps.scissorCount  = 1;
 
     VkPipelineRasterizationStateCreateInfo ras = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-    ras.polygonMode = VK_POLYGON_MODE_FILL;
+    ras.polygonMode = poly_mode;
     ras.cullMode    = VK_CULL_MODE_NONE;
     ras.frontFace   = VK_FRONT_FACE_CLOCKWISE;
     ras.lineWidth   = 1.0f;  /* >1.0 requires wideLines feature; 1.0 is always valid */
@@ -552,7 +639,7 @@ static VkPipeline create_pipe(ShowCtx& sc, VkPrimitiveTopology topo, bool blend,
 
     VkPipelineDepthStencilStateCreateInfo dss = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     dss.depthTestEnable  = VK_TRUE;
-    dss.depthWriteEnable = VK_TRUE;
+    dss.depthWriteEnable = blend ? VK_FALSE : VK_TRUE; /* transparent mesh must not own depth */
     dss.depthCompareOp   = VK_COMPARE_OP_LESS;
 
     VkPipelineColorBlendAttachmentState cba = {};
@@ -768,6 +855,19 @@ static void init_viewer(ShowCtx& sc, GLFWwindow* win, uint32_t w, uint32_t h) {
     sc.triPipe  = create_pipe(sc, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true,  true);
     sc.linePipe = create_pipe(sc, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,     false, false);
 
+    /* Wireframe pipeline: triPipe with POLYGON_MODE_LINE (needs fillModeNonSolid feature) */
+    {
+        VkPhysicalDeviceFeatures feats = {};
+        vkGetPhysicalDeviceFeatures(sc.pdev, &feats);
+
+        if (feats.fillModeNonSolid) {
+            sc.wirePipe = create_pipe(sc, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false, true,
+                                      VK_POLYGON_MODE_LINE);
+        } else {
+            printf("[show] fillModeNonSolid not supported; wireframe toggle disabled\n");
+        }
+    }
+
     /* Command pool + command buffers */
     VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpi.queueFamilyIndex = sc.gqf;
@@ -792,6 +892,115 @@ static void init_viewer(ShowCtx& sc, GLFWwindow* win, uint32_t w, uint32_t h) {
     }
 
     printf("[show] Viewer initialized (%ux%u)\n", w, h);
+}
+
+/* ================================================================ */
+/*                  Volume pipeline initialisation                  */
+/* ================================================================ */
+
+static void init_vol_pipeline(ShowCtx& sc) {
+    /* Descriptor set layout: binding 0 = combined sampler3D */
+    VkDescriptorSetLayoutBinding dslb = {};
+    dslb.binding         = 0;
+    dslb.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    dslb.descriptorCount = 1;
+    dslb.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutCreateInfo dslic = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslic.bindingCount = 1;
+    dslic.pBindings    = &dslb;
+    SH_VK_CHECK(vkCreateDescriptorSetLayout(sc.dev, &dslic, nullptr, &sc.volDSL));
+
+    /* Pipeline layout: descriptor set 0 + 128-byte push constant */
+    VkPushConstantRange pcr = {};
+    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr.offset     = 0;
+    pcr.size       = 128;
+
+    VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount         = 1;
+    plci.pSetLayouts            = &sc.volDSL;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges    = &pcr;
+    SH_VK_CHECK(vkCreatePipelineLayout(sc.dev, &plci, nullptr, &sc.volLayout));
+
+    /* Shaders */
+    sc.vsm_vol = make_shader(sc.dev, vkmmc_show_vol_vert_spv, vkmmc_show_vol_vert_spv_len);
+    sc.fsm_vol = make_shader(sc.dev, vkmmc_show_vol_frag_spv, vkmmc_show_vol_frag_spv_len);
+
+    /* No vertex input — fullscreen quad via gl_VertexIndex */
+    VkPipelineVertexInputStateCreateInfo vis = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vis.vertexBindingDescriptionCount   = 0;
+    vis.vertexAttributeDescriptionCount = 0;
+
+    VkPipelineInputAssemblyStateCreateInfo ias = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vps.viewportCount = 1;
+    vps.scissorCount  = 1;
+
+    VkPipelineRasterizationStateCreateInfo ras = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    ras.polygonMode = VK_POLYGON_MODE_FILL;
+    ras.cullMode    = VK_CULL_MODE_NONE;
+    ras.frontFace   = VK_FRONT_FACE_CLOCKWISE;
+    ras.lineWidth   = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo mss = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    mss.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo dss = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    dss.depthTestEnable  = VK_FALSE;
+    dss.depthWriteEnable = VK_FALSE;
+    dss.depthCompareOp   = VK_COMPARE_OP_LESS;
+
+    /* Alpha blending for compositing */
+    VkPipelineColorBlendAttachmentState cba = {};
+    cba.blendEnable         = VK_TRUE;
+    cba.colorWriteMask      = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.colorBlendOp        = VK_BLEND_OP_ADD;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    cba.alphaBlendOp        = VK_BLEND_OP_ADD;
+
+    VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cbs.attachmentCount = 1;
+    cbs.pAttachments    = &cba;
+
+    VkDynamicState dynStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dyn.dynamicStateCount = 2;
+    dyn.pDynamicStates    = dynStates;
+
+    VkPipelineShaderStageCreateInfo stages[2] = {};
+    stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = sc.vsm_vol;
+    stages[0].pName  = "main";
+    stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = sc.fsm_vol;
+    stages[1].pName  = "main";
+
+    VkGraphicsPipelineCreateInfo pci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pci.stageCount          = 2;
+    pci.pStages             = stages;
+    pci.pVertexInputState   = &vis;
+    pci.pInputAssemblyState = &ias;
+    pci.pViewportState      = &vps;
+    pci.pRasterizationState = &ras;
+    pci.pMultisampleState   = &mss;
+    pci.pDepthStencilState  = &dss;
+    pci.pColorBlendState    = &cbs;
+    pci.pDynamicState       = &dyn;
+    pci.layout              = sc.volLayout;
+    pci.renderPass          = sc.rp;
+    pci.subpass             = 0;
+
+    SH_VK_CHECK(vkCreateGraphicsPipelines(sc.dev, VK_NULL_HANDLE, 1, &pci, nullptr, &sc.volPipe));
 }
 
 /* ================================================================ */
@@ -963,39 +1172,269 @@ static void upload_src(ShowCtx& sc, const std::vector<float>& lines) {
     sc.srcPtCnt = (uint32_t)(lines.size() / 3);
 }
 
-static void upload_button(ShowCtx& sc, int state) {
-    (void)state;
-    sc.btnVB.destroy();
+/* One-shot command buffer helpers for image layout transitions */
+static VkCommandBuffer one_shot_begin(ShowCtx& sc) {
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool        = sc.pool;
+    cai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    SH_VK_CHECK(vkAllocateCommandBuffers(sc.dev, &cai, &cmd));
 
-    /* Button quad in NDC: x=[0.62,0.97].
-     * With the Y-flip viewport (vp.y=H, vp.height=-H), NDC y=-1 → screen bottom.
-     * Use y∈[-0.97,-0.72] so the button appears at the bottom-right of the window.
-     * Hover detection in cb_cursor uses screen-space NDC [0.72,0.97] which maps
-     * to the same screen region. */
-    float x0 = 0.62f, x1 = 0.97f, y0 = -0.97f, y1 = -0.72f, z = 0.5f;
-    /* Play triangle (▶) inside button */
-    float px0 = 0.71f, px1 = 0.88f, pym = (y0 + y1) * 0.5f;
-    float pyt = y0 + (y1 - y0) * 0.2f, pyb = y1 - (y1 - y0) * 0.2f;
-    float pz  = 0.49f; /* slightly in front (smaller z) of button quad */
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    SH_VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+    return cmd;
+}
 
-    /* Each vertex: xyz + normal(0,0,1) — forward-facing for unlit look */
-#define BTN_V(vx,vy,vz) (vx),(vy),(vz), 0.f,0.f,1.f
-    float verts[] = {
-        /* Quad: 2 triangles CW */
-        BTN_V(x0, y0, z),
-        BTN_V(x1, y0, z),
-        BTN_V(x0, y1, z),
-        BTN_V(x1, y0, z),
-        BTN_V(x1, y1, z),
-        BTN_V(x0, y1, z),
-        /* Play triangle CW */
-        BTN_V(px0, pyt, pz),
-        BTN_V(px1, pym, pz),
-        BTN_V(px0, pyb, pz)
+static void one_shot_end(ShowCtx& sc, VkCommandBuffer cmd) {
+    SH_VK_CHECK(vkEndCommandBuffer(cmd));
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &cmd;
+    SH_VK_CHECK(vkQueueSubmit(sc.gq, 1, &si, VK_NULL_HANDLE));
+    SH_VK_CHECK(vkQueueWaitIdle(sc.gq));
+    vkFreeCommandBuffers(sc.dev, sc.pool, 1, &cmd);
+}
+
+static void transition_image(VkCommandBuffer cmd, VkImage img,
+                             VkImageLayout from, VkImageLayout to,
+                             VkAccessFlags srcAccess, VkAccessFlags dstAccess,
+                             VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage) {
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask       = srcAccess;
+    b.dstAccessMask       = dstAccess;
+    b.oldLayout           = from;
+    b.newLayout           = to;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image               = img;
+    b.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+/*
+ * upload_vol — upload ShowVol data to a 3D VkImage and build the descriptor set.
+ *
+ * Data layout in ShowVol::data: column-major, ix fastest (x-axis varies fastest):
+ *   data[ix + iy*nx + iz*nx*ny]  →  voxel (ix, iy, iz)
+ *
+ * This matches Vulkan's buffer-to-3D-image copy layout (width=nx, height=ny, depth=nz),
+ * so the bytes are uploaded as-is without any reordering.
+ */
+static void upload_vol(ShowCtx& sc, const ShowVol& vol) {
+    sc.volReady = false;
+
+    if (vol.data.empty() || vol.nx == 0 || vol.ny == 0 || vol.nz == 0) {
+        return;
+    }
+
+    /* Destroy previous volume resources if any */
+    if (sc.volSampler)  { vkDestroySampler(sc.dev, sc.volSampler, nullptr);  sc.volSampler  = VK_NULL_HANDLE; }
+    if (sc.volImgView)  { vkDestroyImageView(sc.dev, sc.volImgView, nullptr); sc.volImgView  = VK_NULL_HANDLE; }
+    if (sc.volImg)      { vkDestroyImage(sc.dev, sc.volImg, nullptr);         sc.volImg      = VK_NULL_HANDLE; }
+    if (sc.volImgMem)   { vkFreeMemory(sc.dev, sc.volImgMem, nullptr);        sc.volImgMem   = VK_NULL_HANDLE; }
+    if (sc.volPool)     { vkDestroyDescriptorPool(sc.dev, sc.volPool, nullptr); sc.volPool    = VK_NULL_HANDLE; }
+
+    VkDeviceSize dataSize = (VkDeviceSize)vol.nx * vol.ny * vol.nz * sizeof(float);
+
+    /* --- Create 3D image --- */
+    VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType   = VK_IMAGE_TYPE_3D;
+    ici.format      = VK_FORMAT_R32_SFLOAT;
+    ici.extent      = {vol.nx, vol.ny, vol.nz};
+    ici.mipLevels   = 1;
+    ici.arrayLayers = 1;
+    ici.samples     = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling      = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    SH_VK_CHECK(vkCreateImage(sc.dev, &ici, nullptr, &sc.volImg));
+
+    VkMemoryRequirements mreq;
+    vkGetImageMemoryRequirements(sc.dev, sc.volImg, &mreq);
+
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize  = mreq.size;
+    mai.memoryTypeIndex = find_mem(sc.pdev, mreq.memoryTypeBits,
+                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    SH_VK_CHECK(vkAllocateMemory(sc.dev, &mai, nullptr, &sc.volImgMem));
+    SH_VK_CHECK(vkBindImageMemory(sc.dev, sc.volImg, sc.volImgMem, 0));
+
+    /* --- Staging buffer --- */
+    ShowBuf staging = make_buf(sc, dataSize,
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                               vol.data.data());
+
+    /* --- Upload via one-shot command buffer --- */
+    VkCommandBuffer cmd = one_shot_begin(sc);
+
+    transition_image(cmd, sc.volImg,
+                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    VkBufferImageCopy region = {};
+    region.bufferOffset      = 0;
+    region.bufferRowLength   = 0;   /* tightly packed */
+    region.bufferImageHeight = 0;
+    region.imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageOffset       = {0, 0, 0};
+    region.imageExtent       = {vol.nx, vol.ny, vol.nz};
+    vkCmdCopyBufferToImage(cmd, staging.buf, sc.volImg,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    transition_image(cmd, sc.volImg,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+    one_shot_end(sc, cmd);
+    staging.destroy();
+
+    /* --- Image view --- */
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image    = sc.volImg;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_3D;
+    vci.format   = VK_FORMAT_R32_SFLOAT;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    SH_VK_CHECK(vkCreateImageView(sc.dev, &vci, nullptr, &sc.volImgView));
+
+    /* --- Sampler (trilinear, clamp to border=0) --- */
+    VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter    = VK_FILTER_LINEAR;
+    sci.minFilter    = VK_FILTER_LINEAR;
+    sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    sci.borderColor  = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    SH_VK_CHECK(vkCreateSampler(sc.dev, &sci, nullptr, &sc.volSampler));
+
+    /* --- Descriptor pool + set --- */
+    VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+    VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets       = 1;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes    = &poolSize;
+    SH_VK_CHECK(vkCreateDescriptorPool(sc.dev, &dpci, nullptr, &sc.volPool));
+
+    VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsai.descriptorPool     = sc.volPool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts        = &sc.volDSL;
+    SH_VK_CHECK(vkAllocateDescriptorSets(sc.dev, &dsai, &sc.volDS));
+
+    VkDescriptorImageInfo dii = {};
+    dii.sampler     = sc.volSampler;
+    dii.imageView   = sc.volImgView;
+    dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet wds = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    wds.dstSet          = sc.volDS;
+    wds.dstBinding      = 0;
+    wds.descriptorCount = 1;
+    wds.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wds.pImageInfo      = &dii;
+    vkUpdateDescriptorSets(sc.dev, 1, &wds, 0, nullptr);
+
+    memcpy(sc.volOrigin, vol.origin, 12);
+    memcpy(sc.volExtent, vol.extent, 12);
+    sc.volReady = true;
+    printf("[show] Volume %ux%ux%u uploaded (origin %.1f,%.1f,%.1f extent %.1f,%.1f,%.1f)\n",
+           vol.nx, vol.ny, vol.nz,
+           vol.origin[0], vol.origin[1], vol.origin[2],
+           vol.extent[0], vol.extent[1], vol.extent[2]);
+}
+
+
+static void upload_toolbar(ShowCtx& sc) {
+    sc.toolbarVB.destroy();
+    sc.toolbarIconVB.destroy();
+    sc.toolbarVtxCnt    = 0;
+    sc.toolbarIconPtCnt = 0;
+
+    /* Three small buttons at top-right, each 0.09 wide × 0.07 tall, gap 0.01.
+     * NDC y∈[0.90, 0.97] = screen top (Y-flip viewport: NDC +1 = screen top).
+     * Layout (right→left): 2=close [0.88..0.97], 1=run [0.78..0.87], 0=wire [0.68..0.77] */
+    struct Btn { float x0, x1, y0, y1; };
+    const Btn btns[3] = {
+        {0.68f, 0.77f, 0.90f, 0.97f},  /* 0: wireframe toggle */
+        {0.78f, 0.87f, 0.90f, 0.97f},  /* 1: run simulation   */
+        {0.88f, 0.97f, 0.90f, 0.97f},  /* 2: close window     */
     };
-#undef BTN_V
+    const float z = 0.5f, iz = 0.49f;
 
-    sc.btnVB = make_buf(sc, sizeof(verts), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, verts);
+    /* triPipe buffer (stride 24 = xyz + normal):
+     * 3 quads × 6 verts + play icon triangle × 3 verts = 21 verts = 126 floats */
+    float tverts[21 * 6];
+    int   ti = 0;
+
+    for (int k = 0; k < 3; k++) {
+        float x0 = btns[k].x0, x1 = btns[k].x1;
+        float y0 = btns[k].y0, y1 = btns[k].y1;
+        float q[] = {
+            x0,y0,z,0,0,1,  x1,y0,z,0,0,1,  x0,y1,z,0,0,1,
+            x1,y0,z,0,0,1,  x1,y1,z,0,0,1,  x0,y1,z,0,0,1,
+        };
+        memcpy(tverts + ti, q, sizeof(q));
+        ti += 36;
+    }
+
+    /* Play icon (▶) in button 1 */
+    {
+        const Btn& b = btns[1];
+        float pw = b.x1 - b.x0, ph = b.y1 - b.y0;
+        float px0 = b.x0 + pw * 0.25f, px1 = b.x0 + pw * 0.75f;
+        float pym = (b.y0 + b.y1) * 0.5f;
+        float pyt = b.y0 + ph * 0.2f, pyb = b.y1 - ph * 0.2f;
+        float tri[] = {
+            px0,pyt,iz,0,0,1,  px1,pym,iz,0,0,1,  px0,pyb,iz,0,0,1,
+        };
+        memcpy(tverts + ti, tri, sizeof(tri));
+        ti += 18;
+    }
+
+    sc.toolbarVB = make_buf(sc, (size_t)ti * sizeof(float),
+                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, tverts);
+    sc.toolbarVtxCnt = (uint32_t)(ti / 6);
+
+    /* linePipe icon buffer (stride 12 = xyz only):
+     * wireframe icon: 4 line segs = 8 pts; close icon: 2 line segs = 4 pts; total 12 pts */
+    float iverts[12 * 3];
+    int   ii = 0;
+
+    /* Wireframe icon in button 0: small square outline */
+    {
+        const Btn& b  = btns[0];
+        float hw = (b.x1 - b.x0) * 0.32f, hh = (b.y1 - b.y0) * 0.32f;
+        float cx = (b.x0 + b.x1) * 0.5f,   cy = (b.y0 + b.y1) * 0.5f;
+        float ix0 = cx - hw, ix1 = cx + hw, iy0 = cy - hh, iy1 = cy + hh;
+        /* top, bottom, left, right */
+        iverts[ii++]=ix0; iverts[ii++]=iy0; iverts[ii++]=iz;
+        iverts[ii++]=ix1; iverts[ii++]=iy0; iverts[ii++]=iz;
+        iverts[ii++]=ix0; iverts[ii++]=iy1; iverts[ii++]=iz;
+        iverts[ii++]=ix1; iverts[ii++]=iy1; iverts[ii++]=iz;
+        iverts[ii++]=ix0; iverts[ii++]=iy0; iverts[ii++]=iz;
+        iverts[ii++]=ix0; iverts[ii++]=iy1; iverts[ii++]=iz;
+        iverts[ii++]=ix1; iverts[ii++]=iy0; iverts[ii++]=iz;
+        iverts[ii++]=ix1; iverts[ii++]=iy1; iverts[ii++]=iz;
+    }
+
+    /* Close icon in button 2: X (two diagonals) */
+    {
+        const Btn& b  = btns[2];
+        float hw = (b.x1 - b.x0) * 0.28f, hh = (b.y1 - b.y0) * 0.28f;
+        float cx = (b.x0 + b.x1) * 0.5f,   cy = (b.y0 + b.y1) * 0.5f;
+        iverts[ii++]=cx-hw; iverts[ii++]=cy-hh; iverts[ii++]=iz;
+        iverts[ii++]=cx+hw; iverts[ii++]=cy+hh; iverts[ii++]=iz;
+        iverts[ii++]=cx+hw; iverts[ii++]=cy-hh; iverts[ii++]=iz;
+        iverts[ii++]=cx-hw; iverts[ii++]=cy+hh; iverts[ii++]=iz;
+    }
+
+    sc.toolbarIconVB = make_buf(sc, (size_t)ii * sizeof(float),
+                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, iverts);
+    sc.toolbarIconPtCnt = (uint32_t)(ii / 3);
 }
 
 /* ================================================================ */
@@ -1005,7 +1444,9 @@ static void upload_button(ShowCtx& sc, int state) {
 static uint32_t g_frame_count = 0;
 
 /* Returns false if the device is lost (e.g. GPU watchdog fired during simulation). */
-static bool draw_frame(ShowCtx& sc, const Camera& cam, int state, bool has_traj) {
+static bool draw_frame(ShowCtx& sc, const Camera& cam, int state, bool has_traj,
+                       bool wireframe = false, int toolbarHovered = -1,
+                       bool use_mip = false) {
     int frame = (int)(g_frame_count % (uint32_t)ShowCtx::FRAMES);
 
     vkWaitForFences(sc.dev, 1, &sc.fence[frame], VK_TRUE, UINT64_MAX);
@@ -1060,16 +1501,50 @@ static bool draw_frame(ShowCtx& sc, const Camera& cam, int state, bool has_traj)
     VkRect2D scissor = {{0, 0}, sc.ext};
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    /* --- Draw mesh (semi-transparent triangles) --- */
+    /* --- Draw volume (ray-marched fluence, rendered first as background) --- */
+    if (sc.volReady && sc.volPipe && sc.volDS) {
+        float mvp[16], inv[16];
+        cam.mvp(mvp);
+        float eye[3];
+        cam.eye_pos(eye);
+
+        VolPC vpc = {};
+        m4_inv(inv, mvp);
+        memcpy(vpc.inv_mvp, inv, 64);
+        vpc.cam_logmin[0]    = eye[0];
+        vpc.cam_logmin[1]    = eye[1];
+        vpc.cam_logmin[2]    = eye[2];
+        vpc.cam_logmin[3]    = 0.f;   /* log_min — already baked into normalised texture */
+        vpc.origin_logmax[0] = sc.volOrigin[0];
+        vpc.origin_logmax[1] = sc.volOrigin[1];
+        vpc.origin_logmax[2] = sc.volOrigin[2];
+        vpc.origin_logmax[3] = 1.f;   /* log_max */
+        vpc.extent_opacity[0] = sc.volExtent[0];
+        vpc.extent_opacity[1] = sc.volExtent[1];
+        vpc.extent_opacity[2] = sc.volExtent[2];
+        vpc.extent_opacity[3] = 8.f;  /* opacity scale — tune for visibility */
+        vpc.use_mip  = use_mip ? 1 : 0;
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sc.volPipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sc.volLayout,
+                                0, 1, &sc.volDS, 0, nullptr);
+        vkCmdPushConstants(cmd, sc.volLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, 128, &vpc);
+        vkCmdDraw(cmd, 6, 1, 0, 0); /* fullscreen quad — no vertex buffer */
+    }
+
+    /* --- Draw mesh (semi-transparent triangles, or wireframe if toggled) --- */
     if (sc.meshIdxCnt > 0 && sc.meshVB.buf) {
         ShowPC pc;
         cam.mvp(pc.mvp);
         pc.color[0] = 0.5f;
         pc.color[1] = 0.7f;
         pc.color[2] = 1.0f;
-        pc.color[3] = 0.25f;
+        pc.color[3] = wireframe ? 0.8f : 0.25f;
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sc.triPipe);
+        VkPipeline meshPipe = (wireframe && sc.wirePipe) ? sc.wirePipe : sc.triPipe;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipe);
         vkCmdPushConstants(cmd, sc.playout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, 80, &pc);
@@ -1115,59 +1590,78 @@ static bool draw_frame(ShowCtx& sc, const Camera& cam, int state, bool has_traj)
         vkCmdDraw(cmd, sc.trajPtCnt, 1, 0, 0);
     }
 
-    /* --- Draw button in NDC space (identity MVP) --- */
-    if (sc.btnVB.buf) {
+    /* --- Draw toolbar buttons (top-right corner) --- */
+    if (sc.toolbarVB.buf && sc.toolbarVtxCnt > 0) {
         ShowPC pc;
         m4_id(pc.mvp);
 
-        /* State colors for background quad */
-        if (state == 0) {
-            pc.color[0] = 0.2f;
-            pc.color[1] = 0.75f;
-            pc.color[2] = 0.2f;
-            pc.color[3] = 0.85f;
-        } else if (state == 1) {
-            pc.color[0] = 0.8f;
-            pc.color[1] = 0.7f;
-            pc.color[2] = 0.1f;
-            pc.color[3] = 0.85f;
-        } else {
-            pc.color[0] = 0.2f;
-            pc.color[1] = 0.5f;
-            pc.color[2] = 0.9f;
-            pc.color[3] = 0.85f;
-        }
+        /* Per-button background colors */
+        float bclr[3][4];
+        /* Button 0: wireframe toggle — teal when active, grey otherwise */
+        bclr[0][0] = wireframe ? 0.15f : 0.25f;
+        bclr[0][1] = wireframe ? 0.75f : 0.25f;
+        bclr[0][2] = wireframe ? 0.75f : 0.25f;
+        bclr[0][3] = 0.85f;
+        /* Button 1: run — mirrors big button state colors */
+        bclr[1][0] = (state == 0) ? 0.2f  : (state == 1) ? 0.8f : 0.2f;
+        bclr[1][1] = (state == 0) ? 0.75f : (state == 1) ? 0.7f : 0.5f;
+        bclr[1][2] = (state == 0) ? 0.2f  : (state == 1) ? 0.1f : 0.9f;
+        bclr[1][3] = 0.85f;
+        /* Button 2: close — dark red */
+        bclr[2][0] = 0.5f; bclr[2][1] = 0.1f; bclr[2][2] = 0.1f; bclr[2][3] = 0.85f;
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sc.triPipe);
-        vkCmdPushConstants(cmd, sc.playout,
-                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                           0, 80, &pc);
         VkDeviceSize off = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &sc.btnVB.buf, &off);
-        vkCmdDraw(cmd, 6, 1, 0, 0); /* quad: 6 verts */
+        vkCmdBindVertexBuffers(cmd, 0, 1, &sc.toolbarVB.buf, &off);
 
-        /* Play icon — darker shade */
-        if (state == 0) {
-            pc.color[0] = 0.05f;
-            pc.color[1] = 0.4f;
-            pc.color[2] = 0.05f;
-            pc.color[3] = 1.0f;
-        } else if (state == 1) {
-            pc.color[0] = 0.5f;
-            pc.color[1] = 0.4f;
-            pc.color[2] = 0.02f;
-            pc.color[3] = 1.0f;
-        } else {
-            pc.color[0] = 0.05f;
-            pc.color[1] = 0.2f;
-            pc.color[2] = 0.6f;
-            pc.color[3] = 1.0f;
+        for (int k = 0; k < 3; k++) {
+            pc.color[0] = bclr[k][0];
+            pc.color[1] = bclr[k][1];
+            pc.color[2] = bclr[k][2];
+            pc.color[3] = bclr[k][3];
+
+            if (toolbarHovered == k) {
+                pc.color[0] = std::min(1.f, pc.color[0] + 0.2f);
+                pc.color[1] = std::min(1.f, pc.color[1] + 0.2f);
+                pc.color[2] = std::min(1.f, pc.color[2] + 0.2f);
+            }
+
+            vkCmdPushConstants(cmd, sc.playout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, 80, &pc);
+            vkCmdDraw(cmd, 6, 1, (uint32_t)(k * 6), 0);
         }
 
+        /* Play icon (▶) for run button — darker shade */
+        pc.color[0] = (state == 0) ? 0.05f : (state == 1) ? 0.5f  : 0.05f;
+        pc.color[1] = (state == 0) ? 0.4f  : (state == 1) ? 0.4f  : 0.2f;
+        pc.color[2] = (state == 0) ? 0.05f : (state == 1) ? 0.02f : 0.6f;
+        pc.color[3] = 1.0f;
         vkCmdPushConstants(cmd, sc.playout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, 80, &pc);
-        vkCmdDraw(cmd, 3, 1, 6, 0); /* play triangle: 3 verts starting at vertex 6 */
+        vkCmdDraw(cmd, 3, 1, 18, 0); /* play icon: 3 verts at vertex offset 18 */
+
+        /* Toolbar line icons */
+        if (sc.toolbarIconVB.buf && sc.toolbarIconPtCnt > 0) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sc.linePipe);
+            VkDeviceSize ioff = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &sc.toolbarIconVB.buf, &ioff);
+
+            /* Wireframe icon (square outline) — light blue */
+            pc.color[0] = 0.8f; pc.color[1] = 0.95f; pc.color[2] = 1.0f; pc.color[3] = 1.0f;
+            vkCmdPushConstants(cmd, sc.playout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, 80, &pc);
+            vkCmdDraw(cmd, 8, 1, 0, 0);
+
+            /* Close icon (X) — light red */
+            pc.color[0] = 1.0f; pc.color[1] = 0.7f; pc.color[2] = 0.7f; pc.color[3] = 1.0f;
+            vkCmdPushConstants(cmd, sc.playout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, 80, &pc);
+            vkCmdDraw(cmd, 4, 1, 8, 0);
+        }
     }
 
     vkCmdEndRenderPass(cmd);
@@ -1216,11 +1710,13 @@ struct InputState {
     bool   leftDown = false, rightDown = false;
     double lastX = 0, lastY = 0;
     float  dYaw = 0, dPitch = 0, dScroll = 0;
-    bool   startSim = false, btnHovered = false;
+    bool   startSim = false, toggleMip = false;
     double mouseX = 0, mouseY = 0;
     bool   clicked = false;
     int    W = 1280, H = 720;
     bool   resized = false;
+    int    toolbarHovered = -1;  /* -1=none, 0=wireframe, 1=run, 2=close */
+    int    toolbarClicked = -1;
 };
 
 static void cb_cursor(GLFWwindow* win, double x, double y) {
@@ -1237,10 +1733,16 @@ static void cb_cursor(GLFWwindow* win, double x, double y) {
     inp->lastX = x;
     inp->lastY = y;
 
-    /* Check button hover: NDC x=[0.62,0.97], y=[0.72,0.97] */
+    /* NDC from GLFW screen coords (GLFW y=0 at top; with Y-flip viewport, NDC +1 = screen top) */
     double nx = (x / inp->W) * 2.0 - 1.0;
     double ny = (y / inp->H) * 2.0 - 1.0;
-    inp->btnHovered = (nx >= 0.62 && nx <= 0.97 && ny >= 0.72 && ny <= 0.97);
+    /* Toolbar buttons: vertex NDC y=[0.90,0.97] → screen top → GLFW ny≈[-0.97,-0.90] */
+    inp->toolbarHovered = -1;
+    if (ny >= -0.97 && ny <= -0.90) {
+        if      (nx >= 0.68 && nx <= 0.77) { inp->toolbarHovered = 0; }
+        else if (nx >= 0.78 && nx <= 0.87) { inp->toolbarHovered = 1; }
+        else if (nx >= 0.88 && nx <= 0.97) { inp->toolbarHovered = 2; }
+    }
 }
 
 static void cb_mouse_btn(GLFWwindow* win, int btn, int action, int /*mods*/) {
@@ -1249,8 +1751,8 @@ static void cb_mouse_btn(GLFWwindow* win, int btn, int action, int /*mods*/) {
     if (btn == GLFW_MOUSE_BUTTON_LEFT) {
         inp->leftDown = (action == GLFW_PRESS);
 
-        if (action == GLFW_PRESS && inp->btnHovered) {
-            inp->clicked = true;
+        if (action == GLFW_PRESS && inp->toolbarHovered >= 0) {
+            inp->toolbarClicked = inp->toolbarHovered;
         }
     }
 
@@ -1274,6 +1776,10 @@ static void cb_key(GLFWwindow* win, int key, int /*scancode*/, int action, int /
 
         if (key == GLFW_KEY_ESCAPE) {
             glfwSetWindowShouldClose(win, GLFW_TRUE);
+        }
+
+        if (key == GLFW_KEY_M) {
+            inp->toggleMip = true;
         }
     }
 }
@@ -1350,8 +1856,21 @@ static void destroy_viewer(ShowCtx& sc) {
     sc.meshVB.destroy();
     sc.meshIB.destroy();
     sc.trajVB.destroy();
-    sc.btnVB.destroy();
     sc.srcVB.destroy();
+    sc.toolbarVB.destroy();
+    sc.toolbarIconVB.destroy();
+
+    /* Volume resources */
+    if (sc.volSampler)  vkDestroySampler(sc.dev, sc.volSampler, nullptr);
+    if (sc.volImgView)  vkDestroyImageView(sc.dev, sc.volImgView, nullptr);
+    if (sc.volImg)      vkDestroyImage(sc.dev, sc.volImg, nullptr);
+    if (sc.volImgMem)   vkFreeMemory(sc.dev, sc.volImgMem, nullptr);
+    if (sc.volPool)     vkDestroyDescriptorPool(sc.dev, sc.volPool, nullptr);
+    if (sc.volPipe)     vkDestroyPipeline(sc.dev, sc.volPipe, nullptr);
+    if (sc.volLayout)   vkDestroyPipelineLayout(sc.dev, sc.volLayout, nullptr);
+    if (sc.volDSL)      vkDestroyDescriptorSetLayout(sc.dev, sc.volDSL, nullptr);
+    if (sc.fsm_vol)     vkDestroyShaderModule(sc.dev, sc.fsm_vol, nullptr);
+    if (sc.vsm_vol)     vkDestroyShaderModule(sc.dev, sc.vsm_vol, nullptr);
 
     for (int i = 0; i < ShowCtx::FRAMES; i++) {
         vkDestroyFence(sc.dev, sc.fence[i], nullptr);
@@ -1361,6 +1880,10 @@ static void destroy_viewer(ShowCtx& sc) {
 
     if (sc.pool) {
         vkDestroyCommandPool(sc.dev, sc.pool, nullptr);
+    }
+
+    if (sc.wirePipe) {
+        vkDestroyPipeline(sc.dev, sc.wirePipe, nullptr);
     }
 
     if (sc.linePipe) {
@@ -1436,9 +1959,13 @@ void run_viewer(const ShowMesh& mesh, std::function<ShowTraj()> simulate,
 
     ShowCtx sc;
     init_viewer(sc, win, (uint32_t)WIN_W, (uint32_t)WIN_H);
+    init_vol_pipeline(sc);
     upload_mesh(sc, mesh);
     upload_src(sc, mesh.src_lines);
-    upload_button(sc, 0);
+    upload_toolbar(sc);
+    if (!mesh.vol.data.empty()) {
+        upload_vol(sc, mesh.vol);
+    }
 
     Camera cam;
     cam.cx = mesh.cx;
@@ -1450,12 +1977,13 @@ void run_viewer(const ShowMesh& mesh, std::function<ShowTraj()> simulate,
 
     int state = initial_traj ? 2 : 0; /* 0=waiting, 1=running, 2=done */
     bool has_traj = (initial_traj != nullptr);
+    bool wireframe = false;
+    bool use_mip   = false;
     ShowTraj traj;
 
     if (initial_traj) {
         traj = *initial_traj;
         upload_traj(sc, traj);
-        upload_button(sc, 2);
     }
 
     g_frame_count = 0;
@@ -1488,14 +2016,36 @@ void run_viewer(const ShowMesh& mesh, std::function<ShowTraj()> simulate,
         cam.dist   = clampf(cam.dist, mesh.radius * 0.1f, mesh.radius * 10.f);
         inp.dYaw = inp.dPitch = inp.dScroll = 0;
 
+        /* M key: toggle MIP / compositing volume rendering mode */
+        if (inp.toggleMip) {
+            use_mip = !use_mip;
+            inp.toggleMip = false;
+            glfwSetWindowTitle(win, use_mip ? "rtmmc-vulkan | Volume MIP (M=toggle)"
+                                            : "rtmmc-vulkan | Volume compositing (M=toggle)");
+        }
+
+        /* Handle toolbar button clicks */
+        if (inp.toolbarClicked >= 0) {
+            int tc = inp.toolbarClicked;
+            inp.toolbarClicked = -1;
+
+            if (tc == 0) {                             /* wireframe toggle */
+                wireframe = !wireframe;
+            } else if (tc == 1) {                      /* run simulation */
+                inp.startSim = true;
+            } else if (tc == 2) {                      /* close window */
+                glfwSetWindowShouldClose(win, GLFW_TRUE);
+            }
+        }
+
         /* Check if simulation should start */
         if ((inp.startSim || inp.clicked) && state == 0 && simulate) {
             state = 1;
             glfwSetWindowTitle(win, "rtmmc-vulkan | Running simulation...");
-            upload_button(sc, 1);
+            /* state change reflected in toolbar color — no separate button buffer */
 
             /* Show the "running" state before blocking */
-            if (!draw_frame(sc, cam, state, has_traj)) {
+            if (!draw_frame(sc, cam, state, has_traj, wireframe, inp.toolbarHovered, use_mip)) {
                 glfwSetWindowShouldClose(win, GLFW_TRUE);
                 goto done;
             }
@@ -1512,14 +2062,13 @@ void run_viewer(const ShowMesh& mesh, std::function<ShowTraj()> simulate,
             }
 
             state = 2;
-            upload_button(sc, 2);
             glfwSetWindowTitle(win, "rtmmc-vulkan | Simulation done - rotate to inspect");
         }
 
         inp.startSim = false;
         inp.clicked  = false;
 
-        if (!draw_frame(sc, cam, state, has_traj)) {
+        if (!draw_frame(sc, cam, state, has_traj, wireframe, inp.toolbarHovered, use_mip)) {
             /* GPU device lost (watchdog). Close the window; trajectory was saved to disk. */
             glfwSetWindowShouldClose(win, GLFW_TRUE);
             continue;

@@ -46,7 +46,8 @@ GLFW_LIB  ?= $(shell pkg-config --libs   glfw3 2>/dev/null || echo "-L/usr/local
 ifdef SHOW
     CXXFLAGS  += -DUSE_SHOW $(GLFW_INC)
     LDFLAGS   += $(GLFW_LIB)
-    SHOW_DEPS  = vkmmc_show_vert_spv.h vkmmc_show_frag_spv.h
+    SHOW_DEPS  = vkmmc_show_vert_spv.h vkmmc_show_frag_spv.h \
+                 vkmmc_show_vol_vert_spv.h vkmmc_show_vol_frag_spv.h
     HEADERS   += $(SHOW_DEPS)
 endif
 
@@ -90,6 +91,18 @@ vkmmc_show_vert_spv.h: vkmmc_show_vert.spv
 vkmmc_show_frag_spv.h: vkmmc_show_frag.spv
 	xxd -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
 
+vkmmc_show_vol_vert.spv: vkmmc_show_vol.vert
+	glslangValidator --target-env vulkan1.2 -e main -S vert -o $@ $<
+
+vkmmc_show_vol_frag.spv: vkmmc_show_vol.frag
+	glslangValidator --target-env vulkan1.2 -e main -S frag -o $@ $<
+
+vkmmc_show_vol_vert_spv.h: vkmmc_show_vol_vert.spv
+	xxd -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
+
+vkmmc_show_vol_frag_spv.h: vkmmc_show_vol_frag.spv
+	xxd -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
+
 host: $(BINARY)
 
 # Force shader rebuild when flags change
@@ -121,7 +134,9 @@ run: $(BINARY) $(SHADER)
 
 clean:
 	rm -f $(BINARY) $(SHADER) $(SHADER_HEADER) _mc_nvidia.comp .shader_flags *.jdat *.o \
-	    vkmmc_show_vert.spv vkmmc_show_frag.spv vkmmc_show_vert_spv.h vkmmc_show_frag_spv.h
+	    vkmmc_show_vert.spv vkmmc_show_frag.spv vkmmc_show_vert_spv.h vkmmc_show_frag_spv.h \
+	    vkmmc_show_vol_vert.spv vkmmc_show_vol_frag.spv \
+	    vkmmc_show_vol_vert_spv.h vkmmc_show_vol_frag_spv.h
 
 miniz/miniz.c:
 	@echo "Error: miniz.c not found. Download from https://github.com/richgel999/miniz"
