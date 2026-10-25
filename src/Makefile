@@ -114,13 +114,13 @@ vkmmc_show_vol_frag.spv: vkmmc_show_vol.frag
 	$(XXD) -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
 
 test: $(BINARY)
-	cd ../test && ./testvkmmc.sh ../bin/vkmmc
+	cd ../tests && ./test_vkmmc.sh ../bin/vkmmc
 
 unittest:
-	$(MAKE) -C ../test/unit run
+	$(MAKE) -C ../tests/unit run
 
 fuzz:
-	$(MAKE) -C ../test/fuzz
+	$(MAKE) -C ../tests/fuzz
 
 listgpu: $(BINARY)
 	$(BINARY) -L
