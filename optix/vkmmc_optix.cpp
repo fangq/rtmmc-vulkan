@@ -1,15 +1,11 @@
 /*
  * vkmmc_optix.cpp — OptiX 7 host for surface-based MC photon transport
  *
- * Reuses vkmmc_io.h, vkmmc_shapes.h, vkmmc_curvature.h for JSON I/O,
- * shape triangulation, and curvature computation.
- *
- * Build (adjust paths as needed):
- *   nvcc -ptx -o vkmmc_optix_core.ptx vkmmc_optix_core.cu \
- *        -I/path/to/optix/include -I/path/to/sutil
- *   g++ -std=c++14 -O2 -o vkmmc_optix vkmmc_optix.cpp miniz.c \
- *        -I. -Iminiz -I/path/to/optix/include \
- *        -lcuda -lcudart -loptix
+ * Shares the input parsing, shape triangulation, curvature, output and
+ * command line handling with the Vulkan front-end (../src/vkmmc_host.h).
+ * The kernel variants (mesh, CSG, CSG+curvature) are compiled to PTX from
+ * vkmmc_optix_core.cu and embedded in the binary; the variant matching the
+ * input is picked at run time. Build with 'make'.
  *
  * Usage: same as vkmmc
  *   ./vkmmc_optix input.json
@@ -37,29 +33,26 @@
 #include <string>
 #include <sstream>
 
-#include "vkmmc_io.h"
-#include "vkmmc_shapes.h"
-#include "vkmmc_curvature.h"
+#include "vkmmc_host.h"
+#include "vkmmc_optix_ptx.h"
 
 /* ================================================================ */
 /*                  CUDA / OptiX error checking                     */
 /* ================================================================ */
 
 #define CUDA_CHECK(call) do { \
-        cudaError_t rc = call; \
-        if (rc != cudaSuccess) { \
-            fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(rc), __FILE__, __LINE__); \
-            exit(1); \
+        cudaError_t rc_ = call; \
+        if (rc_ != cudaSuccess) { \
+            throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(rc_) + " in " + #call); \
         } \
-    } while(0)
+    } while (0)
 
 #define OPTIX_CHECK(call) do { \
-        OptixResult res = call; \
-        if (res != OPTIX_SUCCESS) { \
-            fprintf(stderr, "OptiX error %d at %s:%d\n", (int)res, __FILE__, __LINE__); \
-            exit(1); \
+        OptixResult res_ = call; \
+        if (res_ != OPTIX_SUCCESS) { \
+            throw std::runtime_error(std::string("OptiX error ") + std::to_string((int)res_) + " in " + #call); \
         } \
-    } while(0)
+    } while (0)
 
 /* ================================================================ */
 /*                   GPU data structures                            */
@@ -69,14 +62,11 @@ struct Medium_GPU {
     float mua, mus, g, n;
 };
 
-struct NodeCurv_GPU {
-    float4 vnorm_k1;
-    float4 pdir_k2;
-    float4 node_pos;
-};
+#define MAX_PROP 256    /* must match vkmmc_optix_core.cu */
 
-#define MAX_PROP 256
+static_assert(MAX_PROP >= VKMMC_MAX_MEDIA, "the OptiX kernel must hold every medium");
 
+/* launch parameters; must match VKMMCParam in vkmmc_optix_core.cu */
 struct VKMMCParam {
     OptixTraversableHandle gashandle;
     CUdeviceptr  facebuf;
@@ -123,7 +113,7 @@ struct CUDABuf {
     size_t sz = 0;
     void alloc(size_t n) {
         sz = n;
-        CUDA_CHECK(cudaMalloc(&ptr, n));
+        CUDA_CHECK(cudaMalloc(&ptr, std::max<size_t>(n, 1)));
     }
     void free() {
         if (ptr) {
@@ -149,132 +139,6 @@ struct CUDABuf {
         alloc_upload(v.data(), v.size());
     }
 };
-
-/* ================================================================ */
-/*                       CLI parsing                                */
-/* ================================================================ */
-
-struct CmdOverrides {
-    uint64_t nphoton, batch_size;
-    uint32_t rng_seed, totalthread;
-    float unitinmm;
-    int outputtype, isreflect, isnormalize, gpuid, meshres, docurv;
-    bool listgpu, dumpjson, dumpmesh, debugcurv;
-    std::string session_id, inputfile;
-    CmdOverrides(): nphoton(0), batch_size(UINT64_MAX), rng_seed(0), totalthread(0),
-        unitinmm(0), outputtype(-1), isreflect(-1), isnormalize(-1), gpuid(0),
-        meshres(0), docurv(-1), listgpu(false), dumpjson(false), dumpmesh(false),
-        debugcurv(false) {}
-};
-
-void printhelp(const char* n) {
-    printf("vkmmc_optix - OptiX ray-tracing accelerated surface MC\n"
-           "Usage: %s input.json  OR  %s -f input.json [flags]\n\n"
-           "Flags:\n -f/--input\tJSON file\n -n/--photon\tphoton number\n"
-           " -s/--session\tsession name\n -u/--unitinmm\tvoxel size [1]\n"
-           " -E/--seed\tRNG seed\n -O/--outputtype\tx:energy,f:flux,l:fluence\n"
-           " -b/--reflect\tmismatch [1]\n -U/--normalize\t[1]\n"
-           " -t/--thread\tGPU threads [65536]\n -G/--gpuid\tdevice [0]\n"
-           " -m/--meshres\tshape mesh resolution [24]\n"
-           " -c/--curv\tcurvature [1=on,0=off,-1=auto]\n"
-           " -L/--listgpu\tlist GPUs\n --dumpjson\tdump config\n"
-           " --dumpmesh\tsave mesh JSON\n --debugcurv\texport normal error\n"
-           " -h/--help\n", n, n);
-    exit(0);
-}
-
-SimConfig parse_cmdline(int argc, char** argv, CmdOverrides& ovr) {
-    std::string inputfile;
-
-    if (argc < 2) {
-        printhelp(argv[0]);
-    }
-
-    for (int i = 1; i < argc; i++) {
-        std::string a(argv[i]);
-
-        if ((a == "-f" || a == "--input") && i + 1 < argc) {
-            inputfile = argv[++i];
-        } else if ((a == "-n" || a == "--photon") && i + 1 < argc) {
-            ovr.nphoton = (uint64_t)atof(argv[++i]);
-        } else if ((a == "-s" || a == "--session") && i + 1 < argc) {
-            ovr.session_id = argv[++i];
-        } else if ((a == "-u" || a == "--unitinmm") && i + 1 < argc) {
-            ovr.unitinmm = (float)atof(argv[++i]);
-        } else if ((a == "-E" || a == "--seed") && i + 1 < argc) {
-            ovr.rng_seed = (uint32_t)atoi(argv[++i]);
-        } else if ((a == "-O" || a == "--outputtype") && i + 1 < argc) {
-            char c2 = argv[++i][0];
-            ovr.outputtype = (c2 == 'f' ? 0 : c2 == 'l' ? 1 : 2);
-        } else if ((a == "-b" || a == "--reflect") && i + 1 < argc) {
-            ovr.isreflect = atoi(argv[++i]);
-        } else if ((a == "-U" || a == "--normalize") && i + 1 < argc) {
-            ovr.isnormalize = atoi(argv[++i]);
-        } else if ((a == "-t" || a == "--thread") && i + 1 < argc) {
-            ovr.totalthread = (uint32_t)atoi(argv[++i]);
-        } else if ((a == "-G" || a == "--gpuid") && i + 1 < argc) {
-            ovr.gpuid = atoi(argv[++i]);
-        } else if ((a == "-m" || a == "--meshres") && i + 1 < argc) {
-            ovr.meshres = atoi(argv[++i]);
-        } else if ((a == "-c" || a == "--curv") && i + 1 < argc) {
-            ovr.docurv = atoi(argv[++i]);
-        } else if (a == "-L" || a == "--listgpu") {
-            ovr.listgpu = true;
-        } else if (a == "--dumpjson") {
-            ovr.dumpjson = true;
-        } else if (a == "--dumpmesh") {
-            ovr.dumpmesh = true;
-        } else if (a == "--debugcurv") {
-            ovr.debugcurv = true;
-        } else if (a == "-h" || a == "--help") {
-            printhelp(argv[0]);
-        } else if (a[0] != '-' && inputfile.empty()) {
-            inputfile = a;
-        }
-    }
-
-    if (inputfile.empty()) {
-        fprintf(stderr, "No input JSON\n");
-        printhelp(argv[0]);
-    }
-
-    ovr.inputfile = inputfile;
-    SimConfig cfg = load_json_input(inputfile.c_str());
-
-    if (ovr.nphoton > 0) {
-        cfg.nphoton = ovr.nphoton;
-    }
-
-    if (ovr.rng_seed > 0) {
-        cfg.rng_seed = ovr.rng_seed;
-    }
-
-    if (!ovr.session_id.empty()) {
-        cfg.session_id = ovr.session_id;
-    }
-
-    if (ovr.unitinmm > 0) {
-        cfg.unitinmm = ovr.unitinmm;
-    }
-
-    if (ovr.outputtype >= 0) {
-        cfg.output_type = ovr.outputtype;
-    }
-
-    if (ovr.isreflect >= 0) {
-        cfg.do_mismatch = (ovr.isreflect != 0);
-    }
-
-    if (ovr.isnormalize >= 0) {
-        cfg.do_normalize = (ovr.isnormalize != 0);
-    }
-
-    if (ovr.meshres > 0) {
-        cfg.mesh_res = ovr.meshres;
-    }
-
-    return cfg;
-}
 
 /* ================================================================ */
 /*                         List GPUs                                */
@@ -303,19 +167,39 @@ struct OptixState {
     OptixPipeline pipeline;
     OptixPipelineCompileOptions pipeCompileOpts;
     OptixProgramGroup raygenPG, missPG, hitgroupPG;
+    OptixProgramGroup missCopPG, hitgroupCopPG;   /* ray type 1: coplanar triangle enumeration */
     OptixShaderBindingTable sbt;
     CUDABuf raygenSBT, missSBT, hitgroupSBT;
-    CUDABuf gasBuf, tempBuf;
+    CUDABuf gasBuf;
     OptixTraversableHandle gasHandle;
 };
 
 void optix_log_callback(unsigned int level, const char* tag, const char* msg, void*) {
-    if (level < 4) {
+    if (level < 3) {
         fprintf(stderr, "[OptiX %u][%s]: %s\n", level, tag, msg);
     }
 }
 
-void setup_optix(OptixState& st, int gpuid, const char* ptxfile) {
+/* embedded PTX of a kernel variant, or a user supplied .ptx file */
+static std::string kernel_ptx(int variant, const std::string& ptxfile) {
+    if (!ptxfile.empty()) {
+        std::ifstream f(ptxfile.c_str());
+
+        if (!f) {
+            throw std::runtime_error("cannot open PTX file " + ptxfile);
+        }
+
+        printf("Kernel: %s (user supplied)\n", ptxfile.c_str());
+        return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    }
+
+    static const unsigned char* ptx[KV_COUNT] = {vkmmc_optix_mesh_ptx, vkmmc_optix_csg_ptx, vkmmc_optix_curv_ptx};
+    static const unsigned int len[KV_COUNT] = {vkmmc_optix_mesh_ptx_len, vkmmc_optix_csg_ptx_len, vkmmc_optix_curv_ptx_len};
+    printf("Kernel: %s\n", kernel_variant_name(variant));
+    return std::string((const char*)ptx[variant], len[variant]);
+}
+
+void setup_optix(OptixState& st, int gpuid, int variant, const std::string& ptxfile) {
     CUDA_CHECK(cudaSetDevice(gpuid));
     CUDA_CHECK(cudaFree(0));  /* init CUDA */
     OPTIX_CHECK(optixInit());
@@ -327,20 +211,12 @@ void setup_optix(OptixState& st, int gpuid, const char* ptxfile) {
     ctxOpts.logCallbackLevel = 3;
     OPTIX_CHECK(optixDeviceContextCreate(cuCtx, &ctxOpts, &st.context));
 
-    /* Load PTX */
-    std::ifstream ptxf(ptxfile);
-
-    if (!ptxf) {
-        throw std::runtime_error(std::string("Cannot open PTX: ") + ptxfile);
-    }
-
-    std::string ptxstr((std::istreambuf_iterator<char>(ptxf)),
-                       std::istreambuf_iterator<char>());
+    std::string ptxstr = kernel_ptx(variant, ptxfile);
 
     /* Module */
     OptixModuleCompileOptions modOpts = {};
     modOpts.maxRegisterCount = OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT;
-#ifndef NDEBUG
+#ifdef VKMMC_OPTIX_DEBUG
     modOpts.optLevel = OPTIX_COMPILE_OPTIMIZATION_LEVEL_0;
     modOpts.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_FULL;
 #else
@@ -351,11 +227,8 @@ void setup_optix(OptixState& st, int gpuid, const char* ptxfile) {
     st.pipeCompileOpts = {};
     st.pipeCompileOpts.usesMotionBlur = false;
     st.pipeCompileOpts.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
-#ifdef USE_CSG
-    st.pipeCompileOpts.numPayloadValues = 16;  // 12 photon + 4 RNG
-#else
-    st.pipeCompileOpts.numPayloadValues = 14;  // 10 photon + 4 RNG
-#endif
+    /* photon (10; CSG: +2 media state, +2 coplanar crossing) + 4 RNG words */
+    st.pipeCompileOpts.numPayloadValues = (variant == KV_MESH) ? 14 : 18;
     st.pipeCompileOpts.numAttributeValues = 2;
     st.pipeCompileOpts.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
     st.pipeCompileOpts.pipelineLaunchParamsVariableName = "gcfg";
@@ -364,10 +237,6 @@ void setup_optix(OptixState& st, int gpuid, const char* ptxfile) {
     size_t logsz = sizeof(log);
     OPTIX_CHECK(optixModuleCreateFromPTX(st.context, &modOpts, &st.pipeCompileOpts,
                                          ptxstr.c_str(), ptxstr.size(), log, &logsz, &st.module));
-
-    if (logsz > 1) {
-        printf("Module log: %s\n", log);
-    }
 
     /* Program groups */
     OptixProgramGroupOptions pgOpts = {};
@@ -393,35 +262,67 @@ void setup_optix(OptixState& st, int gpuid, const char* ptxfile) {
     logsz = sizeof(log);
     OPTIX_CHECK(optixProgramGroupCreate(st.context, &hgDesc, 1, &pgOpts, log, &logsz, &st.hitgroupPG));
 
+    OptixProgramGroupDesc mcDesc = {};
+    mcDesc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
+    mcDesc.miss.module = st.module;
+    mcDesc.miss.entryFunctionName = "__miss__coplanar";
+    logsz = sizeof(log);
+    OPTIX_CHECK(optixProgramGroupCreate(st.context, &mcDesc, 1, &pgOpts, log, &logsz, &st.missCopPG));
+
+    OptixProgramGroupDesc hcDesc = {};
+    hcDesc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+    hcDesc.hitgroup.moduleAH = st.module;
+    hcDesc.hitgroup.entryFunctionNameAH = "__anyhit__coplanar";
+    logsz = sizeof(log);
+    OPTIX_CHECK(optixProgramGroupCreate(st.context, &hcDesc, 1, &pgOpts, log, &logsz, &st.hitgroupCopPG));
+
     /* Pipeline */
-    OptixProgramGroup pgs[] = { st.raygenPG, st.missPG, st.hitgroupPG };
+    OptixProgramGroup pgs[] = { st.raygenPG, st.missPG, st.hitgroupPG, st.missCopPG, st.hitgroupCopPG };
     OptixPipelineLinkOptions linkOpts = {};
     linkOpts.maxTraceDepth = 1;
     logsz = sizeof(log);
     OPTIX_CHECK(optixPipelineCreate(st.context, &st.pipeCompileOpts, &linkOpts,
-                                    pgs, 3, log, &logsz, &st.pipeline));
+                                    pgs, 5, log, &logsz, &st.pipeline));
 
     /* SBT */
     RaygenRecord rg;
     OPTIX_CHECK(optixSbtRecordPackHeader(st.raygenPG, &rg));
     st.raygenSBT.alloc_upload(&rg, 1);
 
-    MissRecord ms;
-    OPTIX_CHECK(optixSbtRecordPackHeader(st.missPG, &ms));
-    st.missSBT.alloc_upload(&ms, 1);
+    /* record 0: photon transport, record 1: coplanar triangle enumeration */
+    MissRecord ms[2];
+    OPTIX_CHECK(optixSbtRecordPackHeader(st.missPG, &ms[0]));
+    OPTIX_CHECK(optixSbtRecordPackHeader(st.missCopPG, &ms[1]));
+    st.missSBT.alloc_upload(ms, 2);
 
-    HitgroupRecord hg;
-    OPTIX_CHECK(optixSbtRecordPackHeader(st.hitgroupPG, &hg));
-    st.hitgroupSBT.alloc_upload(&hg, 1);
+    HitgroupRecord hg[2];
+    OPTIX_CHECK(optixSbtRecordPackHeader(st.hitgroupPG, &hg[0]));
+    OPTIX_CHECK(optixSbtRecordPackHeader(st.hitgroupCopPG, &hg[1]));
+    st.hitgroupSBT.alloc_upload(hg, 2);
 
     st.sbt = {};
     st.sbt.raygenRecord = st.raygenSBT.d_ptr();
     st.sbt.missRecordBase = st.missSBT.d_ptr();
     st.sbt.missRecordStrideInBytes = sizeof(MissRecord);
-    st.sbt.missRecordCount = 1;
+    st.sbt.missRecordCount = 2;
     st.sbt.hitgroupRecordBase = st.hitgroupSBT.d_ptr();
     st.sbt.hitgroupRecordStrideInBytes = sizeof(HitgroupRecord);
-    st.sbt.hitgroupRecordCount = 1;
+    st.sbt.hitgroupRecordCount = 2;
+}
+
+void destroy_optix(OptixState& st) {
+    st.gasBuf.free();
+    st.raygenSBT.free();
+    st.missSBT.free();
+    st.hitgroupSBT.free();
+    optixPipelineDestroy(st.pipeline);
+    optixProgramGroupDestroy(st.raygenPG);
+    optixProgramGroupDestroy(st.missPG);
+    optixProgramGroupDestroy(st.hitgroupPG);
+    optixProgramGroupDestroy(st.missCopPG);
+    optixProgramGroupDestroy(st.hitgroupCopPG);
+    optixModuleDestroy(st.module);
+    optixDeviceContextDestroy(st.context);
 }
 
 /* ================================================================ */
@@ -432,14 +333,7 @@ void build_gas(OptixState& st, const std::vector<Vec3>& nodes,
                const std::vector<std::array<uint32_t, 3>>& faces) {
     CUDABuf vertBuf, idxBuf;
     vertBuf.alloc_upload(nodes.data(), nodes.size());
-
-    std::vector<uint3> idx3(faces.size());
-
-    for (size_t i = 0; i < faces.size(); i++) {
-        idx3[i] = make_uint3(faces[i][0], faces[i][1], faces[i][2]);
-    }
-
-    idxBuf.alloc_upload(idx3.data(), idx3.size());
+    idxBuf.alloc_upload(faces.data(), faces.size());
 
     OptixBuildInput triInput = {};
     triInput.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
@@ -449,10 +343,11 @@ void build_gas(OptixState& st, const std::vector<Vec3>& nodes,
     triInput.triangleArray.numVertices = (unsigned)nodes.size();
     triInput.triangleArray.vertexBuffers = &dv;
     triInput.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
-    triInput.triangleArray.indexStrideInBytes = sizeof(uint3);
+    triInput.triangleArray.indexStrideInBytes = sizeof(uint32_t) * 3;
     triInput.triangleArray.numIndexTriplets = (unsigned)faces.size();
     triInput.triangleArray.indexBuffer = di;
-    uint32_t flags = OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT;
+    /* any-hit stays enabled for ray type 1; transport rays disable it per ray */
+    uint32_t flags = OPTIX_GEOMETRY_FLAG_NONE;
     triInput.triangleArray.flags = &flags;
     triInput.triangleArray.numSbtRecords = 1;
 
@@ -495,67 +390,18 @@ void build_gas(OptixState& st, const std::vector<Vec3>& nodes,
 }
 
 /* ================================================================ */
-/*                            Main                                  */
+/*                         Simulation                               */
 /* ================================================================ */
 
-int main(int argc, char** argv) {
-    const char* ptxFile = "vkmmc_optix_core.ptx";
+static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOverrides& ovr) {
+    int ndev = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&ndev));
 
-    /* Check for PTX file override */
-    if (argc > 2) {
-        std::string la(argv[argc - 1]);
-
-        if (la.size() > 4 && la.substr(la.size() - 4) == ".ptx") {
-            ptxFile = argv[--argc];
-        }
+    if (ovr.gpuid < 0 || ovr.gpuid >= ndev) {
+        throw std::runtime_error("-G " + std::to_string(ovr.gpuid) + ": only " + std::to_string(ndev) +
+                                 " CUDA device(s) found (run with -L to list them)");
     }
 
-    for (int i = 1; i < argc; i++) {
-        std::string a(argv[i]);
-
-        if (a == "-L" || a == "--listgpu") {
-            list_gpus();
-            return 0;
-        }
-    }
-
-    CmdOverrides ovr;
-    SimConfig cfg = parse_cmdline(argc, argv, ovr);
-
-    /* ---- Phase 1: Generate CSG mesh ---- */
-    std::vector<NodeCurvature> curvData;
-    bool has_curvature = false;
-    bool want_curvature = (ovr.docurv < 0) ? true : (ovr.docurv != 0);
-
-    if (cfg.is_csg) {
-        std::ifstream sf(ovr.inputfile.c_str());
-        json jroot;
-        sf >> jroot;
-
-        if (jroot.contains("Shapes") && jroot["Shapes"].is_array()) {
-            float ext[6] = {0, 60, 0, 60, 0, 60};
-            ShapeMesh sm = parse_shapes(jroot["Shapes"], ext, cfg.mesh_res);
-            cfg.nodes = sm.nodes;
-            cfg.faces = sm.faces;
-            cfg.facedata = sm.facedata;
-            cfg.face_shape_id = sm.shape_id;
-            update_bbox(cfg);
-
-            if (want_curvature) {
-                auto origins = extract_shape_origins(jroot["Shapes"]);
-                curvData = compute_curvature(sm, origins);
-                has_curvature = true;
-                printf("Curvature: %zu nodes, %zu shapes\n", curvData.size(), origins.size());
-            }
-        }
-
-        if (cfg.nodes.empty()) {
-            fprintf(stderr, "CSG: no shapes\n");
-            return 1;
-        }
-    }
-
-    /* ---- Phase 2: Setup OptiX ---- */
     CUDA_CHECK(cudaSetDevice(ovr.gpuid));
     {
         cudaDeviceProp p;
@@ -563,125 +409,63 @@ int main(int argc, char** argv) {
         printf("GPU: %s (SM %d.%d)\n", p.name, p.major, p.minor);
     }
 
-    OptixState optix;
-    setup_optix(optix, ovr.gpuid, ptxFile);
+    if (cfg.debuglevel & VKMMC_DEBUG_TRAJ) {
+        printf("WARNING: trajectory output (-D M) is only supported by the Vulkan backend\n");
+    }
 
-    /* Build GAS */
+    OptixState optix;
+    setup_optix(optix, ovr.gpuid, st.variant, ovr.kernelfile);
     build_gas(optix, cfg.nodes, cfg.faces);
 
-    /* ---- Phase 3: Prepare buffers ---- */
-
-    /* Face buffer: interleaved */
+    /* Face buffer: interleaved [normal+media, vertex indices] */
     struct FaceGPU {
-        float nx, ny, nz, pm, v0f, v1f, v2f, pad;
+        float nx, ny, nz, pm;
+        uint32_t v0, v1, v2, pad;
     };
     std::vector<FaceGPU> faceGpu(cfg.faces.size());
 
     for (size_t i = 0; i < cfg.faces.size(); i++) {
-        faceGpu[i].nx = cfg.facedata[i].nx;
-        faceGpu[i].ny = cfg.facedata[i].ny;
-        faceGpu[i].nz = cfg.facedata[i].nz;
-        faceGpu[i].pm = cfg.facedata[i].packed_media;
-        uint32_t v0 = cfg.faces[i][0], v1 = cfg.faces[i][1], v2 = cfg.faces[i][2];
-        memcpy(&faceGpu[i].v0f, &v0, 4);
-        memcpy(&faceGpu[i].v1f, &v1, 4);
-        memcpy(&faceGpu[i].v2f, &v2, 4);
-        faceGpu[i].pad = 0;
+        faceGpu[i] = {cfg.facedata[i].nx, cfg.facedata[i].ny, cfg.facedata[i].nz, cfg.facedata[i].packed_media,
+                      cfg.faces[i][0], cfg.faces[i][1], cfg.faces[i][2], 0
+                     };
     }
 
     CUDABuf faceBuf;
     faceBuf.alloc_upload(faceGpu);
 
-    // Curvature buffer - ALWAYS allocate cfg.nodes.size() elements
-    /* Curvature buffer */
+    /* Curvature buffer: 3 x float4 per node */
     struct GpuNodeCurv {
         float nx, ny, nz, k1, px, py, pz, k2, posx, posy, posz, pad;
     };
-    std::vector<GpuNodeCurv> gpuCurv(cfg.nodes.size());
+    std::vector<GpuNodeCurv> gpuCurv(std::max<size_t>(cfg.nodes.size(), 1));
+    memset(gpuCurv.data(), 0, gpuCurv.size() * sizeof(GpuNodeCurv));
 
-    printf("DEBUG: Allocating curvature buffer: %zu nodes\n", cfg.nodes.size());
-
-    if (has_curvature && !curvData.empty()) {
-        printf("DEBUG: Filling with curvature data: %zu entries\n", curvData.size());
-
-        for (size_t i = 0; i < curvData.size(); i++) {
-            gpuCurv[i] = {curvData[i].nx, curvData[i].ny, curvData[i].nz, curvData[i].k1,
-                          curvData[i].px, curvData[i].py, curvData[i].pz, curvData[i].k2,
-                          cfg.nodes[i].x, cfg.nodes[i].y, cfg.nodes[i].z, 0
-                         };
+    if (st.has_curvature && st.curv.size() == cfg.nodes.size()) {
+        for (size_t i = 0; i < st.curv.size(); i++) {
+            const NodeCurvature& c = st.curv[i];
+            gpuCurv[i] = {c.nx, c.ny, c.nz, c.k1, c.px, c.py, c.pz, c.k2, cfg.nodes[i].x, cfg.nodes[i].y, cfg.nodes[i].z, 0};
         }
-    } else {
-        printf("DEBUG: Filling with zeros\n");
-        memset(gpuCurv.data(), 0, gpuCurv.size() * sizeof(GpuNodeCurv));
     }
-
-    printf("DEBUG: Curvature buffer size: %zu elements = %zu bytes\n",
-           gpuCurv.size(), gpuCurv.size() * sizeof(GpuNodeCurv));
 
     CUDABuf curvBuf;
     curvBuf.alloc_upload(gpuCurv);
 
-    printf("DEBUG: Curvature buffer uploaded to GPU at %p\n", curvBuf.ptr);
-
-    // DEBUG: Verify face indices are in bounds
-    printf("DEBUG: Checking face vertex indices...\n");
-
-    for (size_t i = 0; i < std::min(size_t(10), cfg.faces.size()); i++) {
-        uint32_t v0 = cfg.faces[i][0];
-        uint32_t v1 = cfg.faces[i][1];
-        uint32_t v2 = cfg.faces[i][2];
-        printf("  Face[%zu]: v=(%u,%u,%u)", i, v0, v1, v2);
-
-        if (v0 >= cfg.nodes.size() || v1 >= cfg.nodes.size() || v2 >= cfg.nodes.size()) {
-            printf(" *** OUT OF BOUNDS! ***\n");
-        } else {
-            printf(" OK\n");
-        }
-    }
-
-    /* Output grid */
-    float vs = cfg.unitinmm;
-
-    if (cfg.has_steps) {
-        vs = cfg.steps[0];
-    }
-
-    float ge = vs * 0.5f;
-    float gmin[3] = {cfg.nmin.x - ge, cfg.nmin.y - ge, cfg.nmin.z - ge};
-    float gmax[3] = {cfg.nmax.x + ge, cfg.nmax.y + ge, cfg.nmax.z + ge};
-    uint32_t nx = (uint32_t)ceil((gmax[0] - gmin[0]) / vs);
-    uint32_t ny = (uint32_t)ceil((gmax[1] - gmin[1]) / vs);
-    uint32_t nz = (uint32_t)ceil((gmax[2] - gmin[2]) / vs);
-    uint32_t crop0w = nx * ny * nz * cfg.maxgate, outSz = crop0w * 2 + 16;
-
+    /* Output grid: one 64-bit fixed-point sum per voxel and gate */
+    OutputGrid g = compute_grid(cfg);
+    size_t outSz = g.nelem;
     CUDABuf outBuf;
-    outBuf.alloc(outSz * sizeof(float));
-    CUDA_CHECK(cudaMemset(outBuf.ptr, 0, outSz * sizeof(float)));
-    printf("Grid: %ux%ux%u x %d gates, voxel=%.3fmm\n", nx, ny, nz, cfg.maxgate, vs);
+    outBuf.alloc(outSz * sizeof(uint64_t));
+    CUDA_CHECK(cudaMemset(outBuf.ptr, 0, outSz * sizeof(uint64_t)));
+    printf("Grid: %ux%ux%u x %d gates, voxel=%.3f (%.4f mm), origin=[%.2f,%.2f,%.2f]\n",
+           g.nx, g.ny, g.nz, g.maxgate, g.vs, g.vs * cfg.unitinmm, g.gmin[0], g.gmin[1], g.gmin[2]);
 
-    /* Thread count */
-    uint32_t tt = (ovr.totalthread > 0) ? ovr.totalthread : 65536;
-
-    if (cfg.nphoton < tt) {
-        tt = ((uint32_t)cfg.nphoton + 63) / 64 * 64;
-
-        if (!tt) {
-            tt = 64;
-        }
-    }
-
-    /* RNG seeds */
-    srand(cfg.rng_seed > 0 ? cfg.rng_seed : (uint32_t)time(0));
-    std::vector<uint4> seeds(tt);
-
-    for (uint32_t i = 0; i < tt; i++) {
-        seeds[i] = make_uint4((uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand(), (uint32_t)rand());
-    }
-
+    uint32_t tt = thread_count(cfg, ovr);
+    uint32_t seed0 = base_seed(cfg);
+    std::vector<uint32_t> seeds;
     CUDABuf seedBuf;
-    seedBuf.alloc_upload(seeds);
+    seedBuf.alloc((size_t)tt * 4 * sizeof(uint32_t));
 
-    /* ---- Phase 4: Fill launch params ---- */
+    /* Launch params */
     VKMMCParam params;
     memset(&params, 0, sizeof(params));
     params.gashandle = optix.gasHandle;
@@ -694,63 +478,38 @@ int main(int argc, char** argv) {
     params.srcdir = make_float3(cfg.srcdir[0], cfg.srcdir[1], cfg.srcdir[2]);
     params.srcparam1 = make_float4(cfg.srcparam1[0], cfg.srcparam1[1], cfg.srcparam1[2], cfg.srcparam1[3]);
     params.srcparam2 = make_float4(cfg.srcparam2[0], cfg.srcparam2[1], cfg.srcparam2[2], cfg.srcparam2[3]);
-    params.grid_min = make_float3(gmin[0], gmin[1], gmin[2]);
-    params.grid_extent = make_float3(gmax[0] - gmin[0], gmax[1] - gmin[1], gmax[2] - gmin[2]);
-    params.grid_stride = make_uint4(nx, nx * ny, nx * ny * nz, crop0w);
-    params.voxel_scale = 1.0f / vs;
-    params.tstart = cfg.t0;
-    params.tend = cfg.t1;
-    params.inv_timestep = 1.0f / cfg.dt;
+    params.grid_min = make_float3(g.gmin[0], g.gmin[1], g.gmin[2]);
+    params.grid_extent = make_float3(g.gmax[0] - g.gmin[0], g.gmax[1] - g.gmin[1], g.gmax[2] - g.gmin[2]);
+    params.grid_stride = make_uint4(g.nx, g.nx * g.ny, (uint32_t)g.nvox, (uint32_t)g.nelem);
+    params.voxel_scale = 1.0f / g.vs;
+    kernel_time_gates(cfg, params.tstart, params.tend, params.inv_timestep);
     params.maxgate = cfg.maxgate;
     params.initial_medium = cfg.mediumid0;
     params.do_reflect = cfg.do_mismatch ? 1u : 0u;
     params.output_type = cfg.output_type;
     params.num_media = (uint32_t)cfg.media.size();
     params.do_csg = cfg.is_csg ? 1u : 0u;
-    params.has_curvature = has_curvature ? 1u : 0u;
+    params.has_curvature = st.has_curvature ? 1u : 0u;
     params.minenergy = cfg.minenergy;
     params.roulettesize = cfg.roulettesize;
-    // Also add debug output:
-    printf("DEBUG: has_curvature=%d, params.has_curvature=%u\n",
-           has_curvature, params.has_curvature);
 
-    /* Media */
-    for (size_t i = 0; i < cfg.media.size() && i < MAX_PROP; i++) {
-        params.media[i] = {cfg.media[i].mua, cfg.media[i].mus, cfg.media[i].g, cfg.media[i].n};
+    std::vector<Medium> media = kernel_media(cfg);
+
+    for (size_t i = 0; i < media.size(); i++) {
+        params.media[i] = {media[i].mua, media[i].mus, media[i].g, media[i].n};
     }
 
     CUDABuf paramBuf;
     paramBuf.alloc(sizeof(VKMMCParam));
 
-    /* ---- Phase 5: Launch ---- */
-    uint64_t batchsz = 500000;
-
-    if (ovr.batch_size == 0) {
-        batchsz = cfg.nphoton;
-    } else if (ovr.batch_size != UINT64_MAX) {
-        batchsz = ovr.batch_size;
-    }
-
-    uint64_t pdone = 0;
+    /* Launch in batches */
+    uint64_t batchsz = batch_size(cfg, ovr), pdone = 0;
     int batch = 0;
+    bool batch_readback = (outSz * sizeof(uint64_t) <= VKMMC_BATCH_READBACK_BYTES);
+    std::vector<double> acc;
+    std::vector<uint64_t> raw(outSz);
     printf("Threads: %u, batch: %lu photons\n", tt, (unsigned long)batchsz);
-    // ========== ADD THESE DEBUG LINES ==========
-    printf("DEBUG: Mesh mode configuration:\n");
-    printf("  cfg.is_csg = %d\n", cfg.is_csg);
-    printf("  params.do_csg = %u\n", params.do_csg);
-    printf("  params.initial_medium = %u (0x%x)\n", params.initial_medium, params.initial_medium);
-    printf("  cfg.init_elem = %d\n", cfg.init_elem);
-    printf("  cfg.mediumid0 = %u\n", cfg.mediumid0);
-    printf("  params.has_curvature = %u\n", params.has_curvature);
-    printf("  params.num_media = %u\n", params.num_media);
-    printf("  Media properties:\n");
 
-    for (size_t i = 0; i < cfg.media.size() && i < 5; i++) {
-        printf("    Media[%zu]: mua=%.6f mus=%.6f g=%.4f n=%.4f\n",
-               i, cfg.media[i].mua, cfg.media[i].mus, cfg.media[i].g, cfg.media[i].n);
-    }
-
-    // ========================================
     typedef std::chrono::high_resolution_clock Clk;
     double kms = 0;
     Clk::time_point t0 = Clk::now();
@@ -759,83 +518,73 @@ int main(int argc, char** argv) {
         uint64_t rem = cfg.nphoton - pdone, bp = (rem < batchsz) ? rem : batchsz;
         params.threadphoton = (int)(bp / tt);
         params.oddphoton = (int)(bp - (uint64_t)params.threadphoton * tt);
+        make_seeds(seed0, pdone, tt, seeds);
+        seedBuf.upload(seeds.data(), seeds.size() * sizeof(uint32_t));
         paramBuf.upload(&params, sizeof(params));
 
         Clk::time_point ks = Clk::now();
-        OPTIX_CHECK(optixLaunch(optix.pipeline, 0,
-                                paramBuf.d_ptr(), sizeof(VKMMCParam),
-                                &optix.sbt, tt, 1, 1));
+        OPTIX_CHECK(optixLaunch(optix.pipeline, 0, paramBuf.d_ptr(), sizeof(VKMMCParam), &optix.sbt, tt, 1, 1));
         CUDA_CHECK(cudaDeviceSynchronize());
         kms += std::chrono::duration<double, std::milli>(Clk::now() - ks).count();
 
         pdone += bp;
         batch++;
+
+        /* move the batch output into the double accumulator, clear the GPU buffer */
+        if (batch_readback && pdone < cfg.nphoton) {
+            outBuf.download(raw.data(), outSz * sizeof(uint64_t));
+            accumulate_fixed(acc, raw.data(), g.nelem);
+            CUDA_CHECK(cudaMemset(outBuf.ptr, 0, outSz * sizeof(uint64_t)));
+        }
+
         printf("  batch %d: %lu photons (%lu/%lu)\n",
                batch, (unsigned long)bp, (unsigned long)pdone, (unsigned long)cfg.nphoton);
     }
 
     double tms = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
     printf("Done (%d batches), kernel: %.3f ms, total: %.3f ms\n", batch, kms, tms);
-    printf("Speed: %.2f photon/ms\n", (double)cfg.nphoton / kms);
+    printf("Speed: %.2f photon/ms (kernel), %.2f photon/ms (total)\n", (double)cfg.nphoton / std::max(kms, 1e-6),
+           (double)cfg.nphoton / std::max(tms, 1e-6));
 
-    /* ---- Phase 6: Readback ---- */
-    std::vector<float> raw(outSz);
-    outBuf.download(raw.data(), outSz * sizeof(float));
-    std::vector<float> fluence(crop0w);
-    double absorbed = 0;
+    /* Readback, normalization and output */
+    outBuf.download(raw.data(), outSz * sizeof(uint64_t));
+    accumulate_fixed(acc, raw.data(), g.nelem);
+    std::vector<float> vol = finalize_output(cfg, g, acc);
+    save_fluence(cfg, g, vol);
 
-    for (uint32_t i = 0; i < crop0w; i++) {
-        fluence[i] = raw[i] + raw[i + crop0w];
-        absorbed += fluence[i];
-    }
-
-    printf("absorbed: %.5f%%\n", absorbed / (double)cfg.nphoton * 100.0);
-
-    if (cfg.do_normalize) {
-        float vv = vs * vs * vs;
-
-        for (uint32_t i = 0; i < crop0w; i++) {
-            fluence[i] /= (float)cfg.nphoton * vv;
-        }
-    }
-
-    /* Save JData */
-    {
-        std::vector<size_t> dims = {nx, ny, nz};
-
-        if (cfg.maxgate > 1) {
-            dims.push_back((size_t)cfg.maxgate);
-        }
-
-        json root;
-        root["Session"] = {{"ID", cfg.session_id}, {"Photons", cfg.nphoton}};
-        root["Forward"] = {{"T0", cfg.t0}, {"T1", cfg.t1}, {"Dt", cfg.dt}};
-        root["Domain"] = {{"LengthUnit", cfg.unitinmm}, {"VoxelSize", vs},
-            {"Dim", {nx, ny, nz}}, {"Origin", {gmin[0], gmin[1], gmin[2]}}
-        };
-        root["Fluence"] = jdata_encode("single", dims, fluence.data(), crop0w * sizeof(float));
-        std::string outname = cfg.session_id + ".jdat";
-        std::ofstream of(outname.c_str());
-        of << root.dump(2) << std::endl;
-        printf("Output: %s (%ux%ux%u)\n", outname.c_str(), nx, ny, nz);
-    }
-
-    /* ---- Cleanup ---- */
     faceBuf.free();
     curvBuf.free();
     outBuf.free();
     seedBuf.free();
     paramBuf.free();
-    optix.gasBuf.free();
-    optix.raygenSBT.free();
-    optix.missSBT.free();
-    optix.hitgroupSBT.free();
-    optixPipelineDestroy(optix.pipeline);
-    optixProgramGroupDestroy(optix.raygenPG);
-    optixProgramGroupDestroy(optix.missPG);
-    optixProgramGroupDestroy(optix.hitgroupPG);
-    optixModuleDestroy(optix.module);
-    optixDeviceContextDestroy(optix.context);
+    destroy_optix(optix);
+}
+
+/* ================================================================ */
+/*                            Main                                  */
+/* ================================================================ */
+
+int main(int argc, char** argv) {
+    try {
+        CmdOverrides ovr;
+        SimConfig cfg;
+        SimSetup st;
+
+        if (!vkmmc_frontend(argc, argv, "OptiX", 0, ".ptx", ovr, cfg, st)) {
+            return 0;
+        }
+
+        if (ovr.listgpu) {
+            list_gpus();
+            return 0;
+        }
+
+        run_simulation(cfg, st, ovr);
+    } catch (const std::exception& e) {
+        fflush(stdout);
+        fprintf(stderr, "vkmmc_optix ERROR: %s\n", e.what());
+        return 1;
+    }
 
     return 0;
 }
