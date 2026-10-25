@@ -1,0 +1,27 @@
+# build products
+bin/
+*.o
+*.spv
+*.ptx
+src/vkmmc_core_spv.h
+src/vkmmc_show_*_spv.h
+optix/vkmmc_optix_ptx.h
+.shader_flags
+
+# unit test builds and coverage
+tests/unit/test_vkmmc_unit
+tests/unit/test_vkmmc_unit_asan
+tests/unit/test_vkmmc_unit_cov
+tests/unit/*.gcda
+tests/unit/*.gcno
+tests/unit/*.gcov
+
+# fuzzing builds, corpora and findings
+tests/fuzz/build/
+tests/fuzz/corpus_*/
+tests/fuzz/findings/
+
+# simulation outputs and scratch space
+*.jdat
+.work/
+__pycache__/
