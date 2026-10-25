@@ -1,12 +1,16 @@
 /*
  * vkmmc_io.h — Load/save MMC JSON input/output with JData-encoded arrays
  * Supports mesh mode (MeshNode/MeshElem/MeshSurf) and CSG shape mode
+ *
+ * All input is validated here: a malformed or out-of-range input raises a
+ * std::runtime_error with a message naming the offending field, so that the
+ * GPU kernels can assume every index, label and property they read is valid.
  */
 #ifndef VKMMC_IO_H
 #define VKMMC_IO_H
 
 #include <nlohmann/json.hpp>
-#include <miniz.h>
+#include "zmatlib.h"
 #include <vector>
 #include <string>
 #include <array>
@@ -14,12 +18,35 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <stdexcept>
 #include <algorithm>
 #include <iostream>
 #include <fstream>
+#include <sstream>
+#include <thread>
+#include <cctype>
 
 using json = nlohmann::json;
+
+// ============================================================================
+// Limits
+// ============================================================================
+#define VKMMC_MAX_MEDIA      256         /* OptiX keeps media in constant memory */
+#define VKMMC_MAX_CSG_TAG    64          /* CSG enclosure walk tracks 64 tags */
+#define VKMMC_MAX_MESH_LABEL 0x3FFFu     /* front labels have 14 bits */
+
+/* packed_media bit layout of a triangle (stored as float bits for the GPU):
+   bit 31: flat (no curvature correction), bit 30: coplanar with another CSG
+   surface (the kernel re-derives the enclosing shapes after crossing it),
+   bits 29-16: front medium, bits 15-0: back medium */
+#define VKMMC_FACE_FLAT     0x80000000u
+#define VKMMC_FACE_COPLANAR 0x40000000u
+#define VKMMC_MIN_MESHRES    4
+#define VKMMC_MAX_MESHRES    2048
+#define VKMMC_MAX_GATES      100000
+#define VKMMC_MAX_VOXELS     ((uint64_t)1 << 30)  /* voxels x gates; kernel indexes with uint32 */
+#define VKMMC_MAX_JDATA_DIM  8
 
 // ============================================================================
 // Data structures
@@ -34,6 +61,14 @@ struct FaceData {
     float nx, ny, nz, packed_media;
 };
 
+enum SrcType {
+    SRC_PENCIL = 0, SRC_ISOTROPIC = 1, SRC_CONE = 2, SRC_GAUSSIAN = 3, SRC_PLANAR = 4,
+    SRC_PATTERN = 5, SRC_FOURIER = 6, SRC_ARCSINE = 7, SRC_DISK = 8, SRC_ZGAUSSIAN = 11,
+    SRC_LINE = 12, SRC_SLIT = 13
+};
+
+enum OutputType { OT_FLUX = 0, OT_FLUENCE = 1, OT_ENERGY = 2 };
+
 struct SimConfig {
     std::string session_id;
     uint64_t nphoton;
@@ -43,7 +78,7 @@ struct SimConfig {
     float t0, t1, dt;
     int maxgate;
     float unitinmm;
-    std::vector<Medium> media;
+    std::vector<Medium> media;          /* as given in the input, in 1/mm */
     int srctype;
     float srcpos[3], srcdir[4], srcparam1[4], srcparam2[4];
     std::vector<Vec3> nodes;
@@ -52,11 +87,10 @@ struct SimConfig {
     Vec3 nmin, nmax;
     int init_elem;
     uint32_t mediumid0;
-    uint32_t grid_dim[3];
-    bool has_grid_dim;
     float steps[3];
     bool has_steps;
     bool is_csg;
+    json shapes;                        /* CSG mode: the Shapes array */
     std::vector<uint32_t> face_shape_id;
     int mesh_res;
     float minenergy;
@@ -64,17 +98,16 @@ struct SimConfig {
     uint32_t debuglevel;    /* bitmask; bit 13 (8192 = dlTraj) enables trajectory */
     uint32_t maxjumpdebug;  /* max trajectory events to record */
 
-    SimConfig() : nphoton(1000000), rng_seed(29012391), do_mismatch(true),
-        do_normalize(true), output_type(2), t0(0), t1(5e-9f), dt(5e-9f),
-        maxgate(1), unitinmm(1.0f), srctype(0), init_elem(-1),
-        mediumid0(0xFFFFFFFFu), has_grid_dim(false), has_steps(false), is_csg(false), mesh_res(24), minenergy(1e-6f), roulettesize(10.0f),
-        debuglevel(0), maxjumpdebug(10000000) {
+    SimConfig() : session_id("default"), nphoton(1000000), rng_seed(29012391), do_mismatch(true),
+        do_normalize(true), output_type(OT_ENERGY), t0(0), t1(5e-9f), dt(5e-9f),
+        maxgate(1), unitinmm(1.0f), srctype(SRC_PENCIL), init_elem(-1),
+        mediumid0(0xFFFFFFFFu), has_steps(false), is_csg(false), mesh_res(24), minenergy(1e-6f),
+        roulettesize(10.0f), debuglevel(0), maxjumpdebug(10000000) {
         memset(srcpos, 0, sizeof(srcpos));
         memset(srcdir, 0, sizeof(srcdir));
         srcdir[2] = 1.0f;
         memset(srcparam1, 0, sizeof(srcparam1));
         memset(srcparam2, 0, sizeof(srcparam2));
-        memset(grid_dim, 0, sizeof(grid_dim));
         memset(steps, 0, sizeof(steps));
         nmin.x = nmin.y = nmin.z = 1e30f;
         nmax.x = nmax.y = nmax.z = -1e30f;
@@ -82,12 +115,103 @@ struct SimConfig {
 };
 
 // ============================================================================
+// Error helpers
+// ============================================================================
+static void vkmmc_fail(const std::string& msg) {
+    throw std::runtime_error(msg);
+}
+
+static void vkmmc_require(bool cond, const std::string& msg) {
+    if (!cond) {
+        vkmmc_fail(msg);
+    }
+}
+
+/* Read a finite number from obj[key], or return def when the key is absent */
+static double json_num(const json& obj, const char* key, double def, const std::string& ctx) {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+
+    const json& v = obj[key];
+
+    if (v.is_boolean()) {
+        return v.get<bool>() ? 1.0 : 0.0;
+    }
+
+    vkmmc_require(v.is_number(), ctx + "." + key + " must be a number");
+    double d = v.get<double>();
+    vkmmc_require(std::isfinite(d), ctx + "." + key + " must be finite");
+    return d;
+}
+
+static double json_num_range(const json& obj, const char* key, double def, double lo, double hi,
+                             const std::string& ctx) {
+    double d = json_num(obj, key, def, ctx);
+
+    if (!(d >= lo && d <= hi)) {
+        std::ostringstream ss;
+        ss << ctx << "." << key << "=" << d << " is out of range [" << lo << ", " << hi << "]";
+        vkmmc_fail(ss.str());
+    }
+
+    return d;
+}
+
+static bool json_bool(const json& obj, const char* key, bool def, const std::string& ctx) {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+
+    const json& v = obj[key];
+
+    if (v.is_boolean()) {
+        return v.get<bool>();
+    }
+
+    vkmmc_require(v.is_number(), ctx + "." + key + " must be a boolean or a number");
+    return v.get<double>() != 0.0;
+}
+
+static std::string json_str(const json& obj, const char* key, const std::string& def, const std::string& ctx) {
+    if (!obj.is_object() || !obj.contains(key) || obj[key].is_null()) {
+        return def;
+    }
+
+    vkmmc_require(obj[key].is_string(), ctx + "." + key + " must be a string");
+    return obj[key].get<std::string>();
+}
+
+/* Read an array of at least nmin and at most nmax finite numbers */
+static std::vector<double> json_vec(const json& v, size_t nmin, size_t nmax, const std::string& ctx) {
+    vkmmc_require(v.is_array(), ctx + " must be an array");
+    vkmmc_require(v.size() >= nmin, ctx + " needs at least " + std::to_string(nmin) + " numbers");
+    vkmmc_require(v.size() <= nmax, ctx + " has more than " + std::to_string(nmax) + " numbers");
+    std::vector<double> out;
+
+    for (size_t i = 0; i < v.size() && i < nmax; i++) {
+        vkmmc_require(v[i].is_number(), ctx + "[" + std::to_string(i) + "] must be a number");
+        double d = v[i].get<double>();
+        vkmmc_require(std::isfinite(d), ctx + "[" + std::to_string(i) + "] must be finite");
+        out.push_back(d);
+    }
+
+    return out;
+}
+
+/* obj[key] as a fixed-length vector; key must be present */
+static std::vector<double> json_vec_key(const json& obj, const char* key, size_t n, const std::string& ctx) {
+    vkmmc_require(obj.is_object() && obj.contains(key), ctx + " requires '" + key + "'");
+    return json_vec(obj[key], n, n, ctx + "." + key);
+}
+
+// ============================================================================
 // Base64
 // ============================================================================
 static const uint8_t b64_dec[256] = {
     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 62, 64, 64, 64, 63,
-    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 64, 64, 64, 0, 64, 64, 64, 0, 1, 2, 3, 4, 5, 6,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 64, 64, 64, 64, 64, 64, 64, 0, 1, 2, 3, 4, 5, 6,
     7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 64, 64, 64, 64, 64,
     64, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
     49, 50, 51, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
@@ -99,49 +223,45 @@ static const uint8_t b64_dec[256] = {
 };
 static const char b64_enc[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/*
+ * Decode base64, skipping whitespace and line breaks. Padding is optional;
+ * any other character, a misplaced '=' or a dangling 6-bit group is an error.
+ */
 static std::vector<uint8_t> base64_decode(const std::string& in) {
-    std::string cl;
-    cl.reserve(in.size());
+    std::vector<uint8_t> out;
+    out.reserve(in.size() / 4 * 3 + 3);
+    uint32_t acc = 0;
+    int nbits = 0, npad = 0;
+    size_t nsym = 0;
 
-    for (size_t i = 0; i < in.size(); i++) if (b64_dec[(uint8_t)in[i]] < 64 || in[i] == '=') {
-            cl += in[i];
+    for (size_t i = 0; i < in.size(); i++) {
+        uint8_t c = (uint8_t)in[i];
+
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+            continue;
         }
 
-    size_t len = cl.size();
+        if (c == '=') {
+            npad++;
+            continue;
+        }
 
-    if (len % 4) {
-        throw std::runtime_error("bad base64");
+        if (npad || b64_dec[c] >= 64) {
+            throw std::runtime_error("bad base64: invalid character or data after padding");
+        }
+
+        acc = (acc << 6) | b64_dec[c];
+        nbits += 6;
+        nsym++;
+
+        if (nbits >= 8) {
+            nbits -= 8;
+            out.push_back((uint8_t)((acc >> nbits) & 0xFF));
+        }
     }
 
-    size_t ol = len / 4 * 3;
-
-    if (len >= 1 && cl[len - 1] == '=') {
-        ol--;
-    }
-
-    if (len >= 2 && cl[len - 2] == '=') {
-        ol--;
-    }
-
-    std::vector<uint8_t> out(ol);
-    size_t j = 0;
-
-    for (size_t i = 0; i < len; i += 4) {
-        uint32_t a = b64_dec[(uint8_t)cl[i]], b = b64_dec[(uint8_t)cl[i + 1]];
-        uint32_t c = (i + 2 < len) ? b64_dec[(uint8_t)cl[i + 2]] : 0, d = (i + 3 < len) ? b64_dec[(uint8_t)cl[i + 3]] : 0;
-        uint32_t t = (a << 18) | (b << 12) | (c << 6) | d;
-
-        if (j < ol) {
-            out[j++] = (t >> 16) & 0xFF;
-        }
-
-        if (j < ol) {
-            out[j++] = (t >> 8) & 0xFF;
-        }
-
-        if (j < ol) {
-            out[j++] = t & 0xFF;
-        }
+    if (nsym % 4 == 1 || npad > 2 || (npad && (nsym + npad) % 4)) {
+        throw std::runtime_error("bad base64: truncated input");
     }
 
     return out;
@@ -174,12 +294,20 @@ static std::string base64_encode(const uint8_t* data, size_t len) {
 // ============================================================================
 // JData decode/encode
 // ============================================================================
+
+/* threads used by zmat to deflate/inflate zlib/gzip blocks in parallel */
+static int jdata_nthread() {
+    unsigned int n = std::thread::hardware_concurrency();
+    return (int)std::max(1u, std::min(n, 16u));
+}
+
+/* element size in bytes of a JData _ArrayType_, 0 if unsupported */
 static size_t jdata_elem_size(const std::string& t) {
     if (t == "single" || t == "float32" || t == "int32" || t == "uint32") {
         return 4;
     }
 
-    if (t == "double" || t == "float64") {
+    if (t == "double" || t == "float64" || t == "int64" || t == "uint64") {
         return 8;
     }
 
@@ -187,39 +315,313 @@ static size_t jdata_elem_size(const std::string& t) {
         return 2;
     }
 
-    return 4;
-}
-
-static std::vector<uint8_t> jdata_decode(const json& jd) {
-    if (jd.value("_ArrayZipType_", "") != "zlib") {
-        throw std::runtime_error("need zlib");
+    if (t == "int8" || t == "uint8" || t == "logical" || t == "bool") {
+        return 1;
     }
 
-    std::vector<uint8_t> comp = base64_decode(jd["_ArrayZipData_"].get<std::string>());
-    size_t ne = jd["_ArrayZipSize_"].get<size_t>();
-    size_t esz = jdata_elem_size(jd["_ArrayType_"].get<std::string>());
-    size_t usz = ne * esz;
-    std::vector<uint8_t> out(usz);
-    mz_ulong dl = (mz_ulong)usz;
-
-    if (mz_uncompress(out.data(), &dl, comp.data(), (mz_ulong)comp.size()) != MZ_OK) {
-        throw std::runtime_error("zlib fail");
-    }
-
-    return out;
+    return 0;
 }
 
+/* A decoded JData N-D array: raw little-endian bytes in row-major order */
+struct JDataArray {
+    std::string type;
+    std::vector<size_t> dims;
+    size_t esize;
+    std::vector<uint8_t> raw;
+
+    size_t numel() const {
+        size_t n = 1;
+
+        for (size_t i = 0; i < dims.size(); i++) {
+            n *= dims[i];
+        }
+
+        return n;
+    }
+
+    /* element i converted to double */
+    double at(size_t i) const {
+        const uint8_t* p = raw.data() + i * esize;
+        const std::string& t = type;
+
+        if (t == "single" || t == "float32") {
+            return get<float>(p);
+        } else if (t == "double" || t == "float64") {
+            return get<double>(p);
+        } else if (t == "int8") {
+            return get<int8_t>(p);
+        } else if (t == "uint8" || t == "logical" || t == "bool") {
+            return get<uint8_t>(p);
+        } else if (t == "int16") {
+            return get<int16_t>(p);
+        } else if (t == "uint16") {
+            return get<uint16_t>(p);
+        } else if (t == "int32") {
+            return get<int32_t>(p);
+        } else if (t == "uint32") {
+            return get<uint32_t>(p);
+        } else if (t == "int64") {
+            return (double)get<int64_t>(p);
+        } else if (t == "uint64") {
+            return (double)get<uint64_t>(p);
+        }
+
+        return 0.0;
+    }
+
+    template<class T> static T get(const uint8_t* p) {
+        T v;
+        memcpy(&v, p, sizeof(T));
+        return v;
+    }
+};
+
+/* product of dims with overflow check */
+static size_t jdata_numel(const std::vector<size_t>& dims, const std::string& ctx) {
+    size_t n = 1;
+
+    for (size_t i = 0; i < dims.size(); i++) {
+        if (dims[i] && n > ((size_t)1 << 40) / dims[i]) {
+            vkmmc_fail(ctx + ": array is too large");
+        }
+
+        n *= dims[i];
+    }
+
+    return n;
+}
+
+static std::vector<size_t> jdata_dims(const json& v, const std::string& ctx) {
+    std::vector<size_t> dims;
+
+    if (v.is_number_unsigned() || (v.is_number_integer() && v.get<int64_t>() >= 0)) {
+        dims.push_back(v.get<size_t>());
+        return dims;
+    }
+
+    vkmmc_require(v.is_array() && v.size() >= 1 && v.size() <= VKMMC_MAX_JDATA_DIM,
+                  ctx + " must be a non-negative integer or an array of 1-" + std::to_string(VKMMC_MAX_JDATA_DIM) + " of them");
+
+    for (size_t i = 0; i < v.size(); i++) {
+        vkmmc_require(v[i].is_number_unsigned() || (v[i].is_number_integer() && v[i].get<int64_t>() >= 0),
+                      ctx + " entries must be non-negative integers");
+        dims.push_back(v[i].get<size_t>());
+    }
+
+    return dims;
+}
+
+/* read the optional _ArrayZipOffsets_ block index: [[comp, uncomp], ...] or flat */
+static std::vector<size_t> jdata_zipoffsets(const json& jd) {
+    std::vector<size_t> off;
+
+    if (!jd.contains("_ArrayZipOffsets_") || !jd["_ArrayZipOffsets_"].is_array()) {
+        return off;
+    }
+
+    const json& v = jd["_ArrayZipOffsets_"];
+
+    for (size_t i = 0; i < v.size(); i++) {
+        if (v[i].is_array()) {
+            for (size_t k = 0; k < v[i].size(); k++) {
+                if (!v[i][k].is_number() || v[i][k].get<double>() < 0) {
+                    return std::vector<size_t>();
+                }
+
+                off.push_back(v[i][k].get<size_t>());
+            }
+        } else if (v[i].is_number() && v[i].get<double>() >= 0) {
+            off.push_back(v[i].get<size_t>());
+        } else {
+            return std::vector<size_t>();
+        }
+    }
+
+    /* the index is only a speed hint; zmat verifies it against the stream */
+    if (off.size() < 4 || (off.size() & 1)) {
+        off.clear();
+    }
+
+    return off;
+}
+
+/* transpose a column-major N-D buffer to row-major in place */
+static void jdata_col2row(JDataArray& a) {
+    size_t nd = a.dims.size();
+
+    if (nd < 2) {
+        return;
+    }
+
+    size_t n = a.numel(), es = a.esize;
+    std::vector<uint8_t> out(a.raw.size());
+    std::vector<size_t> rstride(nd), cstride(nd), idx(nd, 0);
+    rstride[nd - 1] = 1;
+    cstride[0] = 1;
+
+    for (size_t d = nd - 1; d > 0; d--) {
+        rstride[d - 1] = rstride[d] * a.dims[d];
+    }
+
+    for (size_t d = 1; d < nd; d++) {
+        cstride[d] = cstride[d - 1] * a.dims[d - 1];
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        size_t src = 0, dst = 0;
+
+        for (size_t d = 0; d < nd; d++) {
+            src += idx[d] * cstride[d];
+            dst += idx[d] * rstride[d];
+        }
+
+        memcpy(&out[dst * es], &a.raw[src * es], es);
+
+        for (size_t d = nd; d-- > 0;) {
+            if (++idx[d] < a.dims[d]) {
+                break;
+            }
+
+            idx[d] = 0;
+        }
+    }
+
+    a.raw.swap(out);
+}
+
+/*
+ * Decode a JData-annotated array: {"_ArrayType_", "_ArraySize_", then either
+ * "_ArrayZipType_" (zlib/gzip/base64) + "_ArrayZipSize_" + "_ArrayZipData_",
+ * or an uncompressed "_ArrayData_" (numeric array or base64 string)}.
+ * The result is always row-major; "_ArrayOrder_":"c"/"col" input is transposed.
+ */
+static JDataArray jdata_decode_array(const json& jd, const std::string& ctx = "JData array") {
+    vkmmc_require(jd.is_object(), ctx + " must be a JData object");
+    vkmmc_require(jd.contains("_ArrayType_") && jd["_ArrayType_"].is_string(), ctx + " needs a string _ArrayType_");
+    JDataArray a;
+    a.type = jd["_ArrayType_"].get<std::string>();
+    a.esize = jdata_elem_size(a.type);
+    vkmmc_require(a.esize > 0, ctx + ": unsupported _ArrayType_ '" + a.type + "'");
+    vkmmc_require(jd.contains("_ArraySize_"), ctx + " needs _ArraySize_");
+    a.dims = jdata_dims(jd["_ArraySize_"], ctx + "._ArraySize_");
+    size_t numel = jdata_numel(a.dims, ctx), nbytes = numel * a.esize;
+
+    if (jd.contains("_ArrayZipData_")) {
+        std::string ztype = json_str(jd, "_ArrayZipType_", "zlib", ctx);
+        vkmmc_require(jd["_ArrayZipData_"].is_string(), ctx + "._ArrayZipData_ must be a base64 string");
+
+        if (jd.contains("_ArrayZipSize_")) {
+            std::vector<size_t> zdims = jdata_dims(jd["_ArrayZipSize_"], ctx + "._ArrayZipSize_");
+            vkmmc_require(jdata_numel(zdims, ctx) == numel, ctx + ": _ArrayZipSize_ does not match _ArraySize_");
+        }
+
+        std::vector<uint8_t> comp = base64_decode(jd["_ArrayZipData_"].get<std::string>());
+
+        if (ztype == "base64") {
+            a.raw.swap(comp);
+        } else {
+            vkmmc_require(ztype == "zlib" || ztype == "gzip",
+                          ctx + ": unsupported _ArrayZipType_ '" + ztype + "' (zlib, gzip or base64)");
+            vkmmc_require(!comp.empty(), ctx + ": empty compressed stream");
+            std::vector<size_t> off = jdata_zipoffsets(jd);
+            size_t* poff = off.empty() ? NULL : off.data();
+            size_t noff = off.size();
+            unsigned char* outbuf = NULL;
+            size_t outlen = 0;
+            int status = 0;
+            TZMatFlags flags;
+            flags.iscompress = 0;
+            flags.param.nthread = (char)jdata_nthread();
+            int ret = zmat_run_indexed(comp.size(), comp.data(), &outlen, &outbuf,
+                                       ztype == "zlib" ? zmZlib : zmGzip, &status, flags.iscompress,
+                                       poff ? &poff : NULL, poff ? &noff : NULL);
+
+            if (ret != 0 || outbuf == NULL) {
+                free(outbuf);
+                vkmmc_fail(ctx + ": failed to decompress " + ztype + " data");
+            }
+
+            a.raw.assign(outbuf, outbuf + outlen);
+            free(outbuf);
+        }
+    } else if (jd.contains("_ArrayData_")) {
+        const json& d = jd["_ArrayData_"];
+
+        if (d.is_string()) {
+            a.raw = base64_decode(d.get<std::string>());
+        } else {
+            /* plain numeric array, possibly nested; store as double */
+            std::vector<double> vals;
+
+            vkmmc_require(d.is_array(), ctx + "._ArrayData_ must be an array or a base64 string");
+
+            /* flatten in order (iterative to avoid deep recursion on hostile input) */
+            std::vector<std::pair<const json*, size_t> > it;
+            it.push_back(std::make_pair(&d, (size_t)0));
+
+            while (!it.empty()) {
+                const json* cur = it.back().first;
+                size_t& k = it.back().second;
+
+                if (k >= cur->size()) {
+                    it.pop_back();
+                    continue;
+                }
+
+                const json& e = (*cur)[k++];
+
+                if (e.is_array()) {
+                    vkmmc_require(it.size() < VKMMC_MAX_JDATA_DIM, ctx + "._ArrayData_ is nested too deeply");
+                    it.push_back(std::make_pair(&e, (size_t)0));
+                } else {
+                    vkmmc_require(e.is_number() || e.is_boolean(), ctx + "._ArrayData_ must contain only numbers");
+                    vals.push_back(e.is_boolean() ? (e.get<bool>() ? 1.0 : 0.0) : e.get<double>());
+                }
+
+                vkmmc_require(vals.size() <= numel, ctx + ": _ArrayData_ has more elements than _ArraySize_");
+            }
+
+            vkmmc_require(vals.size() == numel, ctx + ": _ArrayData_ has fewer elements than _ArraySize_");
+            a.type = "double";
+            a.esize = 8;
+            nbytes = numel * 8;
+            a.raw.resize(nbytes);
+
+            if (nbytes) {
+                memcpy(a.raw.data(), vals.data(), nbytes);
+            }
+        }
+    } else {
+        vkmmc_fail(ctx + " needs _ArrayZipData_ or _ArrayData_");
+    }
+
+    if (a.raw.size() != nbytes) {
+        vkmmc_fail(ctx + ": decoded " + std::to_string(a.raw.size()) + " bytes, expected " +
+                   std::to_string(nbytes) + " (" + std::to_string(numel) + " x " + a.type + ")");
+    }
+
+    std::string order = json_str(jd, "_ArrayOrder_", "r", ctx);
+
+    if (!order.empty() && (order[0] == 'c' || order[0] == 'C' || order[0] == 'f' || order[0] == 'F')) {
+        jdata_col2row(a);
+    }
+
+    return a;
+}
+
+/* legacy helper: raw decoded bytes of a JData array (row-major) */
+static inline std::vector<uint8_t> jdata_decode(const json& jd) {
+    return jdata_decode_array(jd).raw;
+}
+
+/*
+ * Encode an array as JData. Data larger than 4 MB is deflated in parallel
+ * blocks (zmat); the stream is a standard zlib stream and its block index is
+ * stored in _ArrayZipOffsets_ so that readers can inflate it in parallel too.
+ * row_major=false marks data stored with the first index fastest.
+ */
 static json jdata_encode(const std::string& atype, const std::vector<size_t>& asize,
                          const void* data, size_t bytes, bool row_major = true) {
-    mz_ulong cb = mz_compressBound((mz_ulong)bytes);
-    std::vector<uint8_t> comp(cb);
-    mz_ulong cl = cb;
-
-    if (mz_compress(comp.data(), &cl, (const unsigned char*)data, (mz_ulong)bytes) != MZ_OK) {
-        throw std::runtime_error("zlib compress fail");
-    }
-
-    comp.resize(cl);
     size_t total = 1;
 
     for (size_t i = 0; i < asize.size(); i++) {
@@ -236,7 +638,42 @@ static json jdata_encode(const std::string& atype, const std::vector<size_t>& as
 
     jd["_ArrayZipType_"] = "zlib";
     jd["_ArrayZipSize_"] = total;
-    jd["_ArrayZipData_"] = base64_encode(comp.data(), comp.size());
+
+    if (bytes == 0) {
+        jd["_ArrayZipData_"] = "eJwDAAAAAAE=";   /* zlib stream of zero bytes */
+        return jd;
+    }
+
+    unsigned char* comp = NULL;
+    size_t clen = 0, *off = NULL, noff = 0;
+    int status = 0;
+    TZMatFlags flags;
+    flags.iscompress = 0;
+    flags.param.clevel = 1;
+    flags.param.nthread = (char)jdata_nthread();
+    int ret = zmat_run_indexed(bytes, (unsigned char*)data, &clen, &comp, zmZlib, &status,
+                               flags.iscompress, &off, &noff);
+
+    if (ret != 0 || comp == NULL) {
+        free(comp);
+        free(off);
+        throw std::runtime_error("zlib compression failed");
+    }
+
+    jd["_ArrayZipData_"] = base64_encode(comp, clen);
+
+    if (off && noff >= 6) {
+        json offsets = json::array();
+
+        for (size_t i = 0; i + 1 < noff; i += 2) {
+            offsets.push_back({off[i], off[i + 1]});
+        }
+
+        jd["_ArrayZipOffsets_"] = offsets;
+    }
+
+    free(comp);
+    free(off);
     return jd;
 }
 
@@ -251,10 +688,18 @@ static float v3len(Vec3 v) {
 }
 
 static float pack_media(uint32_t front, uint32_t back) {
-    uint32_t p = (front << 16) | (back & 0xFFFF);
+    uint32_t p = ((front & VKMMC_MAX_MESH_LABEL) << 16) | (back & 0xFFFF);
     float f;
     memcpy(&f, &p, 4);
     return f;
+}
+
+static void unpack_media(float pm, uint32_t& front, uint32_t& back, bool& flat) {
+    uint32_t p;
+    memcpy(&p, &pm, 4);
+    flat = (p & VKMMC_FACE_FLAT) != 0;
+    front = (p >> 16) & VKMMC_MAX_MESH_LABEL;
+    back = p & 0xFFFFu;
 }
 
 struct FaceKey {
@@ -275,6 +720,11 @@ struct FaceKey {
 // ============================================================================
 // Load MeshSurf
 // ============================================================================
+/*
+ * sd: nf rows of [v1, v2, v3, label] with 1-based node indices, already
+ * range-checked. A triangle listed once is an exterior face (front=0); listed
+ * twice it is an interface between the two labels.
+ */
 static void load_mesh_surf(const std::vector<Vec3>& nodes, const int32_t* sd, size_t nf,
                            std::vector<std::array<uint32_t, 3> >& out_f, std::vector<FaceData>& out_d) {
     struct Entry {
@@ -315,17 +765,19 @@ static void load_mesh_surf(const std::vector<Vec3>& nodes, const int32_t* sd, si
         Vec3 N = v3cross(e1, e2);
         float l = v3len(N);
 
-        if (l > 0) {
-            N.x /= l;
-            N.y /= l;
-            N.z /= l;
+        if (!(l > 0)) {
+            continue;   /* degenerate triangle: cannot be hit */
         }
+
+        N.x /= l;
+        N.y /= l;
+        N.z /= l;
 
         out_f.push_back({{e0.v[0], e0.v[1], e0.v[2]}});
         out_d.push_back({N.x, N.y, N.z, pack_media(front, back)});
     }
 
-    std::cout << "MeshSurf: " << nf << " -> " << out_f.size() << " unique triangles\n";
+    printf("MeshSurf: %zu -> %zu unique triangles\n", nf, out_f.size());
 }
 
 // ============================================================================
@@ -336,7 +788,7 @@ static void load_mesh_surf(const std::vector<Vec3>& nodes, const int32_t* sd, si
  * Extract surface triangles from a tetrahedral mesh.
  *
  * Convention: the geometric normal of each output triangle points toward the
- * FRONT medium side. In packed_media, front is stored in bits [31:16] and
+ * FRONT medium side. In packed_media, front is stored in bits [30:16] and
  * back in bits [15:0].
  *
  * For a photon traveling from medium A to medium B through this triangle:
@@ -349,24 +801,16 @@ static void load_mesh_surf(const std::vector<Vec3>& nodes, const int32_t* sd, si
  *
  * This is exactly what the shader does: new_mid = ff ? bm : fm;
  *
- * To make this work correctly, we orient the triangle normal to point OUTWARD
- * from the back-medium region (i.e., toward the front-medium region). This way:
- *   - A ray inside the "back" region heading outward hits the BACK face
- *     (ray direction aligned with normal → front_face=false) → new_mid = front
- *   - A ray from the "front" region heading inward hits the FRONT face
- *     (ray direction against normal → front_face=true) → new_mid = back
- *
- * For exterior faces (front=0, back=region), we orient the normal to point
- * outward from the mesh (toward medium 0/exterior). This means:
+ * For exterior faces (front=0, back=region), the normal points outward from
+ * the mesh (toward medium 0/exterior):
  *   - Photon inside mesh heading out → hits back face → new_mid = 0 (exit)
  *   - Photon outside heading in → hits front face → new_mid = region (enter)
+ *
+ * Faces shared by more than two tetrahedra (a non-manifold mesh) are rejected.
  */
 static void extract_surface_from_tet(const std::vector<Vec3>& nodes, const int32_t* elems,
                                      size_t ne, std::vector<std::array<uint32_t, 3> >& out_f,
                                      std::vector<FaceData>& out_d) {
-    /* Each tet face is opposite to one vertex. The face indices (in the
-       standard MMC convention) and their outward-pointing winding relative
-       to the tet interior: */
     static const int ftab[4][3] = {{0, 3, 1}, {3, 2, 1}, {0, 2, 3}, {0, 1, 2}};
 
     struct FInfo {
@@ -374,6 +818,7 @@ static void extract_surface_from_tet(const std::vector<Vec3>& nodes, const int32
         int r1;             /* region of first tet */
         int r2;             /* region of second tet (-1 if exterior) */
         int tet1;           /* index of first tet */
+        int count;          /* number of tets sharing this face */
     };
 
     std::map<FaceKey, FInfo> fmap;
@@ -403,8 +848,14 @@ static void extract_surface_from_tet(const std::vector<Vec3>& nodes, const int32
                 fi.r1 = reg;
                 fi.r2 = -1;
                 fi.tet1 = (int)e;
+                fi.count = 1;
                 fmap[k] = fi;
             } else {
+                if (++it->second.count > 2) {
+                    vkmmc_fail("MeshElem: a triangle is shared by more than two tetrahedra (element " +
+                               std::to_string(e + 1) + ")");
+                }
+
                 it->second.r2 = reg;
             }
         }
@@ -416,8 +867,8 @@ static void extract_surface_from_tet(const std::vector<Vec3>& nodes, const int32
     for (std::map<FaceKey, FInfo>::iterator it = fmap.begin(); it != fmap.end(); ++it) {
         FInfo& fi = it->second;
 
-        /* Skip internal faces where both sides are the same region */
-        if (fi.r2 >= 0 && fi.r1 == fi.r2) {
+        /* Skip faces with the same medium on both sides (incl. label-0 elements on the exterior) */
+        if ((fi.r2 >= 0 && fi.r1 == fi.r2) || (fi.r2 < 0 && fi.r1 == 0)) {
             continue;
         }
 
@@ -427,22 +878,16 @@ static void extract_surface_from_tet(const std::vector<Vec3>& nodes, const int32
         Vec3 N = v3cross(e1, e2);
         float l = v3len(N);
 
-        if (l > 0) {
-            N.x /= l;
-            N.y /= l;
-            N.z /= l;
+        if (!(l > 0)) {
+            continue;   /* degenerate triangle: cannot be hit */
         }
 
-        /* Determine front and back media:
-           front = the medium on the side the normal points toward
-           back  = the medium on the opposite side
-
-           We need the normal to point toward the front medium.
-           First, figure out which tet (r1) the current winding's normal
-           points away from, using the opposite vertex of tet1. */
+        N.x /= l;
+        N.y /= l;
+        N.z /= l;
 
         /* Find the 4th vertex of tet1 (the one not on this face) */
-        const int32_t* row1 = elems + fi.tet1 * 5;
+        const int32_t* row1 = elems + (size_t)fi.tet1 * 5;
         uint32_t tet1_verts[4] = {(uint32_t)(row1[0] - 1), (uint32_t)(row1[1] - 1),
                                   (uint32_t)(row1[2] - 1), (uint32_t)(row1[3] - 1)
                                  };
@@ -464,117 +909,91 @@ static void extract_surface_from_tet(const std::vector<Vec3>& nodes, const int32
         float dx = opp.x - cx, dy = opp.y - cy, dz = opp.z - cz;
         float dot = N.x * dx + N.y * dy + N.z * dz;
 
-        /* If dot > 0, normal points toward tet1's interior (toward r1).
-           If dot < 0, normal points away from tet1 (toward r2 or exterior).
-
-           We want the convention:
-             normal points toward front_med, away from back_med.
-
-           For exterior faces (r2 = -1): front = 0 (exterior), back = r1.
-             Normal should point outward (away from r1) → dot < 0 is correct.
-             If dot > 0, flip.
-
-           For interior faces (r2 >= 0): front = r2, back = r1.
-             Normal should point away from r1 toward r2 → dot < 0 is correct.
-             If dot > 0, flip. */
-
-        uint32_t front_med, back_med;
-
+        /* the normal must point away from tet1 (region r1, the back medium) */
         if (dot > 0) {
-            /* Normal points toward r1. Flip it so it points away from r1. */
             N.x = -N.x;
             N.y = -N.y;
             N.z = -N.z;
-            /* Swap winding */
             uint32_t tmp = fi.v[1];
             fi.v[1] = fi.v[2];
             fi.v[2] = tmp;
         }
 
-        /* Now normal points away from r1.
-           back = r1, front = r2 (or 0 for exterior) */
-        back_med = (uint32_t)fi.r1;
-        front_med = (fi.r2 >= 0) ? (uint32_t)fi.r2 : 0u;
+        uint32_t back_med = (uint32_t)fi.r1;
+        uint32_t front_med = (fi.r2 >= 0) ? (uint32_t)fi.r2 : 0u;
 
         out_f.push_back({{fi.v[0], fi.v[1], fi.v[2]}});
         out_d.push_back({N.x, N.y, N.z, pack_media(front_med, back_med)});
     }
 
-    std::cout << "Extracted " << out_f.size() << " surface triangles from " << ne << " tetrahedra\n";
+    printf("Extracted %zu surface triangles from %zu tetrahedra\n", out_f.size(), ne);
 }
 
 // ============================================================================
 // Parse helpers
 // ============================================================================
+
+/* source type id; -1 if unknown */
 static int parse_srctype(const std::string& s) {
-    if (s == "pencil") {
-        return 0;
+    static const char* names[] = {"pencil", "isotropic", "cone", "gaussian", "planar", "pattern",
+                                  "fourier", "arcsine", "disk", "", "", "zgaussian", "line", "slit"
+                                 };
+
+    for (int i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++) {
+        if (names[i][0] && s == names[i]) {
+            return i;
+        }
     }
 
-    if (s == "isotropic") {
-        return 1;
-    }
-
-    if (s == "cone") {
-        return 2;
-    }
-
-    if (s == "gaussian") {
-        return 3;
-    }
-
-    if (s == "planar") {
-        return 4;
-    }
-
-    if (s == "pattern") {
-        return 5;
-    }
-
-    if (s == "fourier") {
-        return 6;
-    }
-
-    if (s == "arcsine") {
-        return 7;
-    }
-
-    if (s == "disk") {
-        return 8;
-    }
-
-    if (s == "zgaussian") {
-        return 11;
-    }
-
-    if (s == "line") {
-        return 12;
-    }
-
-    if (s == "slit") {
-        return 13;
-    }
-
-    return 0;
+    return -1;
 }
 
-static int parse_outputtype(const std::string& s) {
+static const char* srctype_name(int t) {
+    switch (t) {
+        case SRC_PENCIL:
+            return "pencil";
+
+        case SRC_PLANAR:
+            return "planar";
+
+        case SRC_DISK:
+            return "disk";
+
+        default:
+            return "unknown";
+    }
+}
+
+/* source types the GPU kernels implement */
+static bool srctype_supported(int t) {
+    return t == SRC_PENCIL || t == SRC_PLANAR || t == SRC_DISK;
+}
+
+/* output type from a name or its first letter: flux, fluence, energy; -1 if unknown */
+static int parse_outputtype(const std::string& name) {
+    std::string s(name);
+
+    for (size_t i = 0; i < s.size(); i++) {
+        s[i] = (char)tolower((unsigned char)s[i]);
+    }
+
     if (s.empty()) {
-        return 2;
+        return OT_ENERGY;
     }
 
     switch (s[0]) {
         case 'f':
-            return 0;
+            return (s.compare(0, 5, "fluen") == 0) ? OT_FLUENCE : OT_FLUX;
 
         case 'l':
-            return 1;
+            return OT_FLUENCE;
 
         case 'x':
-            return 2;
+        case 'e':
+            return OT_ENERGY;
     }
 
-    return 2;
+    return -1;
 }
 
 static void update_bbox(SimConfig& cfg) {
@@ -583,285 +1002,360 @@ static void update_bbox(SimConfig& cfg) {
 
     for (size_t i = 0; i < cfg.nodes.size(); i++) {
         Vec3& v = cfg.nodes[i];
+        cfg.nmin.x = std::min(cfg.nmin.x, v.x);
+        cfg.nmin.y = std::min(cfg.nmin.y, v.y);
+        cfg.nmin.z = std::min(cfg.nmin.z, v.z);
+        cfg.nmax.x = std::max(cfg.nmax.x, v.x);
+        cfg.nmax.y = std::max(cfg.nmax.y, v.y);
+        cfg.nmax.z = std::max(cfg.nmax.z, v.z);
+    }
+}
 
-        if (v.x < cfg.nmin.x) {
-            cfg.nmin.x = v.x;
+// ============================================================================
+// Load a numeric table (JData or inline JSON array of rows) as row-major doubles
+// ============================================================================
+static std::vector<double> load_table(const json& v, size_t mincols, size_t& rows, size_t& cols,
+                                      const std::string& ctx) {
+    std::vector<double> out;
+
+    if (v.is_object()) {
+        JDataArray a = jdata_decode_array(v, ctx);
+        vkmmc_require(a.dims.size() == 2, ctx + " must be a 2-D array");
+        rows = a.dims[0];
+        cols = a.dims[1];
+        size_t n = a.numel();
+        out.resize(n);
+
+        for (size_t i = 0; i < n; i++) {
+            out[i] = a.at(i);
         }
+    } else {
+        vkmmc_require(v.is_array(), ctx + " must be a JData object or an array of rows");
+        rows = v.size();
+        cols = rows ? v[0].size() : 0;
+        out.reserve(rows * cols);
 
-        if (v.y < cfg.nmin.y) {
-            cfg.nmin.y = v.y;
-        }
+        for (size_t i = 0; i < rows; i++) {
+            vkmmc_require(v[i].is_array() && v[i].size() == cols,
+                          ctx + " row " + std::to_string(i + 1) + " must have " + std::to_string(cols) + " numbers");
 
-        if (v.z < cfg.nmin.z) {
-            cfg.nmin.z = v.z;
-        }
-
-        if (v.x > cfg.nmax.x) {
-            cfg.nmax.x = v.x;
-        }
-
-        if (v.y > cfg.nmax.y) {
-            cfg.nmax.y = v.y;
-        }
-
-        if (v.z > cfg.nmax.z) {
-            cfg.nmax.z = v.z;
+            for (size_t j = 0; j < cols; j++) {
+                vkmmc_require(v[i][j].is_number(), ctx + " must contain only numbers");
+                out.push_back(v[i][j].get<double>());
+            }
         }
     }
+
+    vkmmc_require(rows > 0, ctx + " is empty");
+    vkmmc_require(cols >= mincols, ctx + " needs at least " + std::to_string(mincols) + " columns");
+
+    for (size_t i = 0; i < out.size(); i++) {
+        vkmmc_require(std::isfinite(out[i]), ctx + " contains a NaN or Inf");
+    }
+
+    return out;
 }
 
 // ============================================================================
 // Load nodes (JData or inline JSON array)
 // ============================================================================
 static void load_nodes(const json& mn, SimConfig& cfg) {
-    if (mn.contains("_ArraySize_")) {
-        std::vector<size_t> dims;
-        json da = mn["_ArraySize_"];
+    size_t nn = 0, cols = 0;
+    std::vector<double> d = load_table(mn, 3, nn, cols, "Shapes.MeshNode");
+    vkmmc_require(nn <= 0x7FFFFFFFu, "Shapes.MeshNode: too many nodes");
+    cfg.nodes.resize(nn);
 
-        for (size_t i = 0; i < da.size(); i++) {
-            dims.push_back(da[i].get<size_t>());
+    for (size_t i = 0; i < nn; i++) {
+        cfg.nodes[i] = {(float)d[i * cols], (float)d[i * cols + 1], (float)d[i * cols + 2]};
+
+        if (!std::isfinite(cfg.nodes[i].x) || !std::isfinite(cfg.nodes[i].y) || !std::isfinite(cfg.nodes[i].z)) {
+            vkmmc_fail("Shapes.MeshNode: node " + std::to_string(i + 1) + " is outside the float range");
         }
-
-        size_t nn = dims[0];
-        std::vector<uint8_t> raw = jdata_decode(mn);
-        const float* fd = reinterpret_cast<const float*>(raw.data());
-        cfg.nodes.resize(nn);
-
-        for (size_t i = 0; i < nn; i++) cfg.nodes[i] = {fd[i * 3], fd[i * 3 + 1], fd[i * 3 + 2]};
-
-        std::cout << "MeshNode: " << nn << " nodes\n";
-    } else if (mn.is_array()) {
-        size_t nn = mn.size();
-        cfg.nodes.resize(nn);
-
-        for (size_t i = 0; i < nn; i++)
-            cfg.nodes[i] = {mn[i][0].get<float>(), mn[i][1].get<float>(), mn[i][2].get<float>()};
-
-        std::cout << "MeshNode: " << nn << " nodes (inline)\n";
     }
 
+    printf("MeshNode: %zu nodes\n", nn);
     update_bbox(cfg);
 }
 
-// ============================================================================
-// Load elements (JData or inline), returns raw int32 buffer + count/cols
-// ============================================================================
-static void load_elems(const json& me, std::vector<uint8_t>& raw_out,
-                       const int32_t*& data_out, size_t& count_out, size_t& cols_out) {
-    if (me.contains("_ArraySize_")) {
-        json da = me["_ArraySize_"];
-        count_out = da[0].get<size_t>();
-        cols_out = da[1].get<size_t>();
-        raw_out = jdata_decode(me);
-        data_out = reinterpret_cast<const int32_t*>(raw_out.data());
-    } else if (me.is_array()) {
-        count_out = me.size();
-        cols_out = me[0].size();
-        raw_out.resize(count_out * cols_out * sizeof(int32_t));
-        int32_t* buf = reinterpret_cast<int32_t*>(raw_out.data());
+/*
+ * Load elements (JData or inline) as int32 rows of ncols: node indices are
+ * checked against 1..nn and the label (last column) against 0..maxlabel.
+ */
+static std::vector<int32_t> load_elems(const json& me, size_t nnodes, size_t nnode_cols, size_t maxlabel,
+                                       size_t& count, const std::string& ctx) {
+    size_t cols = 0;
+    std::vector<double> d = load_table(me, nnode_cols + 1, count, cols, ctx);
+    std::vector<int32_t> out(count * (nnode_cols + 1));
 
-        for (size_t i = 0; i < count_out; i++)
-            for (size_t j = 0; j < cols_out; j++) {
-                buf[i * cols_out + j] = me[i][j].get<int32_t>();
+    for (size_t i = 0; i < count; i++) {
+        for (size_t j = 0; j < nnode_cols; j++) {
+            double v = d[i * cols + j];
+
+            if (!(v >= 1 && v <= (double)nnodes) || v != std::floor(v)) {
+                vkmmc_fail(ctx + " row " + std::to_string(i + 1) + ": node index " + std::to_string(v) +
+                           " is not an integer in [1, " + std::to_string(nnodes) + "]");
             }
 
-        data_out = buf;
+            out[i * (nnode_cols + 1) + j] = (int32_t)v;
+        }
+
+        double lab = d[i * cols + cols - 1];
+
+        if (!(lab >= 0 && lab <= (double)maxlabel) || lab != std::floor(lab)) {
+            vkmmc_fail(ctx + " row " + std::to_string(i + 1) + ": label " + std::to_string(lab) +
+                       " is not an integer in [0, " + std::to_string(maxlabel) + "]");
+        }
+
+        out[i * (nnode_cols + 1) + nnode_cols] = (int32_t)lab;
     }
+
+    return out;
 }
 
 // ============================================================================
 // Main JSON loader
 // ============================================================================
-static SimConfig load_json_input(const char* filepath) {
-    std::ifstream f(filepath);
 
-    if (!f) {
-        throw std::runtime_error(std::string("Cannot open: ") + filepath);
-    }
+/* largest label a medium list of this size can resolve */
+static size_t max_label(const SimConfig& cfg) {
+    return cfg.media.empty() ? 0 : std::min(cfg.media.size() - 1, (size_t)VKMMC_MAX_MESH_LABEL);
+}
 
-    json j;
-    f >> j;
+static SimConfig load_json_config(const json& j) {
     SimConfig cfg;
+
+    vkmmc_require(j.is_object(), "input must be a JSON object");
 
     // Session
     if (j.contains("Session")) {
-        json& s = j["Session"];
-        cfg.session_id = s.value("ID", "default");
-        cfg.nphoton = s.value("Photons", (uint64_t)1000000);
-        cfg.rng_seed = s.value("RNGSeed", (uint32_t)29012391);
-        cfg.do_mismatch = s.value("DoMismatch", true);
-        cfg.do_normalize = s.value("DoNormalize", true);
-        cfg.output_type = parse_outputtype(s.value("OutputType", "x"));
-        cfg.minenergy = s.value("RussianRoulette", 1e-6f);
-        cfg.roulettesize = s.value("RussianRouletteSize", 10.0f);
-        cfg.debuglevel = s.value("DebugFlag", 0u);
-        cfg.maxjumpdebug = s.value("MaxJumpDebug", 10000000u);
+        const json& s = j["Session"];
+        vkmmc_require(s.is_object(), "Session must be an object");
+        cfg.session_id = json_str(s, "ID", "default", "Session");
+        vkmmc_require(!cfg.session_id.empty() && cfg.session_id.size() < 256, "Session.ID must have 1-255 characters");
+        cfg.nphoton = (uint64_t)json_num_range(s, "Photons", 1e6, 1, 9.2e18, "Session");
+        cfg.rng_seed = (uint32_t)(int64_t)json_num_range(s, "RNGSeed", 29012391, -2147483648.0, 4294967295.0, "Session");
+        cfg.do_mismatch = json_bool(s, "DoMismatch", true, "Session");
+        cfg.do_normalize = json_bool(s, "DoNormalize", true, "Session");
+        cfg.output_type = parse_outputtype(json_str(s, "OutputType", "x", "Session"));
+        vkmmc_require(cfg.output_type >= 0, "Session.OutputType must be flux, fluence or energy (f/l/x)");
+        cfg.minenergy = (float)json_num_range(s, "RussianRoulette", 1e-6, 0, 1, "Session");
+        cfg.roulettesize = (float)json_num_range(s, "RussianRouletteSize", 10, 1, 1e6, "Session");
+        cfg.debuglevel = (uint32_t)json_num_range(s, "DebugFlag", 0, 0, 4294967295.0, "Session");
+        cfg.maxjumpdebug = (uint32_t)json_num_range(s, "MaxJumpDebug", 1e7, 0, 1e9, "Session");
     }
 
     // Forward
     if (j.contains("Forward")) {
-        json& fw = j["Forward"];
-        double d0 = fw.value("T0", 0.0), d1 = fw.value("T1", 5e-9), dd = fw.value("Dt", 5e-9);
+        const json& fw = j["Forward"];
+        vkmmc_require(fw.is_object(), "Forward must be an object");
+        double d0 = json_num(fw, "T0", 0.0, "Forward"), d1 = json_num(fw, "T1", 5e-9, "Forward");
+        double dd = json_num(fw, "Dt", d1 - d0, "Forward");
+        vkmmc_require(d0 >= 0 && d1 > d0, "Forward: need 0 <= T0 < T1");
+        vkmmc_require(dd > 0, "Forward.Dt must be positive");
+        double ng = std::floor((d1 - d0) / dd + 0.5);
+        vkmmc_require(ng <= VKMMC_MAX_GATES, "Forward: (T1-T0)/Dt gives more than " + std::to_string(VKMMC_MAX_GATES) + " time gates");
         cfg.t0 = (float)d0;
         cfg.t1 = (float)d1;
         cfg.dt = (float)dd;
-        cfg.maxgate = (int)((d1 - d0) / dd + 0.5);
-
-        if (cfg.maxgate < 1) {
-            cfg.maxgate = 1;
-        }
-
+        cfg.maxgate = std::max(1, (int)ng);
         printf("Forward: T0=%.4e T1=%.4e Dt=%.4e maxgate=%d\n", d0, d1, dd, cfg.maxgate);
     }
 
     // Domain
-    if (j.contains("Domain")) {
-        json& d = j["Domain"];
-        cfg.unitinmm = d.value("LengthUnit", 1.0f);
+    vkmmc_require(j.contains("Domain") && j["Domain"].is_object(), "input requires a Domain object");
+    const json& d = j["Domain"];
+    cfg.unitinmm = (float)json_num_range(d, "LengthUnit", 1.0, 1e-6, 1e6, "Domain");
 
-        if (d.contains("Media")) {
-            cfg.media.clear();
-            json ma = d["Media"];
+    vkmmc_require(d.contains("Media"), "Domain requires Media");
+    {
+        json ma = d["Media"];
 
-            if (ma.is_array() && ma.size() > 0 && ma[0].is_array()) {
-                ma = ma[0];    // unwrap [[...]]
-            }
-
-            for (size_t i = 0; i < ma.size(); i++) {
-                json& m = ma[i];
-                Medium med = {m.value("mua", 0.f)* cfg.unitinmm, m.value("mus", 0.f)* cfg.unitinmm,
-                              m.value("g", 1.f), m.value("n", 1.f)
-                             };
-                cfg.media.push_back(med);
-                printf("  Media[%zu]: mua=%.6f mus=%.6f g=%.4f n=%.4f\n", i, med.mua, med.mus, med.g, med.n);
-            }
+        /* unwrap [[{...}, ...]]; a list of 4-number rows [[mua,mus,g,n], ...] is kept */
+        if (ma.is_array() && ma.size() == 1 && ma[0].is_array() && !ma[0].empty() && !ma[0][0].is_number()) {
+            ma = ma[0];
         }
 
-        if (d.contains("Dim")) {
-            json dm = d["Dim"];
-            cfg.grid_dim[0] = dm[0].get<uint32_t>();
-            cfg.grid_dim[1] = dm[1].get<uint32_t>();
-            cfg.grid_dim[2] = dm[2].get<uint32_t>();
-            cfg.has_grid_dim = true;
-        }
+        vkmmc_require(ma.is_array() && ma.size() >= 1, "Domain.Media must be a non-empty array");
+        vkmmc_require(ma.size() <= VKMMC_MAX_MEDIA, "Domain.Media: at most " + std::to_string(VKMMC_MAX_MEDIA) + " media are supported");
 
-        if (d.contains("Step")) {
-            json st = d["Step"];
+        for (size_t i = 0; i < ma.size(); i++) {
+            std::string ctx = "Domain.Media[" + std::to_string(i) + "]";
+            const json& m = ma[i];
+            Medium med;
 
-            for (int i = 0; i < (int)st.size() && i < 3; i++) {
-                cfg.steps[i] = st[i].get<float>();
+            if (m.is_array()) {
+                std::vector<double> p = json_vec(m, 4, 4, ctx);
+                med = {(float)p[0], (float)p[1], (float)p[2], (float)p[3]};
+            } else {
+                vkmmc_require(m.is_object(), ctx + " must be an object {mua,mus,g,n}");
+                med = {(float)json_num(m, "mua", 0, ctx), (float)json_num(m, "mus", 0, ctx),
+                       (float)json_num(m, "g", 1, ctx), (float)json_num(m, "n", 1, ctx)
+                      };
             }
 
-            cfg.has_steps = true;
-        }
-
-        if (d.contains("MeshRes")) {
-            cfg.mesh_res = d["MeshRes"].get<int>();
-            printf("MeshRes: %d\n", cfg.mesh_res);
+            vkmmc_require(med.mua >= 0 && med.mua < 1e6f, ctx + ".mua must be in [0, 1e6)");
+            vkmmc_require(med.mus >= 0 && med.mus < 1e6f, ctx + ".mus must be in [0, 1e6)");
+            vkmmc_require(med.g >= -1 && med.g <= 1, ctx + ".g must be in [-1, 1]");
+            vkmmc_require(med.n >= 0.01f && med.n <= 100, ctx + ".n must be in [0.01, 100]");
+            cfg.media.push_back(med);
+            printf("  Media[%zu]: mua=%.6f mus=%.6f g=%.4f n=%.4f\n", i, med.mua, med.mus, med.g, med.n);
         }
     }
 
+    if (d.contains("Step")) {
+        std::vector<double> st = json_vec(d["Step"], 1, 3, "Domain.Step");
+
+        for (size_t i = 0; i < 3; i++) {
+            cfg.steps[i] = (float)st[std::min(i, st.size() - 1)];
+            vkmmc_require(cfg.steps[i] > 1e-6f && cfg.steps[i] < 1e6f, "Domain.Step must be in (1e-6, 1e6)");
+        }
+
+        cfg.has_steps = true;
+    }
+
+    if (d.contains("MeshRes")) {
+        cfg.mesh_res = (int)json_num_range(d, "MeshRes", 24, 1, VKMMC_MAX_MESHRES, "Domain");
+        printf("MeshRes: %d\n", cfg.mesh_res);
+    }
+
     // Optode / Source
-    if (j.contains("Optode") && j["Optode"].contains("Source")) {
-        json& src = j["Optode"]["Source"];
-        cfg.srctype = parse_srctype(src.value("Type", "pencil"));
+    if (j.contains("Optode") && j["Optode"].is_object() && j["Optode"].contains("Source")) {
+        const json& src = j["Optode"]["Source"];
+        vkmmc_require(src.is_object(), "Optode.Source must be an object");
+        std::string tname = json_str(src, "Type", "pencil", "Optode.Source");
+        cfg.srctype = parse_srctype(tname);
+        vkmmc_require(cfg.srctype >= 0, "Optode.Source.Type '" + tname + "' is not a known source type");
+        vkmmc_require(srctype_supported(cfg.srctype),
+                      "Optode.Source.Type '" + tname + "' is not supported yet (use pencil, planar or disk)");
 
         if (src.contains("Pos")) {
-            json p = src["Pos"];
-            cfg.srcpos[0] = p[0];
-            cfg.srcpos[1] = p[1];
-            cfg.srcpos[2] = p[2];
+            std::vector<double> p = json_vec(src["Pos"], 3, 3, "Optode.Source.Pos");
+
+            for (int i = 0; i < 3; i++) {
+                cfg.srcpos[i] = (float)p[i];
+            }
         }
 
         if (src.contains("Dir")) {
-            json d = src["Dir"];
+            std::vector<double> p = json_vec(src["Dir"], 3, 4, "Optode.Source.Dir");
 
-            for (int i = 0; i < (int)d.size() && i < 4; i++) {
-                cfg.srcdir[i] = d[i];
+            for (size_t i = 0; i < p.size(); i++) {
+                cfg.srcdir[i] = (float)p[i];
             }
         }
 
         if (src.contains("Param1")) {
-            json p = src["Param1"];
+            std::vector<double> p = json_vec(src["Param1"], 1, 4, "Optode.Source.Param1");
 
-            for (int i = 0; i < (int)p.size() && i < 4; i++) {
-                cfg.srcparam1[i] = p[i];
+            for (size_t i = 0; i < p.size(); i++) {
+                cfg.srcparam1[i] = (float)p[i];
             }
         }
 
         if (src.contains("Param2")) {
-            json p = src["Param2"];
+            std::vector<double> p = json_vec(src["Param2"], 1, 4, "Optode.Source.Param2");
 
-            for (int i = 0; i < (int)p.size() && i < 4; i++) {
-                cfg.srcparam2[i] = p[i];
+            for (size_t i = 0; i < p.size(); i++) {
+                cfg.srcparam2[i] = (float)p[i];
             }
+        }
+
+        if (cfg.srctype == SRC_DISK) {
+            vkmmc_require(cfg.srcparam1[0] >= 0, "Optode.Source.Param1[0] (disk radius) must be non-negative");
+        }
+    }
+
+    {
+        double l = std::sqrt((double)cfg.srcdir[0] * cfg.srcdir[0] + (double)cfg.srcdir[1] * cfg.srcdir[1] +
+                             (double)cfg.srcdir[2] * cfg.srcdir[2]);
+        vkmmc_require(l > 1e-10, "Optode.Source.Dir must be a non-zero vector");
+
+        for (int i = 0; i < 3; i++) {
+            cfg.srcdir[i] = (float)(cfg.srcdir[i] / l);
         }
     }
 
     // Shapes
-    if (!j.contains("Shapes")) {
-        throw std::runtime_error("JSON missing 'Shapes'");
-    }
-
-    json shapes = j["Shapes"];
+    vkmmc_require(j.contains("Shapes"), "input requires 'Shapes' (a shape array or a mesh object)");
+    const json& shapes = j["Shapes"];
 
     if (shapes.is_array()) {
-        // ---- CSG shape mode ----
+        // ---- CSG shape mode: meshes are generated by build_shape_mesh() ----
+        vkmmc_require(shapes.size() > 0, "Shapes is an empty array");
         cfg.is_csg = true;
         cfg.mediumid0 = 0xFFFFFFFFu;
-        // Shape mesh generation is handled externally via vkmmc_shapes.h
-        // Store the shapes JSON for later processing
-        // For now, we just note it's CSG mode; the caller will invoke parse_shapes()
+        cfg.shapes = shapes;
         printf("Shapes: CSG mode detected (array of shape constructs)\n");
     } else {
         // ---- Mesh mode ----
+        vkmmc_require(shapes.is_object(), "Shapes must be an array of shapes or a mesh object");
         cfg.is_csg = false;
 
-        // Load nodes
-        if (!shapes.contains("MeshNode")) {
-            throw std::runtime_error("Mesh mode requires MeshNode");
-        }
-
+        vkmmc_require(shapes.contains("MeshNode"), "Mesh mode requires Shapes.MeshNode");
         load_nodes(shapes["MeshNode"], cfg);
 
-        // Load faces
-        std::vector<uint8_t> elem_raw;
-        const int32_t* elem_data = NULL;
-        size_t elem_count = 0, elem_cols = 0;
+        std::vector<int32_t> elem;
+        size_t elem_count = 0;
 
         if (shapes.contains("MeshSurf")) {
-            json& ms = shapes["MeshSurf"];
-
-            if (ms.contains("_ArraySize_")) {
-                json da = ms["_ArraySize_"];
-                size_t nf = da[0].get<size_t>();
-                std::vector<uint8_t> raw = jdata_decode(ms);
-                load_mesh_surf(cfg.nodes, reinterpret_cast<const int32_t*>(raw.data()), nf, cfg.faces, cfg.facedata);
-            }
+            size_t nf = 0;
+            std::vector<int32_t> sd = load_elems(shapes["MeshSurf"], cfg.nodes.size(), 3, max_label(cfg), nf,
+                                                 "Shapes.MeshSurf");
+            load_mesh_surf(cfg.nodes, sd.data(), nf, cfg.faces, cfg.facedata);
         } else if (shapes.contains("MeshElem")) {
-            load_elems(shapes["MeshElem"], elem_raw, elem_data, elem_count, elem_cols);
-
-            if (elem_data && elem_cols == 5) {
-                std::cout << "MeshElem: " << elem_count << " tetrahedra\n";
-                extract_surface_from_tet(cfg.nodes, elem_data, elem_count, cfg.faces, cfg.facedata);
-            }
+            elem = load_elems(shapes["MeshElem"], cfg.nodes.size(), 4, max_label(cfg), elem_count,
+                              "Shapes.MeshElem");
+            printf("MeshElem: %zu tetrahedra\n", elem_count);
+            extract_surface_from_tet(cfg.nodes, elem.data(), elem_count, cfg.faces, cfg.facedata);
         } else {
-            throw std::runtime_error("Mesh mode requires MeshSurf or MeshElem");
+            vkmmc_fail("Mesh mode requires Shapes.MeshSurf or Shapes.MeshElem");
         }
 
-        // InitElem
-        if (shapes.contains("InitElem")) {
-            cfg.init_elem = shapes["InitElem"].get<int>();
+        vkmmc_require(!cfg.faces.empty(), "the mesh has no surface triangles between different media");
 
-            if (elem_data && cfg.init_elem > 0 && cfg.init_elem <= (int)elem_count) {
-                int region = elem_data[(cfg.init_elem - 1) * elem_cols + (elem_cols - 1)];
-                cfg.mediumid0 = (uint32_t)region;
+        if (shapes.contains("InitElem")) {
+            double ie = json_num(shapes, "InitElem", -1, "Shapes");
+            vkmmc_require(ie == std::floor(ie) && ie >= -1 && ie <= 2147483647.0, "Shapes.InitElem must be an element index");
+            cfg.init_elem = (int)ie;
+
+            if (cfg.init_elem > 0) {
+                vkmmc_require(!elem.empty(), "Shapes.InitElem requires Shapes.MeshElem");
+                vkmmc_require(cfg.init_elem <= (int)elem_count, "Shapes.InitElem is larger than the element count");
+                cfg.mediumid0 = (uint32_t)elem[(size_t)(cfg.init_elem - 1) * 5 + 4];
                 printf("InitElem: %d, medium type: %u\n", cfg.init_elem, cfg.mediumid0);
             }
         }
     }
 
     return cfg;
+}
+
+/* parse a JSON file; a JSON string passed with -j/--json is merged on top */
+static json load_json_file(const char* filepath, const std::string& patch = std::string()) {
+    std::ifstream f(filepath, std::ios::binary);
+
+    if (!f) {
+        throw std::runtime_error(std::string("cannot open input file: ") + filepath);
+    }
+
+    json j;
+
+    try {
+        j = json::parse(f);
+
+        if (!patch.empty()) {
+            j.merge_patch(json::parse(patch));
+        }
+    } catch (const json::parse_error& e) {
+        throw std::runtime_error(std::string("JSON syntax error in ") + (patch.empty() ? filepath : "input or -j") +
+                                 ": " + e.what());
+    }
+
+    return j;
+}
+
+static inline SimConfig load_json_input(const char* filepath) {
+    return load_json_config(load_json_file(filepath));
 }
 
 #endif // VKMMC_IO_H

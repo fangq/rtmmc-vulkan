@@ -24,6 +24,7 @@
 #include <string>
 #include <cstdio>
 #include <algorithm>
+#include <map>
 #include "nlohmann/json.hpp"
 
 using json = nlohmann::json;
@@ -45,20 +46,19 @@ static float pack_tag(uint32_t tag) {
 
 /* pack tag with bit-31 set to mark triangle as geometrically flat */
 static float pack_tag_flat(uint32_t tag) {
-    uint32_t pk = (tag & 0xFFFFu) | 0x80000000u;
+    uint32_t pk = (tag & 0xFFFFu) | VKMMC_FACE_FLAT;
     float f;
     std::memcpy(&f, &pk, 4);
     return f;
 }
 
 /*
- * add_tri_outward: add one triangle, ensuring its winding produces an outward
- * normal (i.e. pointing away from 'center'). If the computed cross-product
- * normal points toward center, the winding is flipped.
+ * add_tri_toward: add one triangle, winding it so that its normal has a
+ * non-negative component along the outward reference direction ref.
  * front=0, back=tag (CSG convention).
  */
-static void add_tri_outward(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c,
-                            uint32_t tag, Vec3 center, bool flat = false) {
+static void add_tri_toward(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c,
+                           uint32_t tag, Vec3 ref, bool flat = false) {
     Vec3 va = m.nodes[a], vb = m.nodes[b], vc = m.nodes[c];
     Vec3 e1 = {vb.x - va.x, vb.y - va.y, vb.z - va.z};
     Vec3 e2 = {vc.x - va.x, vc.y - va.y, vc.z - va.z};
@@ -71,16 +71,7 @@ static void add_tri_outward(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c,
         n.z /= l;
     }
 
-    /* Triangle centroid */
-    float cx = (va.x + vb.x + vc.x) / 3.0f;
-    float cy = (va.y + vb.y + vc.y) / 3.0f;
-    float cz = (va.z + vb.z + vc.z) / 3.0f;
-
-    /* Vector from shape center to centroid */
-    float dx = cx - center.x, dy = cy - center.y, dz = cz - center.z;
-
-    /* If normal points inward (toward center), flip winding */
-    if (n.x * dx + n.y * dy + n.z * dz < 0) {
+    if (n.x * ref.x + n.y * ref.y + n.z * ref.z < 0) {
         /* swap b and c to reverse winding */
         m.faces.push_back({{a, c, b}});
         n.x = -n.x;
@@ -96,6 +87,19 @@ static void add_tri_outward(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c,
     fd.nz = n.z;
     fd.packed_media = flat ? pack_tag_flat(tag) : pack_tag(tag);
     m.facedata.push_back(fd);
+}
+
+/*
+ * add_tri_outward: add one triangle with its normal pointing away from
+ * 'center' (correct for convex shapes such as boxes, spheres and cylinders).
+ */
+static void add_tri_outward(ShapeMesh& m, uint32_t a, uint32_t b, uint32_t c,
+                            uint32_t tag, Vec3 center, bool flat = false) {
+    Vec3 va = m.nodes[a], vb = m.nodes[b], vc = m.nodes[c];
+    Vec3 ref = {(va.x + vb.x + vc.x) / 3.0f - center.x, (va.y + vb.y + vc.y) / 3.0f - center.y,
+                (va.z + vb.z + vc.z) / 3.0f - center.z
+               };
+    add_tri_toward(m, a, b, c, tag, ref, flat);
 }
 
 /* add quad as 2 triangles with outward normals */
@@ -399,7 +403,6 @@ static void gen_lens(ShapeMesh& m,
     };
 
     uint32_t b = (uint32_t)m.nodes.size();
-    Vec3 center = {ox, oy, oz};
 
     /* ---- Nodes ---- */
 
@@ -453,23 +456,42 @@ static void gen_lens(ShapeMesh& m,
 
     size_t fi0 = m.faces.size();  /* start of front cap */
 
+    /* Orientation references: a cap is a graph over the disk, so its outward
+       normal always has a positive component along +n (front) or -n (back),
+       also for concave caps; the rim band faces radially outward. */
+    Vec3 nfront = {nx, ny, nz}, nback = {-nx, -ny, -nz};
+    auto rim_quad = [&](uint32_t a, uint32_t b2, uint32_t c, uint32_t d) {
+        const uint32_t v[4] = {a, b2, c, d};
+        Vec3 r = {0, 0, 0};
+
+        for (int k = 0; k < 4; k++) {
+            r.x += m.nodes[v[k]].x * 0.25f - ox * 0.25f;
+            r.y += m.nodes[v[k]].y * 0.25f - oy * 0.25f;
+            r.z += m.nodes[v[k]].z * 0.25f - oz * 0.25f;
+        }
+
+        float ax = r.x * nx + r.y * ny + r.z * nz;   /* remove the axial component */
+        Vec3 radial = {r.x - ax * nx, r.y - ax * ny, r.z - ax * nz};
+        add_tri_toward(m, a, b2, c, tag, radial, true);
+        add_tri_toward(m, a, c, d, tag, radial, true);
+    };
+
     /* Front cap: fan apex → ring 0 */
     for (int j = 0; j < nseg; j++) {
-        add_tri_outward(m, f_apex(), f_ring(0, j), f_ring(0, j + 1), tag, center);
+        add_tri_toward(m, f_apex(), f_ring(0, j), f_ring(0, j + 1), tag, nfront);
     }
 
     /* Front cap: rings 0 → nrings-1 (front rim) */
     for (int i = 0; i < nrings - 1; i++) {
         for (int j = 0; j < nseg; j++) {
-            add_quad_outward(m, f_ring(i, j), f_ring(i, j + 1),
-                             f_ring(i + 1, j + 1), f_ring(i + 1, j), tag, center);
+            add_tri_toward(m, f_ring(i, j), f_ring(i, j + 1), f_ring(i + 1, j + 1), tag, nfront);
+            add_tri_toward(m, f_ring(i, j), f_ring(i + 1, j + 1), f_ring(i + 1, j), tag, nfront);
         }
     }
 
     /* Edge: front rim → back rim (flat) */
     for (int j = 0; j < nseg; j++) {
-        add_quad_outward(m, f_ring(nrings - 1, j), f_ring(nrings - 1, j + 1),
-                         b_rim(j + 1), b_rim(j), tag, center, true);
+        rim_quad(f_ring(nrings - 1, j), f_ring(nrings - 1, j + 1), b_rim(j + 1), b_rim(j));
     }
 
     size_t fi2 = m.faces.size();  /* start of back cap */
@@ -478,27 +500,26 @@ static void gen_lens(ShapeMesh& m,
     if (nrings > 1) {
         /* back rim → back ring 0 */
         for (int j = 0; j < nseg; j++) {
-            add_quad_outward(m, b_rim(j), b_rim(j + 1),
-                             b_ring(0, j + 1), b_ring(0, j), tag, center);
+            add_tri_toward(m, b_rim(j), b_rim(j + 1), b_ring(0, j + 1), tag, nback);
+            add_tri_toward(m, b_rim(j), b_ring(0, j + 1), b_ring(0, j), tag, nback);
         }
 
         /* back rings 0 → nrings-2 */
         for (int i = 0; i < nrings - 2; i++) {
             for (int j = 0; j < nseg; j++) {
-                add_quad_outward(m, b_ring(i, j), b_ring(i, j + 1),
-                                 b_ring(i + 1, j + 1), b_ring(i + 1, j), tag, center);
+                add_tri_toward(m, b_ring(i, j), b_ring(i, j + 1), b_ring(i + 1, j + 1), tag, nback);
+                add_tri_toward(m, b_ring(i, j), b_ring(i + 1, j + 1), b_ring(i + 1, j), tag, nback);
             }
         }
 
         /* fan: back ring nrings-2 → apex_b */
         for (int j = 0; j < nseg; j++) {
-            add_tri_outward(m, b_ring(nrings - 2, j), b_ring(nrings - 2, j + 1),
-                            apex_b, tag, center);
+            add_tri_toward(m, b_ring(nrings - 2, j), b_ring(nrings - 2, j + 1), apex_b, tag, nback);
         }
     } else {
         /* nrings == 1: direct fan from back rim to apex */
         for (int j = 0; j < nseg; j++) {
-            add_tri_outward(m, b_rim(j), b_rim(j + 1), apex_b, tag, center);
+            add_tri_toward(m, b_rim(j), b_rim(j + 1), apex_b, tag, nback);
         }
     }
 
@@ -517,157 +538,441 @@ static void gen_lens(ShapeMesh& m,
 }
 
 /* ================================================================ */
-/*  Parse JSON Shapes array → combined mesh                         */
+/*  Coplanar overlapping faces                                      */
 /* ================================================================ */
-static ShapeMesh parse_shapes(const json& arr, float ext[6], int mesh_res = 24) {
-    ShapeMesh m;
-    int origin_counter = 0;
 
-    for (size_t si = 0; si < arr.size(); si++) {
-        const json& shape = arr[si];
+/* do two coplanar triangles overlap with a positive area? (2-D separating axis test) */
+static bool coplanar_tris_overlap(const Vec3* A, const Vec3* B, int ax0, int ax1, float tol) {
+    float a[3][2], b[3][2];
 
-        if (!shape.is_object()) {
+    for (int i = 0; i < 3; i++) {
+        const float* pa = &A[i].x;
+        const float* pb = &B[i].x;
+        a[i][0] = pa[ax0];
+        a[i][1] = pa[ax1];
+        b[i][0] = pb[ax0];
+        b[i][1] = pb[ax1];
+    }
+
+    for (int t = 0; t < 2; t++) {
+        float (*P)[2] = t ? b : a;
+
+        for (int e = 0; e < 3; e++) {
+            float nx = -(P[(e + 1) % 3][1] - P[e][1]), ny = P[(e + 1) % 3][0] - P[e][0];
+            float l = std::sqrt(nx * nx + ny * ny);
+
+            if (l <= 0) {
+                continue;
+            }
+
+            nx /= l;
+            ny /= l;
+            float amin = 1e30f, amax = -1e30f, bmin = 1e30f, bmax = -1e30f;
+
+            for (int i = 0; i < 3; i++) {
+                float pa = a[i][0] * nx + a[i][1] * ny, pb = b[i][0] * nx + b[i][1] * ny;
+                amin = std::min(amin, pa);
+                amax = std::max(amax, pa);
+                bmin = std::min(bmin, pb);
+                bmax = std::max(bmax, pb);
+            }
+
+            if (amax <= bmin + tol || bmax <= amin + tol) {
+                return false;   /* separated, or only touching */
+            }
+        }
+    }
+
+    return true;
+}
+
+/*
+ * Flag triangles that overlap a coplanar triangle (adjacent layers/slabs, a
+ * box flush with the domain, ...). A ray tracer reports only one of two
+ * coincident triangles, which would drop one of the two medium changes, so
+ * the kernels re-derive the set of enclosing shapes after crossing a flagged
+ * triangle. Returns the number of flagged triangles.
+ */
+static size_t flag_coplanar_faces(ShapeMesh& m) {
+    float lo = 1e30f, hi = -1e30f;
+
+    for (size_t i = 0; i < m.nodes.size(); i++) {
+        lo = std::min(lo, std::min(m.nodes[i].x, std::min(m.nodes[i].y, m.nodes[i].z)));
+        hi = std::max(hi, std::max(m.nodes[i].x, std::max(m.nodes[i].y, m.nodes[i].z)));
+    }
+
+    float tol = std::max(1e-5f, (hi - lo) * 1e-6f);
+
+    /* key: canonical normal direction (sign chosen so the largest component is positive) */
+    std::map<std::array<int, 3>, std::vector<std::pair<float, size_t> > > bynormal;
+
+    for (size_t i = 0; i < m.faces.size(); i++) {
+        float n[3] = {m.facedata[i].nx, m.facedata[i].ny, m.facedata[i].nz};
+        int big = (std::fabs(n[0]) >= std::fabs(n[1]) && std::fabs(n[0]) >= std::fabs(n[2])) ? 0 :
+                  (std::fabs(n[1]) >= std::fabs(n[2]) ? 1 : 2);
+        float sg = (n[big] < 0) ? -1.f : 1.f;
+        std::array<int, 3> key = {{(int)std::lround(n[0] * sg * 1e4f), (int)std::lround(n[1] * sg * 1e4f),
+                                   (int)std::lround(n[2] * sg * 1e4f)
+                                 }
+                                };
+        const Vec3& v = m.nodes[m.faces[i][0]];
+        float d = (n[0] * v.x + n[1] * v.y + n[2] * v.z) * sg;
+        bynormal[key].push_back(std::make_pair(d, i));
+    }
+
+    std::vector<bool> flag(m.faces.size(), false);
+
+    for (std::map<std::array<int, 3>, std::vector<std::pair<float, size_t> > >::iterator it = bynormal.begin();
+            it != bynormal.end(); ++it) {
+        std::vector<std::pair<float, size_t> >& g = it->second;
+
+        if (g.size() < 2) {
             continue;
         }
 
-        std::string key;
+        std::sort(g.begin(), g.end());
+        const std::array<int, 3>& k = it->first;
+        int big = (std::abs(k[0]) >= std::abs(k[1]) && std::abs(k[0]) >= std::abs(k[2])) ? 0 : (std::abs(k[1]) >= std::abs(k[2]) ? 1 : 2);
+        int ax0 = (big + 1) % 3, ax1 = (big + 2) % 3;
 
-        for (json::const_iterator it = shape.begin(); it != shape.end(); ++it) {
-            key = it.key();
-            break;
+        /* sweep clusters of (nearly) equal plane offset */
+        for (size_t s0 = 0; s0 < g.size();) {
+            size_t s1 = s0 + 1;
+
+            while (s1 < g.size() && g[s1].first - g[s1 - 1].first <= tol) {
+                s1++;
+            }
+
+            for (size_t i = s0; i < s1; i++) {
+                for (size_t j = i + 1; j < s1; j++) {
+                    size_t fi = g[i].second, fj = g[j].second;
+
+                    if (flag[fi] && flag[fj]) {
+                        continue;
+                    }
+
+                    Vec3 A[3] = {m.nodes[m.faces[fi][0]], m.nodes[m.faces[fi][1]], m.nodes[m.faces[fi][2]]};
+                    Vec3 B[3] = {m.nodes[m.faces[fj][0]], m.nodes[m.faces[fj][1]], m.nodes[m.faces[fj][2]]};
+
+                    if (coplanar_tris_overlap(A, B, ax0, ax1, tol)) {
+                        flag[fi] = flag[fj] = true;
+                    }
+                }
+            }
+
+            s0 = s1;
+        }
+    }
+
+    size_t nflag = 0;
+
+    for (size_t i = 0; i < m.faces.size(); i++) {
+        if (flag[i]) {
+            uint32_t pk;
+            memcpy(&pk, &m.facedata[i].packed_media, 4);
+            pk |= VKMMC_FACE_COPLANAR;
+            memcpy(&m.facedata[i].packed_media, &pk, 4);
+            nflag++;
+        }
+    }
+
+    return nflag;
+}
+
+/* ================================================================ */
+/*  Parse JSON Shapes array → combined mesh                         */
+/* ================================================================ */
+
+/* Per-shape analytic surface needed for curvature (see vkmmc_curvature.h).
+   parse_shapes() emits one entry per shape (two for a Lens), indexed by the
+   1-based ids stored in ShapeMesh::shape_id. */
+struct ShapeOrigin {
+    int type;             /* 0=box/slab, 1=sphere, 2=cylinder, 3=lens cap */
+    float cx, cy, cz;     /* center (sphere/lens cap) or C0 (cylinder) */
+    float ax, ay, az;     /* axis direction (cylinder only, unit vector) */
+    float R;              /* radius (signed for lens caps: negative = concave) */
+    float length;         /* cylinder axis length */
+    uint32_t node_start, node_end;
+};
+
+static ShapeOrigin make_origin(int type) {
+    ShapeOrigin so;
+    memset(&so, 0, sizeof(so));
+    so.type = type;
+    return so;
+}
+
+/* CSG tag of a shape: 1..maxtag */
+static uint32_t shape_tag(const json& obj, uint32_t maxtag, const std::string& ctx) {
+    double t = json_num(obj, "Tag", 1, ctx);
+
+    if (!(t >= 1 && t <= maxtag) || t != std::floor(t)) {
+        vkmmc_fail(ctx + ".Tag=" + std::to_string(t) + " must be an integer in [1, " + std::to_string(maxtag) +
+                   "] (a medium index; CSG supports up to " + std::to_string(VKMMC_MAX_CSG_TAG) + " tags)");
+    }
+
+    return (uint32_t)t;
+}
+
+static std::vector<double> shape_pos(const json& obj, const char* key, const double orig[3], const std::string& ctx) {
+    std::vector<double> v = json_vec_key(obj, key, 3, ctx);
+
+    for (int i = 0; i < 3; i++) {
+        v[i] -= orig[i];
+    }
+
+    return v;
+}
+
+static std::vector<double> shape_size(const json& obj, const std::string& ctx) {
+    std::vector<double> v = json_vec_key(obj, "Size", 3, ctx);
+
+    for (int i = 0; i < 3; i++) {
+        vkmmc_require(v[i] > 0, ctx + ".Size must be positive");
+    }
+
+    return v;
+}
+
+static double shape_radius(const json& obj, const std::string& ctx) {
+    vkmmc_require(obj.contains("R"), ctx + " requires 'R'");
+    double r = json_num(obj, "R", 0, ctx);
+    vkmmc_require(r > 0, ctx + ".R must be positive");
+    return r;
+}
+
+/*
+ * Build a watertight triangle mesh from a JSON Shapes array (MCX shape syntax
+ * plus Lens). Every shape is validated; invalid input throws. maxtag bounds the
+ * Tag of each shape (number of media - 1). When origins is non-NULL it receives
+ * the analytic surface of each shape, for curvature computation.
+ */
+static ShapeMesh parse_shapes(const json& arr, float ext[6], int mesh_res = 24,
+                              uint32_t maxtag = VKMMC_MAX_CSG_TAG,
+                              std::vector<ShapeOrigin>* origins = NULL) {
+    ShapeMesh m;
+    int origin_counter = 0;
+    double orig[3] = {0, 0, 0};
+    std::vector<ShapeOrigin> olist;
+
+    vkmmc_require(arr.is_array(), "Shapes must be an array");
+    vkmmc_require(mesh_res >= 1 && mesh_res <= VKMMC_MAX_MESHRES,
+                  "mesh resolution must be in [" + std::to_string(VKMMC_MIN_MESHRES) + ", " +
+                  std::to_string(VKMMC_MAX_MESHRES) + "]");
+
+    /* curved shapes need a minimum tessellation; flat ones ignore mesh_res */
+    auto need_res = [&](const std::string & ctx) {
+        vkmmc_require(mesh_res >= VKMMC_MIN_MESHRES, ctx + ": the mesh resolution (MeshRes/-m) must be at least " +
+                      std::to_string(VKMMC_MIN_MESHRES) + " for curved shapes");
+    };
+    maxtag = std::min(maxtag, (uint32_t)VKMMC_MAX_CSG_TAG);
+
+    for (size_t si = 0; si < arr.size(); si++) {
+        const json& shape = arr[si];
+        std::string ctx = "Shapes[" + std::to_string(si) + "]";
+
+        vkmmc_require(shape.is_object() && shape.size() == 1,
+                      ctx + " must be an object with a single key, e.g. {\"Sphere\":{...}}");
+
+        std::string key = shape.begin().key();
+        const json& obj = shape.begin().value();
+        ctx += "." + key;
+        size_t faces_before = m.faces.size();
+        ShapeOrigin so = make_origin(0);
+
+        if (key == "Name") {
+            /* label only */
+        } else if (key == "Origin") {
+            std::vector<double> o = json_vec(obj, 3, 3, ctx);
+            orig[0] = o[0];
+            orig[1] = o[1];
+            orig[2] = o[2];
+        } else {
+            vkmmc_require(obj.is_object() || key.find("Layers") != std::string::npos, ctx + " must be an object");
         }
 
-        const json& obj = shape[key];
-        size_t faces_before = m.faces.size();
-
         if (key == "Grid") {
-            float sx = obj["Size"][0].get<float>(), sy = obj["Size"][1].get<float>(), sz = obj["Size"][2].get<float>();
-            uint32_t tag = obj.value("Tag", 1u);
+            std::vector<double> sz = shape_size(obj, ctx);
+            uint32_t tag = shape_tag(obj, maxtag, ctx);
             ext[0] = 0;
-            ext[1] = sx;
+            ext[1] = (float)sz[0];
             ext[2] = 0;
-            ext[3] = sy;
+            ext[3] = (float)sz[1];
             ext[4] = 0;
-            ext[5] = sz;
-            gen_box(m, 0, 0, 0, sx, sy, sz, tag);
-            printf("  Shape[%zu]: Grid [%.0f,%.0f,%.0f] tag=%u (%zu tri)\n", si, sx, sy, sz, tag, m.faces.size());
+            ext[5] = (float)sz[2];
+            gen_box(m, 0, 0, 0, (float)sz[0], (float)sz[1], (float)sz[2], tag);
+            printf("  Shape[%zu]: Grid [%.0f,%.0f,%.0f] tag=%u (%zu tri)\n", si, sz[0], sz[1], sz[2], tag,
+                   m.faces.size() - faces_before);
         } else if (key == "Sphere") {
-            float cx = obj["O"][0].get<float>(), cy = obj["O"][1].get<float>(), cz = obj["O"][2].get<float>();
-            float r = obj["R"].get<float>();
-            uint32_t tag = obj.value("Tag", 1u);
+            std::vector<double> o = shape_pos(obj, "O", orig, ctx);
+            double r = shape_radius(obj, ctx);
+            uint32_t tag = shape_tag(obj, maxtag, ctx);
+            need_res(ctx);
             int nlon = mesh_res, nlat = std::max(mesh_res * 2 / 3, 8);
-            gen_sphere(m, cx, cy, cz, r, tag, nlon, nlat);
+            gen_sphere(m, (float)o[0], (float)o[1], (float)o[2], (float)r, tag, nlon, nlat);
+            so = make_origin(1);
+            so.cx = (float)o[0];
+            so.cy = (float)o[1];
+            so.cz = (float)o[2];
+            so.R = (float)r;
             printf("  Shape[%zu]: Sphere O=[%.1f,%.1f,%.1f] R=%.1f tag=%u nlon=%d nlat=%d (%zu tri)\n",
-                   si, cx, cy, cz, r, tag, nlon, nlat, m.faces.size());
-        } else if (key == "Box") {
-            float ox = obj["O"][0].get<float>(), oy = obj["O"][1].get<float>(), oz = obj["O"][2].get<float>();
-            float sx = obj["Size"][0].get<float>(), sy = obj["Size"][1].get<float>(), sz = obj["Size"][2].get<float>();
-            uint32_t tag = obj.value("Tag", 1u);
-            gen_box(m, ox, oy, oz, sx, sy, sz, tag);
-            printf("  Shape[%zu]: Box O=[%.1f,%.1f,%.1f] S=[%.1f,%.1f,%.1f] tag=%u (%zu tri)\n", si, ox, oy, oz, sx, sy, sz, tag, m.faces.size());
-        } else if (key == "Subgrid") {
-            float ox = obj["O"][0].get<float>() - 1, oy = obj["O"][1].get<float>() - 1, oz = obj["O"][2].get<float>() - 1;
-            float sx = obj["Size"][0].get<float>(), sy = obj["Size"][1].get<float>(), sz = obj["Size"][2].get<float>();
-            uint32_t tag = obj.value("Tag", 1u);
-            gen_box(m, ox, oy, oz, sx, sy, sz, tag);
-            printf("  Shape[%zu]: Subgrid tag=%u (%zu tri)\n", si, tag, m.faces.size());
+                   si, o[0], o[1], o[2], r, tag, nlon, nlat, m.faces.size() - faces_before);
+        } else if (key == "Box" || key == "Subgrid") {
+            std::vector<double> o = shape_pos(obj, "O", orig, ctx);
+            std::vector<double> sz = shape_size(obj, ctx);
+            uint32_t tag = shape_tag(obj, maxtag, ctx);
+
+            if (key == "Subgrid") {   /* MCX Subgrid: 1-based voxel origin */
+                o[0] -= 1;
+                o[1] -= 1;
+                o[2] -= 1;
+            }
+
+            gen_box(m, (float)o[0], (float)o[1], (float)o[2], (float)sz[0], (float)sz[1], (float)sz[2], tag);
+            printf("  Shape[%zu]: %s O=[%.1f,%.1f,%.1f] S=[%.1f,%.1f,%.1f] tag=%u (%zu tri)\n", si, key.c_str(),
+                   o[0], o[1], o[2], sz[0], sz[1], sz[2], tag, m.faces.size() - faces_before);
         } else if (key == "Cylinder") {
-            float x0 = obj["C0"][0].get<float>(), y0 = obj["C0"][1].get<float>(), z0 = obj["C0"][2].get<float>();
-            float x1 = obj["C1"][0].get<float>(), y1 = obj["C1"][1].get<float>(), z1 = obj["C1"][2].get<float>();
-            float r = obj["R"].get<float>();
-            uint32_t tag = obj.value("Tag", 1u);
-            gen_cylinder(m, x0, y0, z0, x1, y1, z1, r, tag, mesh_res);
+            std::vector<double> c0 = shape_pos(obj, "C0", orig, ctx), c1 = shape_pos(obj, "C1", orig, ctx);
+            double r = shape_radius(obj, ctx);
+            uint32_t tag = shape_tag(obj, maxtag, ctx);
+            double dx = c1[0] - c0[0], dy = c1[1] - c0[1], dz = c1[2] - c0[2];
+            double l = std::sqrt(dx * dx + dy * dy + dz * dz);
+            vkmmc_require(l > 1e-6, ctx + ": C0 and C1 must be distinct");
+            need_res(ctx);
+            gen_cylinder(m, (float)c0[0], (float)c0[1], (float)c0[2], (float)c1[0], (float)c1[1], (float)c1[2],
+                         (float)r, tag, mesh_res);
+            so = make_origin(2);
+            so.cx = (float)c0[0];
+            so.cy = (float)c0[1];
+            so.cz = (float)c0[2];
+            so.ax = (float)(dx / l);
+            so.ay = (float)(dy / l);
+            so.az = (float)(dz / l);
+            so.length = (float)l;
+            so.R = (float)r;
             printf("  Shape[%zu]: Cylinder R=%.1f tag=%u nseg=%d (%zu tri)\n",
-                   si, r, tag, mesh_res, m.faces.size());
+                   si, r, tag, mesh_res, m.faces.size() - faces_before);
         } else if (key == "XSlabs" || key == "YSlabs" || key == "ZSlabs") {
             int dir = (key[0] == 'X') ? 0 : (key[0] == 'Y') ? 1 : 2;
+            uint32_t tag = shape_tag(obj, maxtag, ctx);
+            vkmmc_require(obj.contains("Bound") && obj["Bound"].is_array(), ctx + " requires a 'Bound' array");
+            json bd = obj["Bound"];
 
-            if (obj.is_object()) {
-                uint32_t tag = obj.value("Tag", 1u);
-
-                if (obj.contains("Bound")) {
-                    const json& bd = obj["Bound"];
-
-                    for (size_t j = 0; j < bd.size(); j++) {
-                        gen_slab(m, dir, bd[j][0].get<float>(), bd[j][1].get<float>(), ext, tag);
-                    }
-                }
+            if (bd.size() == 2 && bd[0].is_number()) {
+                bd = json::array({bd});    /* a single [lo, hi] pair */
             }
 
-            printf("  Shape[%zu]: %s (%zu tri)\n", si, key.c_str(), m.faces.size());
+            for (size_t j = 0; j < bd.size(); j++) {
+                std::vector<double> b = json_vec(bd[j], 2, 2, ctx + ".Bound[" + std::to_string(j) + "]");
+                vkmmc_require(b[1] > b[0], ctx + ".Bound: need lower < upper bound");
+                gen_slab(m, dir, (float)b[0], (float)b[1], ext, tag);
+            }
+
+            printf("  Shape[%zu]: %s (%zu tri)\n", si, key.c_str(), m.faces.size() - faces_before);
         } else if (key == "XLayers" || key == "YLayers" || key == "ZLayers") {
             int dir = (key[0] == 'X') ? 0 : (key[0] == 'Y') ? 1 : 2;
+            vkmmc_require(obj.is_array(), ctx + " must be an array of [start, end, tag] layers");
+            json layers = obj;
 
-            if (obj.is_array()) {
-                for (size_t j = 0; j < obj.size(); j++) {
-                    const json& layer = obj[j];
-
-                    if (layer.is_array() && layer.size() >= 3) {
-                        float lo = layer[0].get<float>() - 1.0f, hi = layer[1].get<float>();
-                        uint32_t lt = layer[2].get<uint32_t>();
-                        gen_slab(m, dir, lo, hi, ext, lt);
-                    }
-                }
+            if (layers.size() == 3 && layers[0].is_number()) {
+                layers = json::array({layers});    /* a single layer */
             }
 
-            printf("  Shape[%zu]: %s (%zu tri)\n", si, key.c_str(), m.faces.size());
+            for (size_t j = 0; j < layers.size(); j++) {
+                std::string lctx = ctx + "[" + std::to_string(j) + "]";
+                std::vector<double> l = json_vec(layers[j], 3, 3, lctx);
+                vkmmc_require(l[1] >= l[0], lctx + ": need start <= end");
+                json t;
+                t["Tag"] = l[2];
+                uint32_t lt = shape_tag(t, maxtag, lctx);
+                gen_slab(m, dir, (float)(l[0] - 1.0), (float)l[1], ext, lt);
+            }
+
+            printf("  Shape[%zu]: %s (%zu tri)\n", si, key.c_str(), m.faces.size() - faces_before);
         } else if (key == "Lens") {
-            float lox = obj["O"][0].get<float>(), loy = obj["O"][1].get<float>(), loz = obj["O"][2].get<float>();
-            float ldx = obj["Dir"][0].get<float>(), ldy = obj["Dir"][1].get<float>(), ldz = obj["Dir"][2].get<float>();
-            float lR = obj["R"].get<float>();
-            uint32_t tag = obj.value("Tag", 1u);
-            float Df = obj["Front"]["D"].get<float>();
-            float Rf = obj["Front"]["R"].get<float>();
-            float Db = obj["Back"]["D"].get<float>();
-            float Rb = obj["Back"]["R"].get<float>();
+            std::vector<double> o = shape_pos(obj, "O", orig, ctx);
+            std::vector<double> ld = json_vec_key(obj, "Dir", 3, ctx);
+            double lR = shape_radius(obj, ctx);
+            uint32_t tag = shape_tag(obj, maxtag, ctx);
+            vkmmc_require(obj.contains("Front") && obj["Front"].is_object(), ctx + " requires a 'Front' object {D, R}");
+            vkmmc_require(obj.contains("Back") && obj["Back"].is_object(), ctx + " requires a 'Back' object {D, R}");
+            double Df = json_num(obj["Front"], "D", 0, ctx + ".Front"), Rf = json_num(obj["Front"], "R", 0, ctx + ".Front");
+            double Db = json_num(obj["Back"], "D", 0, ctx + ".Back"), Rb = json_num(obj["Back"], "R", 0, ctx + ".Back");
+            double dl = std::sqrt(ld[0] * ld[0] + ld[1] * ld[1] + ld[2] * ld[2]);
+            vkmmc_require(dl > 1e-10, ctx + ".Dir must be a non-zero vector");
+            vkmmc_require(Df + Db > 0, ctx + ": the lens thickness Front.D + Back.D must be positive");
+            vkmmc_require(Rf != 0 && Rb != 0, ctx + ": Front.R and Back.R must be non-zero");
+            need_res(ctx);
+
             int nseg   = mesh_res;
             int nrings = std::max(mesh_res / 2, 4);
             uint32_t foid = (uint32_t)(origin_counter + 1);
             uint32_t boid = (uint32_t)(origin_counter + 2);
-            gen_lens(m, lox, loy, loz, ldx, ldy, ldz, lR, Df, Rf, Db, Rb, tag, foid, boid, nseg, nrings);
+            gen_lens(m, (float)o[0], (float)o[1], (float)o[2], (float)ld[0], (float)ld[1], (float)ld[2], (float)lR,
+                     (float)Df, (float)Rf, (float)Db, (float)Rb, tag, foid, boid, nseg, nrings);
+            vkmmc_require(m.faces.size() > faces_before, ctx + ": the lens parameters give an empty surface");
             printf("  Shape[%zu]: Lens O=[%.1f,%.1f,%.1f] R=%.2f Df=%.2f Rf=%.2f Db=%.2f Rb=%.2f tag=%u (%zu tri)\n",
-                   si, lox, loy, loz, lR, Df, Rf, Db, Rb, tag, m.faces.size() - faces_before);
+                   si, o[0], o[1], o[2], lR, Df, Rf, Db, Rb, tag, m.faces.size() - faces_before);
+
+            /* front cap: center O + n*(Df-Rf); back cap: center O + n*(Rb-Db); radius kept signed */
+            double nx = ld[0] / dl, ny = ld[1] / dl, nz = ld[2] / dl;
+            ShapeOrigin sf2 = make_origin(3), sb2 = make_origin(3);
+            sf2.cx = (float)(o[0] + nx * (Df - Rf));
+            sf2.cy = (float)(o[1] + ny * (Df - Rf));
+            sf2.cz = (float)(o[2] + nz * (Df - Rf));
+            sf2.R = (float)Rf;
+            sb2.cx = (float)(o[0] + nx * (Rb - Db));
+            sb2.cy = (float)(o[1] + ny * (Rb - Db));
+            sb2.cz = (float)(o[2] + nz * (Rb - Db));
+            sb2.R = (float)Rb;
+            olist.push_back(sf2);
+            olist.push_back(sb2);
             origin_counter += shape_origin_count(key);
             continue;   /* gen_lens already pushed shape_ids */
         } else if (key != "Name" && key != "Origin") {
-            printf("  Shape[%zu]: unknown '%s'\n", si, key.c_str());
+            vkmmc_fail(ctx + ": unknown shape type (Grid, Subgrid, Sphere, Box, Cylinder, XSlabs/YSlabs/ZSlabs, "
+                       "XLayers/YLayers/ZLayers, Lens, Name, Origin)");
         }
 
         for (size_t fi = faces_before; fi < m.faces.size(); fi++) {
             m.shape_id.push_back((uint32_t)(origin_counter + 1));
         }
 
+        olist.push_back(so);
         origin_counter += shape_origin_count(key);
     }
 
     printf("Shape mesh total: %zu nodes, %zu triangles\n", m.nodes.size(), m.faces.size());
 
     /* verify: print tag distribution */
-    int tagcount[16] = {};
+    std::map<uint32_t, int> tagcount;
     int flatcount = 0;
 
     for (size_t i = 0; i < m.facedata.size(); i++) {
-        uint32_t pk = 0;
-        std::memcpy(&pk, &m.facedata[i].packed_media, 4);
-
-        if (pk & 0x80000000u) {
-            flatcount++;
-        }
-
-        uint32_t t = pk & 0xFFFFu;
-
-        if (t < 16) {
-            tagcount[t]++;
-        }
+        uint32_t front, back;
+        bool flat;
+        unpack_media(m.facedata[i].packed_media, front, back, flat);
+        flatcount += flat;
+        tagcount[back]++;
     }
 
     printf("  Tag distribution:");
 
-    for (int i = 0; i < 16; i++) if (tagcount[i]) {
-            printf(" [%d]=%d", i, tagcount[i]);
-        }
+    for (std::map<uint32_t, int>::iterator it = tagcount.begin(); it != tagcount.end(); ++it) {
+        printf(" [%u]=%d", it->first, it->second);
+    }
 
     printf("\n  Flat-flagged triangles: %d / %zu\n", flatcount, m.facedata.size());
+
+    size_t ncop = flag_coplanar_faces(m);
+
+    if (ncop) {
+        printf("  Coplanar-overlap triangles: %zu (enclosure re-derived on crossing)\n", ncop);
+    }
+
+    if (origins) {
+        origins->swap(olist);
+    }
 
     return m;
 }

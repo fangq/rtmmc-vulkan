@@ -1,8 +1,12 @@
 /*
- * vkmmc.cpp — Vulkan Ray Query MC photon transport (Single-AS)
- * Build:
- *   glslangValidator --target-env vulkan1.2 -e main -o vkmmc_core.spv vkmmc_core.comp
- *   g++ -std=c++11 -O2 -o vkmmc vkmmc.cpp miniz.c -lvulkan
+ * vkmmc.cpp — Vulkan ray-query accelerated mesh/shape-based Monte Carlo
+ *             photon transport (single acceleration structure)
+ *
+ * All kernel variants (mesh, CSG, CSG+curvature; each with native or CAS
+ * float atomics) are compiled from vkmmc_core.comp and embedded in the
+ * binary; the variant matching the input and the device is picked at run
+ * time. Build with 'make'; see 'vkmmc --help' for usage.
+ *
  * Usage:
  *   ./vkmmc input.json
  *   ./vkmmc -f input.json -n 1e7 -B 2000000
@@ -22,31 +26,10 @@
 #include <stdexcept>
 #include <algorithm>
 #include <string>
-#include "vkmmc_io.h"
-#include "vkmmc_shapes.h"
-#include "vkmmc_curvature.h"
+#include "vkmmc_host.h"
 #include "vkmmc_core_spv.h"
 #ifdef USE_SHOW
     #include "vkmmc_show.h"
-#endif
-
-#ifndef VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME
-    #define VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME "VK_EXT_shader_atomic_float"
-#endif
-#ifndef VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT
-    #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT ((VkStructureType)1000260000)
-#endif
-#ifndef VK_EXT_shader_atomic_float
-typedef struct VkPhysicalDeviceShaderAtomicFloatFeaturesEXT {
-    VkStructureType sType;
-    void* pNext;
-    VkBool32 shaderBufferFloat32Atomics, shaderBufferFloat32AtomicAdd;
-    VkBool32 shaderBufferFloat64Atomics, shaderBufferFloat64AtomicAdd;
-    VkBool32 shaderSharedFloat32Atomics, shaderSharedFloat32AtomicAdd;
-    VkBool32 shaderSharedFloat64Atomics, shaderSharedFloat64AtomicAdd;
-    VkBool32 shaderImageFloat32Atomics, shaderImageFloat32AtomicAdd;
-    VkBool32 sparseImageFloat32Atomics, sparseImageFloat32AtomicAdd;
-} VkPhysicalDeviceShaderAtomicFloatFeaturesEXT;
 #endif
 
 /* ================================================================ */
@@ -74,12 +57,18 @@ struct MCParams {
     uint32_t do_traj, max_traj;             // 184: trajectory flags
     uint32_t photon_base;                   // 192: global photon index offset for this batch
 };
-// Total: 196 bytes
+// Total: 196 bytes, see the SimParams block in vkmmc_core.comp
 
 /* ================================================================ */
 /*                       Vulkan helpers                             */
 /* ================================================================ */
-#define VK_CHECK(x) do{VkResult r=(x);if(r!=VK_SUCCESS){fprintf(stderr,"VK error %d at %s:%d\n",r,__FILE__,__LINE__);abort();}}while(0)
+#define VK_CHECK(x) do { \
+        VkResult r_ = (x); \
+        if (r_ != VK_SUCCESS) { \
+            throw std::runtime_error(std::string("Vulkan error ") + std::to_string((int)r_) + " in " + #x + \
+                                     " (" + __FILE__ + ":" + std::to_string(__LINE__) + ")"); \
+        } \
+    } while (0)
 
 struct VulkanCtx {
     VkInstance instance;
@@ -94,6 +83,8 @@ struct VulkanCtx {
     PFN_vkGetAccelerationStructureBuildSizesKHR pfnGetASBuildSizes;
     PFN_vkCmdBuildAccelerationStructuresKHR pfnCmdBuildAS;
     PFN_vkGetAccelerationStructureDeviceAddressKHR pfnGetASAddr;
+    bool atomic64;              /* native 64-bit integer atomics on storage buffers */
+    uint32_t max_wg_count;      /* maxComputeWorkGroupCount[0] */
 };
 struct Buffer {
     VkBuffer buf;
@@ -113,6 +104,7 @@ struct ComputePipe {
     VkDescriptorPool descPool;
     VkDescriptorSet descSet;
 };
+
 
 uint32_t find_mem_type(VkPhysicalDevice pd, uint32_t filter, VkMemoryPropertyFlags props) {
     VkPhysicalDeviceMemoryProperties mp;
@@ -230,22 +222,82 @@ void download_from_device(VulkanCtx& c, Buffer& src, void* data, VkDeviceSize sz
 /* ================================================================ */
 /*                       Vulkan init                                */
 /* ================================================================ */
-void list_vulkan_gpus() {
-    VkInstance inst;
+/* ================================================================ */
+/*                       Vulkan init                                */
+/* ================================================================ */
+static const char* VKMMC_REQUIRED_EXTS[] = {
+    VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, VK_KHR_RAY_QUERY_EXTENSION_NAME,
+    VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME
+};
+
+static bool has_extension(const std::vector<VkExtensionProperties>& exts, const char* name) {
+    for (size_t k = 0; k < exts.size(); k++) {
+        if (!strcmp(exts[k].extensionName, name)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static std::vector<VkExtensionProperties> device_extensions(VkPhysicalDevice pd) {
+    uint32_t ec = 0;
+    vkEnumerateDeviceExtensionProperties(pd, NULL, &ec, NULL);
+    std::vector<VkExtensionProperties> exts(ec);
+    vkEnumerateDeviceExtensionProperties(pd, NULL, &ec, exts.data());
+    exts.resize(ec);
+    return exts;
+}
+
+/* a device is usable when it has ray query, acceleration structures and BDA */
+static bool device_usable(VkPhysicalDevice pd) {
+    std::vector<VkExtensionProperties> exts = device_extensions(pd);
+
+    for (size_t i = 0; i < sizeof(VKMMC_REQUIRED_EXTS) / sizeof(VKMMC_REQUIRED_EXTS[0]); i++) {
+        if (!has_extension(exts, VKMMC_REQUIRED_EXTS[i])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/* does the device support 64-bit integer atomics on storage buffers? */
+static bool device_atomic64(VkPhysicalDevice pd) {
+    VkPhysicalDeviceShaderAtomicInt64Features i64 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
+    VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2.pNext = &i64;
+    vkGetPhysicalDeviceFeatures2(pd, &f2);
+    return i64.shaderBufferInt64Atomics == VK_TRUE && f2.features.shaderInt64 == VK_TRUE;
+}
+
+static VkInstance create_instance() {
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.pApplicationName = "vkmmc";
     app.apiVersion = VK_API_VERSION_1_2;
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    VkInstance inst = VK_NULL_HANDLE;
 
     if (vkCreateInstance(&ici, NULL, &inst) != VK_SUCCESS) {
-        printf("Failed to create Vulkan instance\n");
-        return;
+        throw std::runtime_error("cannot create a Vulkan 1.2 instance; is a Vulkan driver installed?");
     }
 
+    return inst;
+}
+
+static std::vector<VkPhysicalDevice> physical_devices(VkInstance inst) {
     uint32_t cnt = 0;
     vkEnumeratePhysicalDevices(inst, &cnt, NULL);
     std::vector<VkPhysicalDevice> pds(cnt);
     vkEnumeratePhysicalDevices(inst, &cnt, pds.data());
+    pds.resize(cnt);
+    return pds;
+}
+
+void list_vulkan_gpus() {
+    VkInstance inst = create_instance();
+    std::vector<VkPhysicalDevice> pds = physical_devices(inst);
     const char* dt[] = {"other", "integrated", "discrete", "virtual", "cpu"};
     printf("========================== Vulkan GPU Devices ==========================\n");
     int did = 0;
@@ -255,26 +307,11 @@ void list_vulkan_gpus() {
         vkGetPhysicalDeviceProperties(pds[j], &pr);
         VkPhysicalDeviceMemoryProperties mp;
         vkGetPhysicalDeviceMemoryProperties(pds[j], &mp);
-        uint32_t ec = 0;
-        vkEnumerateDeviceExtensionProperties(pds[j], NULL, &ec, NULL);
-        std::vector<VkExtensionProperties> exts(ec);
-        vkEnumerateDeviceExtensionProperties(pds[j], NULL, &ec, exts.data());
-        bool rq = false, as = false, af = false;
-
-        for (size_t k = 0; k < exts.size(); k++) {
-            if (!strcmp(exts[k].extensionName, VK_KHR_RAY_QUERY_EXTENSION_NAME)) {
-                rq = true;
-            }
-
-            if (!strcmp(exts[k].extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
-                as = true;
-            }
-
-            if (!strcmp(exts[k].extensionName, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
-                af = true;
-            }
-        }
-
+        std::vector<VkExtensionProperties> exts = device_extensions(pds[j]);
+        bool rq = has_extension(exts, VK_KHR_RAY_QUERY_EXTENSION_NAME);
+        bool as = has_extension(exts, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+        bool ok = device_usable(pds[j]);
+        bool af = device_atomic64(pds[j]);
         uint64_t tm = 0;
 
         for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
@@ -282,91 +319,69 @@ void list_vulkan_gpus() {
                 tm += mp.memoryHeaps[h].size;
             }
 
-        bool ok = rq && as;
-
         if (ok) {
             did++;
         }
 
-        printf("============ GPU device ID %d [%zu of %u]: %s %s============\n", ok ? did : 0, j + 1, cnt, pr.deviceName, ok ? "" : "(not usable) ");
-        printf(" Vendor ID      :\t0x%04x\n Device type    :\t%s\n Global memory  :\t%lu B\n", pr.vendorID, dt[pr.deviceType < 5 ? pr.deviceType : 0], (unsigned long)tm);
-        printf(" Ray query      :\t%s\n Accel structure:\t%s\n Atomic float   :\t%s\n", rq ? "Yes" : "No", as ? "Yes" : "No", af ? "Yes" : "No");
+        printf("============ GPU device ID %d [%zu of %zu]: %s %s============\n", ok ? did : 0, j + 1, pds.size(),
+               pr.deviceName, ok ? "" : "(not usable) ");
+        printf(" Vendor ID      :\t0x%04x\n Device type    :\t%s\n Global memory  :\t%lu B\n", pr.vendorID,
+               dt[pr.deviceType < 5 ? pr.deviceType : 0], (unsigned long)tm);
+        printf(" Ray query      :\t%s\n Accel structure:\t%s\n Int64 atomics  :\t%s\n", rq ? "Yes" : "No",
+               as ? "Yes" : "No", af ? "Yes" : "No");
     }
 
     vkDestroyInstance(inst, NULL);
 }
 
+/* gpuid: 1-based index among usable devices (as listed by -L), 0 = auto (prefer discrete) */
 VulkanCtx init_vulkan(int gpuid) {
     VulkanCtx c;
     memset(&c, 0, sizeof(c));
-    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    app.apiVersion = VK_API_VERSION_1_2;
-    VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-    ici.pApplicationInfo = &app;
-    VK_CHECK(vkCreateInstance(&ici, NULL, &c.instance));
-    uint32_t cnt = 0;
-    vkEnumeratePhysicalDevices(c.instance, &cnt, NULL);
-    std::vector<VkPhysicalDevice> pds(cnt);
-    vkEnumeratePhysicalDevices(c.instance, &cnt, pds.data());
-    std::vector<VkPhysicalDevice> usable;
+    c.instance = create_instance();
+    std::vector<VkPhysicalDevice> pds = physical_devices(c.instance), usable;
 
     for (size_t j = 0; j < pds.size(); j++) {
-        uint32_t ec = 0;
-        vkEnumerateDeviceExtensionProperties(pds[j], NULL, &ec, NULL);
-        std::vector<VkExtensionProperties> exts(ec);
-        vkEnumerateDeviceExtensionProperties(pds[j], NULL, &ec, exts.data());
-        bool ok[4] = {};
-
-        for (size_t k = 0; k < exts.size(); k++) {
-            if (!strcmp(exts[k].extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
-                ok[0] = true;
-            }
-
-            if (!strcmp(exts[k].extensionName, VK_KHR_RAY_QUERY_EXTENSION_NAME)) {
-                ok[1] = true;
-            }
-
-            if (!strcmp(exts[k].extensionName, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)) {
-                ok[2] = true;
-            }
-
-            if (!strcmp(exts[k].extensionName, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)) {
-                ok[3] = true;
-            }
-        }
-
-        if (ok[0] && ok[1] && ok[2] && ok[3]) {
+        if (device_usable(pds[j])) {
             usable.push_back(pds[j]);
         }
     }
 
     if (usable.empty()) {
-        throw std::runtime_error("No GPU with ray query support");
+        throw std::runtime_error("no Vulkan GPU with ray query support was found (run with -L to list devices)");
     }
 
-    if (gpuid >= 1 && gpuid <= (int)usable.size()) {
+    if (gpuid > (int)usable.size()) {
+        throw std::runtime_error("-G " + std::to_string(gpuid) + ": only " + std::to_string(usable.size()) +
+                                 " usable GPU(s) found (run with -L to list them)");
+    }
+
+    if (gpuid >= 1) {
         c.physDev = usable[gpuid - 1];
     } else {
+        /* auto: first discrete GPU, NVIDIA preferred, else the first usable one */
+        int best = -1, bestscore = -1;
+
         for (size_t j = 0; j < usable.size(); j++) {
             VkPhysicalDeviceProperties p2;
             vkGetPhysicalDeviceProperties(usable[j], &p2);
+            int score = (p2.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) * 2 + (p2.vendorID == 0x10DE);
 
-            if (p2.vendorID == 0x10DE && p2.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
-                c.physDev = usable[j];
-                break;
+            if (score > bestscore) {
+                bestscore = score;
+                best = (int)j;
             }
         }
 
-        if (!c.physDev) {
-            c.physDev = usable[0];
-        }
+        c.physDev = usable[best];
+        gpuid = best + 1;
     }
 
-    {
-        VkPhysicalDeviceProperties p2;
-        vkGetPhysicalDeviceProperties(c.physDev, &p2);
-        printf("Selected GPU [%d/%d]: %s (vendor=0x%04x type=%d)\n", gpuid ? gpuid : 1, (int)usable.size(), p2.deviceName, p2.vendorID, p2.deviceType);
-    }
+    VkPhysicalDeviceProperties devPr;
+    vkGetPhysicalDeviceProperties(c.physDev, &devPr);
+    printf("Selected GPU [%d/%d]: %s (vendor=0x%04x type=%d)\n", gpuid, (int)usable.size(), devPr.deviceName,
+           devPr.vendorID, devPr.deviceType);
+    c.max_wg_count = devPr.limits.maxComputeWorkGroupCount[0];
 
     uint32_t qfc = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(c.physDev, &qfc, NULL);
@@ -379,59 +394,43 @@ VulkanCtx init_vulkan(int gpuid) {
             break;
         }
 
+    if (c.computeQF == UINT32_MAX) {
+        throw std::runtime_error("the selected GPU has no compute queue");
+    }
+
     float prio = 1.f;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = c.computeQF;
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
-    VkPhysicalDeviceProperties devPr;
-    vkGetPhysicalDeviceProperties(c.physDev, &devPr);
-    bool isNV = (devPr.vendorID == 0x10DE), hasAF = false;
-
-    if (isNV) {
-        uint32_t ec2 = 0;
-        vkEnumerateDeviceExtensionProperties(c.physDev, NULL, &ec2, NULL);
-        std::vector<VkExtensionProperties> ex2(ec2);
-        vkEnumerateDeviceExtensionProperties(c.physDev, NULL, &ec2, ex2.data());
-
-        for (size_t k = 0; k < ex2.size(); k++)
-            if (!strcmp(ex2[k].extensionName, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
-                hasAF = true;
-            }
-    }
+    /* VKMMC_NO_ATOMIC64=1 forces the portable 32-bit atomic kernels (for testing) */
+    c.atomic64 = device_atomic64(c.physDev) && getenv("VKMMC_NO_ATOMIC64") == NULL;
 
     const char* devExts[] = {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, VK_KHR_RAY_QUERY_EXTENSION_NAME,
-                             VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME
+                             VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME
                             };
-    int nExts = hasAF ? 5 : 4;
-    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT saf;
-    memset(&saf, 0, sizeof(saf));
-    saf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
-    saf.shaderBufferFloat32AtomicAdd = VK_TRUE;
+    VkPhysicalDeviceFeatures f10 = {};
+    f10.shaderInt64 = c.atomic64 ? VK_TRUE : VK_FALSE;
+    VkPhysicalDeviceShaderAtomicInt64Features i64 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
+    i64.shaderBufferInt64Atomics = VK_TRUE;
     VkPhysicalDeviceBufferDeviceAddressFeatures bda = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
     bda.bufferDeviceAddress = VK_TRUE;
-    bda.pNext = hasAF ? (void*)&saf : NULL;
+    bda.pNext = c.atomic64 ? (void*)&i64 : NULL;
     VkPhysicalDeviceAccelerationStructureFeaturesKHR asf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     asf.accelerationStructure = VK_TRUE;
     asf.pNext = &bda;
     VkPhysicalDeviceRayQueryFeaturesKHR rqf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
     rqf.rayQuery = VK_TRUE;
     rqf.pNext = &asf;
-    VkPhysicalDeviceVulkan12Features v12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    v12.bufferDeviceAddress = VK_TRUE;
-    v12.pNext = &rqf;
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = nExts;
+    dci.enabledExtensionCount = 4;
     dci.ppEnabledExtensionNames = devExts;
-    dci.pNext = &v12;
+    dci.pEnabledFeatures = &f10;
+    dci.pNext = &rqf;
     VK_CHECK(vkCreateDevice(c.physDev, &dci, NULL, &c.device));
     vkGetDeviceQueue(c.device, c.computeQF, 0, &c.queue);
-
-    if (hasAF) {
-        printf("GPU supports native atomicAdd(float)\n");
-    }
 
     VkCommandPoolCreateInfo cpi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpi.queueFamilyIndex = c.computeQF;
@@ -443,7 +442,28 @@ VulkanCtx init_vulkan(int gpuid) {
     c.pfnGetASBuildSizes = (PFN_vkGetAccelerationStructureBuildSizesKHR)vkGetDeviceProcAddr(c.device, "vkGetAccelerationStructureBuildSizesKHR");
     c.pfnCmdBuildAS = (PFN_vkCmdBuildAccelerationStructuresKHR)vkGetDeviceProcAddr(c.device, "vkCmdBuildAccelerationStructuresKHR");
     c.pfnGetASAddr = (PFN_vkGetAccelerationStructureDeviceAddressKHR)vkGetDeviceProcAddr(c.device, "vkGetAccelerationStructureDeviceAddressKHR");
+
+    if (!c.pfnGetBufAddr || !c.pfnCreateAS || !c.pfnDestroyAS || !c.pfnGetASBuildSizes || !c.pfnCmdBuildAS || !c.pfnGetASAddr) {
+        throw std::runtime_error("the Vulkan driver does not expose the ray tracing entry points");
+    }
+
     return c;
+}
+
+void destroy_vulkan(VulkanCtx& c) {
+    if (c.cmdPool) {
+        vkDestroyCommandPool(c.device, c.cmdPool, NULL);
+    }
+
+    if (c.device) {
+        vkDestroyDevice(c.device, NULL);
+    }
+
+    if (c.instance) {
+        vkDestroyInstance(c.instance, NULL);
+    }
+
+    memset(&c, 0, sizeof(c));
 }
 
 /* ================================================================ */
@@ -504,21 +524,7 @@ AccelStruct build_tlas(VulkanCtx& c, AccelStruct& blas) {
 /* ================================================================ */
 /*                       Compute pipeline                           */
 /* ================================================================ */
-std::vector<uint32_t> load_spirv(const char* path) {
-    std::ifstream f(path, std::ios::ate | std::ios::binary);
-
-    if (!f) {
-        throw std::runtime_error(std::string("cannot open ") + path);
-    }
-
-    size_t sz = (size_t)f.tellg();
-    std::vector<uint32_t> code(sz / 4);
-    f.seekg(0);
-    f.read(reinterpret_cast<char*>(code.data()), sz);
-    return code;
-}
-
-ComputePipe create_pipeline(VulkanCtx& c, const char* spirv) {
+ComputePipe create_pipeline(VulkanCtx& c, const uint32_t* code, size_t codesize) {
     ComputePipe cp;
     memset(&cp, 0, sizeof(cp));
     VkDescriptorSetLayoutBinding bn[8];
@@ -559,17 +565,9 @@ ComputePipe create_pipeline(VulkanCtx& c, const char* spirv) {
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &cp.descLayout;
     VK_CHECK(vkCreatePipelineLayout(c.device, &pl, NULL, &cp.pipeLayout));
-    std::vector<uint32_t> code;
     VkShaderModuleCreateInfo sm = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-
-    if (spirv) {
-        code = load_spirv(spirv);
-        sm.codeSize = code.size() * 4;
-        sm.pCode = code.data();
-    } else {
-        sm.codeSize = vkmmc_core_spv_len;
-        sm.pCode = reinterpret_cast<const uint32_t*>(vkmmc_core_spv);
-    }
+    sm.codeSize = codesize;
+    sm.pCode = code;
 
     VkShaderModule mod;
     VK_CHECK(vkCreateShaderModule(c.device, &sm, NULL, &mod));
@@ -637,362 +635,175 @@ void update_desc(VulkanCtx& c, ComputePipe& cp, VkAccelerationStructureKHR tlas,
 }
 
 /* ================================================================ */
-/*                       CLI parsing                                */
+/*                    Embedded kernels                              */
 /* ================================================================ */
-static const char debugflag[] = {'S', 'C', 'B', 'W', 'D', 'I', 'O', 'X', 'A', 'T', 'R', 'P', 'E', 'M', '\0'};
-
-static uint32_t parse_debugopt(const char* s) {
-    uint32_t level = 0;
-
-    for (const char* c = s; *c; c++) {
-        char u = (*c >= 'a' && *c <= 'z') ? (*c - 'a' + 'A') : *c;
-        const char* p = strchr(debugflag, u);
-
-        if (p) {
-            level |= (1u << (uint32_t)(p - debugflag));
-        }
-    }
-
-    return level;
-}
-
-struct CmdOverrides {
-    uint64_t nphoton, batch_size;
-    uint32_t rng_seed, totalthread;
-    float unitinmm;
-    int outputtype, isreflect, isnormalize, gpuid;
-    bool listgpu, dumpjson, dumpmesh;
-    int meshres;
-    int docurv;   // -1 = auto (enable for CSG), 0 = off, 1 = on
-    bool debugcurv;
-    int debuglevel;     // -1 = not set
-    int maxjumpdebug;   // -1 = not set
-    bool show;          // launch interactive viewer
-    std::string traj_file;  // optional _traj.jdat to display without simulating
-    std::string session_id, json_str, inputfile;
-    CmdOverrides(): nphoton(0), batch_size(UINT64_MAX), rng_seed(0), totalthread(0), unitinmm(0),
-        outputtype(-1), isreflect(-1), isnormalize(-1), gpuid(0), listgpu(false), dumpjson(false), dumpmesh(false), meshres(0), docurv(-1), debugcurv(false), debuglevel(-1), maxjumpdebug(-1), show(false) {}
+struct SpirvBlob {
+    const unsigned char* data;
+    unsigned int len;
 };
 
-void printhelp(const char* n) {
-    printf("vkmmc - Vulkan ray-tracing accelerated mesh Monte Carlo\n"
-           "Usage: %s input.json  OR  %s -f input.json [flags]\n\n"
-           "Flags:\n -f/--input\tJSON file\n -n/--photon\tphoton number\n -s/--session\tsession name\n"
-           " -u/--unitinmm\tvoxel size [1]\n -E/--seed\tRNG seed\n -O/--outputtype\tx:energy,f:flux,l:fluence\n"
-           " -b/--reflect\tmismatch [1]\n -U/--normalize\t[1]\n -t/--thread\tGPU threads [65536]\n"
-           " -B/--batch\tphotons/batch [500000, 0=no batch]\n -G/--gpuid\tdevice [1]\n"
-           " -m/--meshres\tshape mesh resolution [24]\n -c/--curv\tcurvature [1=on,0=off,-1=auto]\n --debugcurv\texport curvature normal error map\n"
-           " -D/--debug\tdebug flags as letters (M=trajectory) or integer bitmask\n --maxjumpdebug\tmax trajectory events [10000000]\n"
-           " -L/--listgpu\tlist GPUs\n --dumpjson\tdump config\n --dumpmesh\tsave mesh JSON\n"
-           " --show\t\tlaunch interactive viewer before simulation\n"
-           " -h/--help\n", n, n);
-    exit(0);
+/* [variant][native 64-bit atomics] — see the Makefile */
+static SpirvBlob embedded_kernel(int variant, bool atomic64) {
+    static const SpirvBlob k[KV_COUNT][2] = {
+        {{vkmmc_core_mesh_spv, vkmmc_core_mesh_spv_len}, {vkmmc_core_mesh_i64_spv, vkmmc_core_mesh_i64_spv_len}},
+        {{vkmmc_core_csg_spv, vkmmc_core_csg_spv_len}, {vkmmc_core_csg_i64_spv, vkmmc_core_csg_i64_spv_len}},
+        {{vkmmc_core_curv_spv, vkmmc_core_curv_spv_len}, {vkmmc_core_curv_i64_spv, vkmmc_core_curv_i64_spv_len}}
+    };
+    return k[variant][atomic64 ? 1 : 0];
 }
 
-SimConfig parse_cmdline(int argc, char** argv, CmdOverrides& ovr) {
-    std::string inputfile;
+static std::vector<uint32_t> load_spirv(const std::string& path) {
+    std::ifstream f(path.c_str(), std::ios::ate | std::ios::binary);
 
-    if (argc < 2) {
-        printhelp(argv[0]);
+    if (!f) {
+        throw std::runtime_error("cannot open SPIR-V kernel " + path);
     }
 
-    for (int i = 1; i < argc; i++) {
-        std::string a(argv[i]);
+    size_t sz = (size_t)f.tellg();
 
-        if ((a == "-f" || a == "--input") && i + 1 < argc) {
-            inputfile = argv[++i];
-        } else if ((a == "-n" || a == "--photon") && i + 1 < argc) {
-            ovr.nphoton = (uint64_t)atof(argv[++i]);
-        } else if ((a == "-s" || a == "--session") && i + 1 < argc) {
-            ovr.session_id = argv[++i];
-        } else if ((a == "-u" || a == "--unitinmm") && i + 1 < argc) {
-            ovr.unitinmm = (float)atof(argv[++i]);
-        } else if ((a == "-E" || a == "--seed") && i + 1 < argc) {
-            ovr.rng_seed = (uint32_t)atoi(argv[++i]);
-        } else if ((a == "-O" || a == "--outputtype") && i + 1 < argc) {
-            char c2 = argv[++i][0];
-            ovr.outputtype = (c2 == 'f' ? 0 : c2 == 'l' ? 1 : 2);
-        } else if ((a == "-b" || a == "--reflect") && i + 1 < argc) {
-            ovr.isreflect = atoi(argv[++i]);
-        } else if ((a == "-U" || a == "--normalize") && i + 1 < argc) {
-            ovr.isnormalize = atoi(argv[++i]);
-        } else if ((a == "-t" || a == "--thread") && i + 1 < argc) {
-            ovr.totalthread = (uint32_t)atoi(argv[++i]);
-        } else if ((a == "-B" || a == "--batch") && i + 1 < argc) {
-            ovr.batch_size = (uint64_t)atof(argv[++i]);
-        } else if ((a == "-G" || a == "--gpuid") && i + 1 < argc) {
-            ovr.gpuid = atoi(argv[++i]);
-        } else if (a == "-L" || a == "--listgpu") {
-            ovr.listgpu = true;
-        } else if ((a == "-j" || a == "--json") && i + 1 < argc) {
-            ovr.json_str = argv[++i];
-        } else if (a == "--dumpjson") {
-            ovr.dumpjson = true;
-        } else if (a == "--dumpmesh") {
-            ovr.dumpmesh = true;
-        } else if (a == "--debugcurv") {
-            ovr.debugcurv = true;
-        } else if ((a == "-m" || a == "--meshres") && i + 1 < argc) {
-            ovr.meshres = atoi(argv[++i]);
-        } else if ((a == "-c" || a == "--curv") && i + 1 < argc) {
-            ovr.docurv = atoi(argv[++i]);
-        } else if ((a == "-D" || a == "--debug") && i + 1 < argc) {
-            const char* darg = argv[++i];
-            ovr.debuglevel = isalpha((unsigned char)darg[0]) ? (int)parse_debugopt(darg) : atoi(darg);
-        } else if (a == "--maxjumpdebug" && i + 1 < argc) {
-            ovr.maxjumpdebug = (int)atof(argv[++i]);
-        } else if (a == "--show") {
-            ovr.show = true;
-
-            if (i + 1 < argc) {
-                std::string next = argv[i + 1];
-
-                if (next.size() > 5 && next.compare(next.size() - 5, 5, ".jdat") == 0) {
-                    ovr.traj_file = argv[++i];
-                }
-            }
-        } else if (a == "-h" || a == "--help") {
-            printhelp(argv[0]);
-        } else if (a[0] != '-' && inputfile.empty()) {
-            inputfile = a;
-        }
+    if (sz < 20 || sz % 4) {
+        throw std::runtime_error(path + " is not a SPIR-V binary");
     }
 
-    if (inputfile.empty()) {
-        fprintf(stderr, "No input JSON\n");
-        printhelp(argv[0]);
+    std::vector<uint32_t> code(sz / 4);
+    f.seekg(0);
+    f.read(reinterpret_cast<char*>(code.data()), sz);
+
+    if (code[0] != 0x07230203u) {
+        throw std::runtime_error(path + " is not a SPIR-V binary (bad magic number)");
     }
 
-    ovr.inputfile = inputfile;
-    SimConfig cfg = load_json_input(inputfile.c_str());
-
-    if (ovr.nphoton > 0) {
-        cfg.nphoton = ovr.nphoton;
-    }
-
-    if (ovr.rng_seed > 0) {
-        cfg.rng_seed = ovr.rng_seed;
-    }
-
-    if (!ovr.session_id.empty()) {
-        cfg.session_id = ovr.session_id;
-    }
-
-    if (ovr.unitinmm > 0) {
-        cfg.unitinmm = ovr.unitinmm;
-    }
-
-    if (ovr.outputtype >= 0) {
-        cfg.output_type = ovr.outputtype;
-    }
-
-    if (ovr.isreflect >= 0) {
-        cfg.do_mismatch = (ovr.isreflect != 0);
-    }
-
-    if (ovr.isnormalize >= 0) {
-        cfg.do_normalize = (ovr.isnormalize != 0);
-    }
-
-    if (ovr.meshres > 0) {
-        cfg.mesh_res = ovr.meshres;
-    }
-
-    if (ovr.debuglevel >= 0) {
-        cfg.debuglevel = (uint32_t)ovr.debuglevel;
-    }
-
-    if (ovr.maxjumpdebug >= 0) {
-        cfg.maxjumpdebug = (uint32_t)ovr.maxjumpdebug;
-    }
-
-    return cfg;
+    return code;
 }
 
 /* ================================================================ */
-/*                    Simulation function                           */
+/*                    Simulation                                    */
 /* ================================================================ */
+
+/* BLAS over the surface triangles */
+static AccelStruct build_blas(VulkanCtx& ctx, const SimConfig& cfg) {
+    AccelStruct blas;
+    const VkBufferUsageFlags gu = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    Buffer vb = create_buffer(ctx, cfg.nodes.size() * sizeof(Vec3), gu, hv);
+    upload_host(ctx, vb, cfg.nodes.data(), cfg.nodes.size() * sizeof(Vec3));
+    Buffer ib = create_buffer(ctx, cfg.faces.size() * 3 * sizeof(uint32_t), gu, hv);
+    upload_host(ctx, ib, cfg.faces.data(), cfg.faces.size() * 3 * sizeof(uint32_t));
+    VkAccelerationStructureGeometryTrianglesDataKHR tr = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR};
+    tr.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    tr.vertexData.deviceAddress = get_addr(ctx, vb.buf);
+    tr.vertexStride = sizeof(Vec3);
+    tr.maxVertex = (uint32_t)cfg.nodes.size() - 1;
+    tr.indexType = VK_INDEX_TYPE_UINT32;
+    tr.indexData.deviceAddress = get_addr(ctx, ib.buf);
+    VkAccelerationStructureGeometryKHR geom = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+    geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    geom.geometry.triangles = tr;
+    geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    VkAccelerationStructureBuildGeometryInfoKHR bi = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+    bi.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    bi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    bi.geometryCount = 1;
+    bi.pGeometries = &geom;
+    uint32_t pc = (uint32_t)cfg.faces.size();
+    VkAccelerationStructureBuildSizesInfoKHR sz = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    ctx.pfnGetASBuildSizes(ctx.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bi, &pc, &sz);
+    blas.buffer = create_buffer(ctx, sz.accelerationStructureSize,
+                                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkAccelerationStructureCreateInfoKHR ac = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+    ac.buffer = blas.buffer.buf;
+    ac.size = sz.accelerationStructureSize;
+    ac.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    VK_CHECK(ctx.pfnCreateAS(ctx.device, &ac, NULL, &blas.handle));
+    Buffer scratch = create_buffer(ctx, sz.buildScratchSize,
+                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    bi.dstAccelerationStructure = blas.handle;
+    bi.scratchData.deviceAddress = get_addr(ctx, scratch.buf);
+    VkAccelerationStructureBuildRangeInfoKHR rng;
+    memset(&rng, 0, sizeof(rng));
+    rng.primitiveCount = pc;
+    const VkAccelerationStructureBuildRangeInfoKHR* pR = &rng;
+    VkCommandBuffer cmd = begin_cmd(ctx);
+    ctx.pfnCmdBuildAS(cmd, 1, &bi, &pR);
+    end_submit(ctx, cmd);
+    destroy_buf(ctx, scratch);
+    destroy_buf(ctx, vb);
+    destroy_buf(ctx, ib);
+    printf("BLAS: %u triangles, %lu KB\n", pc, (unsigned long)(sz.accelerationStructureSize / 1024));
+    return blas;
+}
+
 /*
- * run_mc_simulation — runs the full Vulkan compute Monte Carlo simulation.
- * Accepts the already-built cfg (with nodes/faces populated) plus overrides.
- * curvData and has_curvature come from the CSG mesh build phase.
- * spirvFile may be NULL to use embedded SPIR-V.
- * Returns trajectory data (non-empty only when debuglevel has trajectory flag).
+ * Run the Monte Carlo simulation for the prepared cfg/setup, save the output
+ * volume (and trajectories when -D M is given). Returns the trajectory events.
  */
-#ifdef USE_SHOW
-static ShowTraj run_mc_simulation(VulkanCtx& ctx, SimConfig& cfg, CmdOverrides& ovr,
-                                  const std::vector<NodeCurvature>& curvData,
-                                  bool has_curvature, const char* spirvFile) {
-    ShowTraj vtraj_out;
-
-    /* Build BLAS */
-    AccelStruct blas, tlas;
-    {
-        const VkBufferUsageFlags gu = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-        const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        Buffer vb = create_buffer(ctx, cfg.nodes.size() * sizeof(Vec3), gu, hv);
-        upload_host(ctx, vb, cfg.nodes.data(), cfg.nodes.size()*sizeof(Vec3));
-        std::vector<uint32_t> idx;
-        idx.reserve(cfg.faces.size() * 3);
-
-        for (size_t i = 0; i < cfg.faces.size(); i++) {
-            idx.push_back(cfg.faces[i][0]);
-            idx.push_back(cfg.faces[i][1]);
-            idx.push_back(cfg.faces[i][2]);
-        }
-
-        Buffer ib = create_buffer(ctx, idx.size() * sizeof(uint32_t), gu, hv);
-        upload_host(ctx, ib, idx.data(), idx.size()*sizeof(uint32_t));
-        VkAccelerationStructureGeometryTrianglesDataKHR tr = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR};
-        tr.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-        tr.vertexData.deviceAddress = get_addr(ctx, vb.buf);
-        tr.vertexStride = sizeof(Vec3);
-        tr.maxVertex = (uint32_t)cfg.nodes.size() - 1;
-        tr.indexType = VK_INDEX_TYPE_UINT32;
-        tr.indexData.deviceAddress = get_addr(ctx, ib.buf);
-        VkAccelerationStructureGeometryKHR geom = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
-        geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-        geom.geometry.triangles = tr;
-        geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
-        VkAccelerationStructureBuildGeometryInfoKHR bi = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
-        bi.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-        bi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-        bi.geometryCount = 1;
-        bi.pGeometries = &geom;
-        uint32_t pc = (uint32_t)cfg.faces.size();
-        VkAccelerationStructureBuildSizesInfoKHR sz = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
-        ctx.pfnGetASBuildSizes(ctx.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bi, &pc, &sz);
-        blas.buffer = create_buffer(ctx, sz.accelerationStructureSize,
-                                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        VkAccelerationStructureCreateInfoKHR ac = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
-        ac.buffer = blas.buffer.buf;
-        ac.size = sz.accelerationStructureSize;
-        ac.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-        ctx.pfnCreateAS(ctx.device, &ac, NULL, &blas.handle);
-        Buffer scratch = create_buffer(ctx, sz.buildScratchSize,
-                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        bi.dstAccelerationStructure = blas.handle;
-        bi.scratchData.deviceAddress = get_addr(ctx, scratch.buf);
-        VkAccelerationStructureBuildRangeInfoKHR rng;
-        memset(&rng, 0, sizeof(rng));
-        rng.primitiveCount = pc;
-        const VkAccelerationStructureBuildRangeInfoKHR* pR = &rng;
-        VkCommandBuffer cmd = begin_cmd(ctx);
-        ctx.pfnCmdBuildAS(cmd, 1, &bi, &pR);
-        end_submit(ctx, cmd);
-        destroy_buf(ctx, scratch);
-        destroy_buf(ctx, vb);
-        destroy_buf(ctx, ib);
-        printf("BLAS: %u triangles, %lu KB\n", pc, (unsigned long)(sz.accelerationStructureSize / 1024));
-        tlas = build_tlas(ctx, blas);
-    }
+static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const SimSetup& st,
+                                  const CmdOverrides& ovr) {
+    TrajData traj;
+    AccelStruct blas = build_blas(ctx, cfg);
+    AccelStruct tlas = build_tlas(ctx, blas);
 
     const VkBufferUsageFlags ssbo = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 
     /* Face buffer: interleaved [normal+media, vertex_indices] per triangle */
     struct FaceDataGPU {
         float nx, ny, nz, packed_media;
-        float v0f, v1f, v2f, pad;
+        uint32_t v0, v1, v2, pad;
     };
     std::vector<FaceDataGPU> faceGpu(cfg.faces.size());
 
     for (size_t i = 0; i < cfg.faces.size(); i++) {
-        faceGpu[i].nx = cfg.facedata[i].nx;
-        faceGpu[i].ny = cfg.facedata[i].ny;
-        faceGpu[i].nz = cfg.facedata[i].nz;
-        faceGpu[i].packed_media = cfg.facedata[i].packed_media;
-        uint32_t v0 = cfg.faces[i][0], v1 = cfg.faces[i][1], v2 = cfg.faces[i][2];
-        memcpy(&faceGpu[i].v0f, &v0, 4);
-        memcpy(&faceGpu[i].v1f, &v1, 4);
-        memcpy(&faceGpu[i].v2f, &v2, 4);
-        faceGpu[i].pad = 0;
+        faceGpu[i] = {cfg.facedata[i].nx, cfg.facedata[i].ny, cfg.facedata[i].nz, cfg.facedata[i].packed_media,
+                      cfg.faces[i][0], cfg.faces[i][1], cfg.faces[i][2], 0
+                     };
     }
 
     Buffer faceBuf = create_device_buffer(ctx, faceGpu.size() * sizeof(FaceDataGPU), ssbo);
-    upload_to_device(ctx, faceBuf, faceGpu.data(), faceGpu.size()*sizeof(FaceDataGPU));
+    upload_to_device(ctx, faceBuf, faceGpu.data(), faceGpu.size() * sizeof(FaceDataGPU));
 
     /* Curvature buffer: 3 x vec4 per node */
     struct GpuNodeCurv {
         float nx, ny, nz, k1, px, py, pz, k2, posx, posy, posz, pad;
     };
-    std::vector<GpuNodeCurv> gpuCurv;
+    std::vector<GpuNodeCurv> gpuCurv(1);
+    memset(gpuCurv.data(), 0, sizeof(GpuNodeCurv));
 
-    if (has_curvature && !curvData.empty()) {
-        gpuCurv.resize(curvData.size());
+    if (st.has_curvature && st.curv.size() == cfg.nodes.size()) {
+        gpuCurv.resize(st.curv.size());
 
-        for (size_t i = 0; i < curvData.size(); i++) {
-            gpuCurv[i] = {curvData[i].nx, curvData[i].ny, curvData[i].nz, curvData[i].k1,
-                          curvData[i].px, curvData[i].py, curvData[i].pz, curvData[i].k2,
-                          cfg.nodes[i].x, cfg.nodes[i].y, cfg.nodes[i].z, 0
-                         };
+        for (size_t i = 0; i < st.curv.size(); i++) {
+            const NodeCurvature& c = st.curv[i];
+            gpuCurv[i] = {c.nx, c.ny, c.nz, c.k1, c.px, c.py, c.pz, c.k2, cfg.nodes[i].x, cfg.nodes[i].y, cfg.nodes[i].z, 0};
         }
-    } else {
-        gpuCurv.resize(1);
-        memset(&gpuCurv[0], 0, sizeof(GpuNodeCurv));
     }
 
     Buffer curvBuf = create_device_buffer(ctx, gpuCurv.size() * sizeof(GpuNodeCurv), ssbo);
-    upload_to_device(ctx, curvBuf, gpuCurv.data(), gpuCurv.size()*sizeof(GpuNodeCurv));
+    upload_to_device(ctx, curvBuf, gpuCurv.data(), gpuCurv.size() * sizeof(GpuNodeCurv));
 
-    /* Media buffer */
-    Buffer mediaBuf = create_device_buffer(ctx, cfg.media.size() * sizeof(Medium), ssbo);
-    upload_to_device(ctx, mediaBuf, cfg.media.data(), cfg.media.size()*sizeof(Medium));
+    /* Media buffer, mua/mus in 1/length-unit */
+    std::vector<Medium> media = kernel_media(cfg);
+    Buffer mediaBuf = create_device_buffer(ctx, media.size() * sizeof(Medium), ssbo);
+    upload_to_device(ctx, mediaBuf, media.data(), media.size() * sizeof(Medium));
 
-    /* Output grid */
-    float vs = cfg.unitinmm;
-
-    if (cfg.has_steps) {
-        vs = cfg.steps[0];
-    }
-
-    float ge = vs * 0.5f;
-    float gmin[3] = {cfg.nmin.x - ge, cfg.nmin.y - ge, cfg.nmin.z - ge};
-    float gmax[3] = {cfg.nmax.x + ge, cfg.nmax.y + ge, cfg.nmax.z + ge};
-    uint32_t nx = (uint32_t)ceil((gmax[0] - gmin[0]) / vs);
-    uint32_t ny = (uint32_t)ceil((gmax[1] - gmin[1]) / vs);
-    uint32_t nz = (uint32_t)ceil((gmax[2] - gmin[2]) / vs);
-    uint32_t crop0w = nx * ny * nz * cfg.maxgate, outSz = crop0w * 2;
-
-    Buffer outBuf = create_device_buffer(ctx, outSz * sizeof(float), ssbo);
+    /* Output grid: one 64-bit fixed-point sum per voxel and gate */
+    OutputGrid g = compute_grid(cfg);
+    VkDeviceSize outBytes = g.nelem * sizeof(uint64_t);
+    Buffer outBuf = create_device_buffer(ctx, outBytes, ssbo);
     {
         VkCommandBuffer cmd = begin_cmd(ctx);
-        vkCmdFillBuffer(cmd, outBuf.buf, 0, outSz * sizeof(float), 0);
+        vkCmdFillBuffer(cmd, outBuf.buf, 0, outBytes, 0);
         end_submit(ctx, cmd);
     }
-    printf("Grid: %ux%ux%u x %d gates, voxel=%.3fmm, origin=[%.2f,%.2f,%.2f]\n",
-           nx, ny, nz, cfg.maxgate, vs, gmin[0], gmin[1], gmin[2]);
-
-    {
-        float bbx_pad = vs * 2.0f;
-        float bbmin[3] = {gmin[0] - bbx_pad, gmin[1] - bbx_pad, gmin[2] - bbx_pad};
-        float bbmax[3] = {gmax[0] + bbx_pad, gmax[1] + bbx_pad, gmax[2] + bbx_pad};
-
-        ShapeMesh bbx_mesh;
-        bbx_mesh.nodes    = cfg.nodes;
-        bbx_mesh.faces    = cfg.faces;
-        bbx_mesh.facedata = cfg.facedata;
-        bbx_mesh.shape_id = cfg.face_shape_id;
-
-        gen_box(bbx_mesh, bbmin[0], bbmin[1], bbmin[2],
-                bbmax[0] - bbmin[0], bbmax[1] - bbmin[1], bbmax[2] - bbmin[2], 0xFFFF);
-
-        cfg.nodes         = bbx_mesh.nodes;
-        cfg.faces         = bbx_mesh.faces;
-        cfg.facedata      = bbx_mesh.facedata;
-        cfg.face_shape_id = bbx_mesh.shape_id;
-
-        printf("After BBox: %zu nodes, %zu faces\n", cfg.nodes.size(), cfg.faces.size());
-    }
+    printf("Grid: %ux%ux%u x %d gates, voxel=%.3f (%.4f mm), origin=[%.2f,%.2f,%.2f]\n",
+           g.nx, g.ny, g.nz, g.maxgate, g.vs, g.vs * cfg.unitinmm, g.gmin[0], g.gmin[1], g.gmin[2]);
 
     /* Threads */
-    uint32_t tt = (ovr.totalthread > 0) ? ovr.totalthread : 65536;
+    uint32_t tt = thread_count(cfg, ovr);
+    uint32_t wg = tt / 64;
 
-    if (cfg.nphoton < tt) {
-        tt = ((uint32_t)cfg.nphoton + 63) / 64 * 64;
-
-        if (!tt) {
-            tt = 64;
-        }
+    if (wg > ctx.max_wg_count) {
+        throw std::runtime_error("-t " + std::to_string(tt) + " exceeds the device limit of " +
+                                 std::to_string((uint64_t)ctx.max_wg_count * 64) + " threads");
     }
 
     /* MCParams */
@@ -1002,6 +813,8 @@ static ShowTraj run_mc_simulation(VulkanCtx& ctx, SimConfig& cfg, CmdOverrides& 
     for (int i = 0; i < 3; i++) {
         params.srcpos[i] = cfg.srcpos[i];
         params.srcdir[i] = cfg.srcdir[i];
+        params.nmin[i] = g.gmin[i];
+        params.nmax[i] = g.gmax[i] - g.gmin[i];
     }
 
     for (int i = 0; i < 4; i++) {
@@ -1009,110 +822,69 @@ static ShowTraj run_mc_simulation(VulkanCtx& ctx, SimConfig& cfg, CmdOverrides& 
         params.srcparam2[i] = cfg.srcparam2[i];
     }
 
-    params.nmin[0] = gmin[0];
-    params.nmin[1] = gmin[1];
-    params.nmin[2] = gmin[2];
-    params.nmax[0] = gmax[0] - gmin[0];
-    params.nmax[1] = gmax[1] - gmin[1];
-    params.nmax[2] = gmax[2] - gmin[2];
-    params.crop0[0] = nx;
-    params.crop0[1] = nx * ny;
-    params.crop0[2] = nx * ny * nz;
-    params.crop0[3] = crop0w;
-
-    params.dstep  = 1.0f / vs;
-    params.tstart = cfg.t0;
-    params.tend   = cfg.t1;
-    params.Rtstep = 1.0f / cfg.dt;
-
+    params.crop0[0] = g.nx;
+    params.crop0[1] = g.nx * g.ny;
+    params.crop0[2] = (uint32_t)g.nvox;
+    params.crop0[3] = (uint32_t)g.nelem;
+    params.dstep  = 1.0f / g.vs;
+    kernel_time_gates(cfg, params.tstart, params.tend, params.Rtstep);
     params.srctype   = cfg.srctype;
     params.maxgate   = cfg.maxgate;
     params.outputtype = cfg.output_type;
     params.isreflect = cfg.do_mismatch ? 1u : 0u;
-
     params.mediumid0    = cfg.mediumid0;
     params.total_threads = tt;
-    params.num_media    = (uint32_t)cfg.media.size();
+    params.num_media    = (uint32_t)media.size();
     params.seed         = cfg.rng_seed;
-
     params.do_csg        = cfg.is_csg ? 1u : 0u;
-    params.has_curvature = has_curvature ? 1u : 0u;
+    params.has_curvature = st.has_curvature ? 1u : 0u;
     params.minenergy     = cfg.minenergy;
     params.roulettesize  = cfg.roulettesize;
-    bool do_traj = (cfg.debuglevel & 8192u) != 0u;
+    bool do_traj = (cfg.debuglevel & VKMMC_DEBUG_TRAJ) != 0u && cfg.maxjumpdebug > 0;
     params.do_traj  = do_traj ? 1u : 0u;
     params.max_traj = do_traj ? cfg.maxjumpdebug : 0u;
-    printf("DEBUG: has_curvature=%d, params.has_curvature=%u\n",
-           has_curvature, params.has_curvature);
 
     Buffer paramBuf = create_device_buffer(ctx, sizeof(MCParams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
-    /* RNG seeds — allocated once, re-seeded per batch to ensure unique photon paths.
-     * Hash-based per-thread seeding avoids the sequential correlations that arise
-     * when using consecutive rand() outputs (which also only provide 31-bit values). */
-    uint32_t base_seed = (cfg.rng_seed > 0) ? cfg.rng_seed : (uint32_t)time(0);
-    struct uint4_t {
-        uint32_t x, y, z, w;
-    };
-    std::vector<uint4_t> seeds(tt);
-
-    auto make_seed = [](uint32_t base, uint32_t idx) -> uint32_t {
-        uint32_t v = base ^ (idx * 2654435761u);
-        v ^= v >> 16; v *= 0x45d9f3bu; v ^= v >> 16; v *= 0x45d9f3bu; v ^= v >> 16;
-        return v;
-    };
-    for (uint32_t i = 0; i < tt; i++)
-        seeds[i] = {make_seed(base_seed, i*4u+0u), make_seed(base_seed, i*4u+1u),
-                    make_seed(base_seed, i*4u+2u), make_seed(base_seed, i*4u+3u)};
-
-    Buffer seedBuf = create_device_buffer(ctx, tt * sizeof(uint4_t), ssbo);
-
-    upload_to_device(ctx, seedBuf, seeds.data(), tt * sizeof(uint4_t));
+    /* RNG seeds, re-seeded per batch so that each batch simulates distinct photons */
+    uint32_t seed0 = base_seed(cfg);
+    std::vector<uint32_t> seeds;
+    Buffer seedBuf = create_device_buffer(ctx, (VkDeviceSize)tt * 4 * sizeof(uint32_t), ssbo);
 
     /* Trajectory buffer: [0]=atomic counter, [1..6*N]=records (6 uints each) */
     uint32_t traj_cap = do_traj ? cfg.maxjumpdebug : 0u;
-
     VkDeviceSize traj_buf_sz = (1 + (VkDeviceSize)traj_cap * 6) * sizeof(uint32_t);
-
     Buffer trajBuf = create_device_buffer(ctx, traj_buf_sz, ssbo);
-
     {
         VkCommandBuffer zcmd = begin_cmd(ctx);
         vkCmdFillBuffer(zcmd, trajBuf.buf, 0, sizeof(uint32_t), 0);
         end_submit(ctx, zcmd);
     }
 
-    if (has_curvature && !curvData.empty()) {
-        gpuCurv.resize(curvData.size());
+    /* Kernel: embedded variant, or a user-supplied .spv */
+    SpirvBlob blob = embedded_kernel(st.variant, ctx.atomic64);
+    std::vector<uint32_t> usercode;
+    const uint32_t* code = reinterpret_cast<const uint32_t*>(blob.data);
+    size_t codesize = blob.len;
 
-        for (size_t i = 0; i < curvData.size(); i++) {
-            gpuCurv[i] = { curvData[i].nx, curvData[i].ny, curvData[i].nz, curvData[i].k1,
-                           curvData[i].px, curvData[i].py, curvData[i].pz, curvData[i].k2,
-                           cfg.nodes[i].x, cfg.nodes[i].y, cfg.nodes[i].z, 0
-                         };
-        }
+    if (!ovr.kernelfile.empty()) {
+        usercode = load_spirv(ovr.kernelfile);
+        code = usercode.data();
+        codesize = usercode.size() * 4;
+        printf("Kernel: %s (user supplied)\n", ovr.kernelfile.c_str());
     } else {
-        gpuCurv.resize(1);
-        memset(&gpuCurv[0], 0, sizeof(GpuNodeCurv));
+        printf("Kernel: %s, %s atomics\n", kernel_variant_name(st.variant), ctx.atomic64 ? "64-bit" : "32-bit pair");
     }
 
-    ComputePipe cp = create_pipeline(ctx, spirvFile);
+    ComputePipe cp = create_pipeline(ctx, code, codesize);
     update_desc(ctx, cp, tlas.handle, faceBuf, mediaBuf, outBuf, paramBuf, seedBuf, curvBuf, trajBuf);
 
     /* Batched dispatch */
-    uint64_t batchsz;
-
-    if (ovr.batch_size == 0) {
-        batchsz = cfg.nphoton;
-    } else if (ovr.batch_size != UINT64_MAX) {
-        batchsz = ovr.batch_size;
-    } else {
-        batchsz = 500000;
-    }
-
-    uint64_t pdone = 0;
+    uint64_t batchsz = batch_size(cfg, ovr), pdone = 0;
     int batch = 0;
-    uint32_t wg = tt / 64;
+    bool batch_readback = (outBytes <= VKMMC_BATCH_READBACK_BYTES);
+    std::vector<double> acc;
+    std::vector<uint64_t> raw(g.nelem);
     printf("Threads: %u (%u x 64), batch: %lu photons\n", tt, wg, (unsigned long)batchsz);
 
     typedef std::chrono::high_resolution_clock Clk;
@@ -1124,16 +896,8 @@ static ShowTraj run_mc_simulation(VulkanCtx& ctx, SimConfig& cfg, CmdOverrides& 
         params.threadphoton = (int)(bp / tt);
         params.oddphoton    = (int)(bp - (uint64_t)params.threadphoton * tt);
         params.photon_base  = (uint32_t)pdone;
-        /* Re-seed per batch so each batch simulates distinct photon paths.
-         * Without this, all batches start with the same RNG state and
-         * simulate identical trajectories with only different photon IDs. */
-        if (pdone > 0) {
-            uint32_t batch_seed = base_seed + (uint32_t)pdone;
-            for (uint32_t i = 0; i < tt; i++)
-                seeds[i] = {make_seed(batch_seed, i*4u+0u), make_seed(batch_seed, i*4u+1u),
-                            make_seed(batch_seed, i*4u+2u), make_seed(batch_seed, i*4u+3u)};
-            upload_to_device(ctx, seedBuf, seeds.data(), tt * sizeof(uint4_t));
-        }
+        make_seeds(seed0, pdone, tt, seeds);
+        upload_to_device(ctx, seedBuf, seeds.data(), seeds.size() * sizeof(uint32_t));
         upload_to_device(ctx, paramBuf, &params, sizeof(params));
         VkCommandBuffer cmd = begin_cmd(ctx);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeline);
@@ -1144,149 +908,41 @@ static ShowTraj run_mc_simulation(VulkanCtx& ctx, SimConfig& cfg, CmdOverrides& 
         kms += std::chrono::duration<double, std::milli>(Clk::now() - ks).count();
         pdone += bp;
         batch++;
+
+        /* move the batch output into the double accumulator, clear the GPU buffer */
+        if (batch_readback && pdone < cfg.nphoton) {
+            download_from_device(ctx, outBuf, raw.data(), outBytes);
+            accumulate_fixed(acc, raw.data(), g.nelem);
+            VkCommandBuffer zcmd = begin_cmd(ctx);
+            vkCmdFillBuffer(zcmd, outBuf.buf, 0, outBytes, 0);
+            end_submit(ctx, zcmd);
+        }
+
         printf("  batch %d: %lu photons (%lu/%lu)\n", batch, (unsigned long)bp, (unsigned long)pdone, (unsigned long)cfg.nphoton);
     }
 
     double tms = std::chrono::duration<double, std::milli>(Clk::now() - t0sim).count();
     printf("Done (%d batches), kernel: %.3f ms, total: %.3f ms\n", batch, kms, tms);
-    printf("Speed: %.2f photon/ms (kernel), %.2f photon/ms (total)\n", (double)cfg.nphoton / kms, (double)cfg.nphoton / tms);
+    printf("Speed: %.2f photon/ms (kernel), %.2f photon/ms (total)\n", (double)cfg.nphoton / std::max(kms, 1e-6),
+           (double)cfg.nphoton / std::max(tms, 1e-6));
 
-    /* Readback */
-    std::vector<float> raw(outSz);
-    download_from_device(ctx, outBuf, raw.data(), outSz * sizeof(float));
-    uint32_t hc_gpu;
-    memcpy(&hc_gpu, &raw[crop0w - 11], 4);
-    printf("DEBUG GPU has_curvature: %u\n", hc_gpu);
-    std::vector<float> fluence(crop0w);
-    double absorbed = 0;
-    int nans = 0, infs = 0;
+    /* Readback, normalization and output */
+    download_from_device(ctx, outBuf, raw.data(), outBytes);
+    accumulate_fixed(acc, raw.data(), g.nelem);
+    std::vector<float> vol = finalize_output(cfg, g, acc);
+    save_fluence(cfg, g, vol);
 
-    for (uint32_t i = 0; i < crop0w; i++) {
-        fluence[i] = raw[i] + raw[i + crop0w];
-
-        if (fluence[i] != fluence[i]) {
-            nans++;
-            fluence[i] = 0;
-        } else if (fluence[i] > 1e30f || fluence[i] < -1e30f) {
-            infs++;
-            fluence[i] = 0;
-        } else {
-            absorbed += fluence[i];
-        }
-    }
-
-    if (nans || infs) {
-        printf("WARNING: %d NaN, %d Inf voxels zeroed\n", nans, infs);
-    }
-
-    printf("simulated %lu photons, absorbed: %.5f%%\n", (unsigned long)cfg.nphoton, absorbed / (double)cfg.nphoton * 100.0);
-
-    if (cfg.do_normalize) {
-        float vv = vs * vs * vs;
-
-        for (uint32_t i = 0; i < crop0w; i++) {
-            fluence[i] /= (float)cfg.nphoton * vv;
-        }
-    }
-
-    /* Save JData */
-    {
-        std::vector<size_t> dims;
-        dims.push_back(nx);
-        dims.push_back(ny);
-        dims.push_back(nz);
-
-        if (cfg.maxgate > 1) {
-            dims.push_back((size_t)cfg.maxgate);
-        }
-
-        json root;
-        root["Session"] = {{"ID", cfg.session_id}, {"Photons", cfg.nphoton}};
-        root["Forward"] = {{"T0", cfg.t0}, {"T1", cfg.t1}, {"Dt", cfg.dt}};
-        root["Domain"] = {{"LengthUnit", cfg.unitinmm}, {"VoxelSize", vs}, {"Dim", {nx, ny, nz}}, {"Origin", {gmin[0], gmin[1], gmin[2]}}};
-        root["Fluence"] = jdata_encode("single", dims, fluence.data(), crop0w * sizeof(float));
-        std::string outname = cfg.session_id + ".jdat";
-        std::ofstream of(outname.c_str());
-        of << root.dump(2) << std::endl;
-        printf("Output: %s (%ux%ux%u", outname.c_str(), nx, ny, nz);
-
-        if (cfg.maxgate > 1) {
-            printf("x%d", cfg.maxgate);
-        }
-
-        printf(")\n");
-    }
-
-    /* Save trajectory */
-    if (do_traj && traj_cap > 0) {
-        std::vector<uint32_t> trajRaw(1 + (size_t)traj_cap * 6);
-        download_from_device(ctx, trajBuf, trajRaw.data(), traj_buf_sz);
-        uint32_t n = std::min(trajRaw[0], traj_cap);
+    if (do_traj) {
+        uint32_t n = 0;
+        download_from_device(ctx, trajBuf, &n, sizeof(uint32_t));
+        n = std::min(n, traj_cap);
         printf("Trajectory: %u events recorded (max %u)\n", n, traj_cap);
 
         if (n > 0) {
-            std::vector<uint32_t> tpid(n), tevt(n);
-            std::vector<float> tpos(n * 3), twgt(n);
-
-            for (uint32_t i = 0; i < n; i++) {
-                uint32_t base = 1u + i * 6u;
-                tpid[i]        = trajRaw[base + 0];
-                memcpy(&tpos[i * 3 + 0], &trajRaw[base + 1], 4);
-                memcpy(&tpos[i * 3 + 1], &trajRaw[base + 2], 4);
-                memcpy(&tpos[i * 3 + 2], &trajRaw[base + 3], 4);
-                memcpy(&twgt[i],          &trajRaw[base + 4], 4);
-                tevt[i]        = trajRaw[base + 5];
-            }
-
-            json troot;
-            json& mdata = troot["MCXData"];
-
-            json media_arr = json::array();
-
-            for (const auto& m : cfg.media) {
-                media_arr.push_back({{"mua", m.mua / cfg.unitinmm}, {"mus", m.mus / cfg.unitinmm}, {"g", m.g}, {"n", m.n}});
-            }
-
-            mdata["Info"] = {
-                {"Version",        1},
-                {"MediaNum",       (int)cfg.media.size()},
-                {"DetNum",         0},
-                {"ColumnNum",      5},
-                {"TotalPhoton",    cfg.nphoton},
-                {"DetectedPhoton", n},
-                {"SavedPhoton",    n},
-                {"LengthUnit",     cfg.unitinmm},
-                {"SeedByte",       0},
-                {"Normalizer",     1.0},
-                {"Repeat",         1},
-                {"SrcNum",         1},
-                {"SaveDetFlag",    0},
-                {"Media",          media_arr}
-            };
-
-            json& tdat = mdata["Trajectory"];
-            tdat["photonid"] = jdata_encode("uint32", {n, 1}, tpid.data(), n * sizeof(uint32_t), true);
-            tdat["p"]        = jdata_encode("single", {n, 3}, tpos.data(), n * 3 * sizeof(float), true);
-            tdat["w0"]       = jdata_encode("single", {n, 1}, twgt.data(), n * sizeof(float), true);
-            tdat["e0"]       = jdata_encode("uint32", {n, 1}, tevt.data(), n * sizeof(uint32_t), true);
-
-            std::string tname = cfg.session_id + "_traj.jdat";
-            std::ofstream tf(tname.c_str());
-            tf << troot.dump() << std::endl;
-            printf("Trajectory saved: %s\n", tname.c_str());
-
-            /* Populate ShowTraj for viewer */
-            vtraj_out.pts.resize(n * 3);
-            vtraj_out.ids.resize(n);
-            vtraj_out.evts.resize(n);
-
-            for (uint32_t i = 0; i < n; i++) {
-                vtraj_out.pts[i * 3 + 0] = tpos[i * 3 + 0];
-                vtraj_out.pts[i * 3 + 1] = tpos[i * 3 + 1];
-                vtraj_out.pts[i * 3 + 2] = tpos[i * 3 + 2];
-                vtraj_out.ids[i]          = tpid[i];
-                vtraj_out.evts[i]         = tevt[i];
-            }
+            std::vector<uint32_t> rec(1 + (size_t)n * 6);
+            download_from_device(ctx, trajBuf, rec.data(), rec.size() * sizeof(uint32_t));
+            traj = unpack_trajectory(rec.data() + 1, n);
+            save_trajectory(cfg, traj);
         }
     }
 
@@ -1306,552 +962,16 @@ static ShowTraj run_mc_simulation(VulkanCtx& ctx, SimConfig& cfg, CmdOverrides& 
     vkDestroyPipelineLayout(ctx.device, cp.pipeLayout, NULL);
     vkDestroyDescriptorPool(ctx.device, cp.descPool, NULL);
     vkDestroyDescriptorSetLayout(ctx.device, cp.descLayout, NULL);
-    vkDestroyCommandPool(ctx.device, ctx.cmdPool, NULL);
 
-    return vtraj_out;
+    return traj;
 }
-#endif /* USE_SHOW */
-
-/* ================================================================ */
-/*                             Main                                 */
-/* ================================================================ */
-int main(int argc, char** argv) {
-    const char* spirvFile = NULL; /* use embedded SPIR-V by default */
-
-    if (argc > 2) {
-        std::string la(argv[argc - 1]);
-
-        if (la.size() > 4 && la.substr(la.size() - 4) == ".spv") {
-            spirvFile = argv[--argc];
-        }
-    }
-
-    for (int i = 1; i < argc; i++) {
-        std::string a(argv[i]);
-
-        if (a == "-L" || a == "--listgpu") {
-            list_vulkan_gpus();
-            return 0;
-        }
-    }
-
-    CmdOverrides ovr;
-    SimConfig cfg = parse_cmdline(argc, argv, ovr);
-
-    /* ---- Phase 1: Generate CSG mesh if needed ---- */
-    std::vector<NodeCurvature> curvData;
-    bool has_curvature = false;
-    bool want_curvature = (ovr.docurv < 0) ? true : (ovr.docurv != 0);  // auto = on for CSG
-
-    if (cfg.is_csg) {
-        std::ifstream sf(ovr.inputfile.c_str());
-        json jroot;
-        sf >> jroot;
-
-        if (jroot.contains("Shapes") && jroot["Shapes"].is_array()) {
-            float ext[6] = {0, 60, 0, 60, 0, 60};
-            ShapeMesh sm = parse_shapes(jroot["Shapes"], ext, cfg.mesh_res);
-            cfg.nodes = sm.nodes;
-            cfg.faces = sm.faces;
-            cfg.facedata = sm.facedata;
-            cfg.face_shape_id = sm.shape_id;
-            update_bbox(cfg);
-
-            if (want_curvature) {
-                std::vector<ShapeOrigin> shape_origins = extract_shape_origins(jroot["Shapes"]);
-                curvData = compute_curvature(sm, shape_origins);
-                has_curvature = true;
-                printf("Curvature: computed for %zu nodes, %zu shapes\n",
-                       curvData.size(), shape_origins.size());
-            } else {
-                printf("Curvature: disabled\n");
-            }
-        }
-
-        if (cfg.nodes.empty()) {
-            fprintf(stderr, "CSG: no shapes\n");
-            return 1;
-        }
-    }
-
-    /* ---- Phase 2: Handle dump commands ---- */
-    if (ovr.dumpjson) {
-        printf("{\"Session\":{\"ID\":\"%s\",\"Photons\":%lu},\"Mesh\":{\"Nodes\":%zu,\"Faces\":%zu}}\n",
-               cfg.session_id.c_str(), (unsigned long)cfg.nphoton, cfg.nodes.size(), cfg.faces.size());
-        return 0;
-    }
-
-    if (ovr.dumpmesh) {
-        if (cfg.nodes.empty() || cfg.faces.empty()) {
-            fprintf(stderr, "No mesh to dump\n");
-            return 1;
-        }
-
-        printf("Verifying face data (%zu faces):\n", cfg.faces.size());
-
-        for (size_t i = 0; i < cfg.faces.size() && i < 5; i++) {
-            uint32_t pk = 0;
-            memcpy(&pk, &cfg.facedata[i].packed_media, 4);
-            bool is_flat = (pk & 0x80000000u) != 0;
-            uint32_t pk_clean = pk & 0x7FFFFFFFu;
-            printf("  face[%zu]: v=(%u,%u,%u) n=(%.3f,%.3f,%.3f) front=%u back=%u%s\n",
-                   i, cfg.faces[i][0], cfg.faces[i][1], cfg.faces[i][2],
-                   cfg.facedata[i].nx, cfg.facedata[i].ny, cfg.facedata[i].nz,
-                   pk_clean >> 16, pk_clean & 0xFFFF, is_flat ? " [FLAT]" : "");
-        }
-
-        json dump;
-        dump["Session"] = {{"ID", cfg.session_id}, {"Photons", cfg.nphoton}};
-        dump["Forward"] = {{"T0", cfg.t0}, {"T1", cfg.t1}, {"Dt", cfg.dt}};
-        dump["Domain"]["LengthUnit"] = cfg.unitinmm;
-        dump["Domain"]["Media"] = json::array();
-
-        for (size_t i = 0; i < cfg.media.size(); i++)
-            dump["Domain"]["Media"].push_back({{"mua", cfg.media[i].mua / cfg.unitinmm}, {"mus", cfg.media[i].mus / cfg.unitinmm}, {"g", cfg.media[i].g}, {"n", cfg.media[i].n}});
-        dump["Optode"]["Source"]["Type"] = (cfg.srctype == 0 ? "pencil" : (cfg.srctype == 4 ? "planar" : (cfg.srctype == 8 ? "disk" : "unknown")));
-        dump["Optode"]["Source"]["Pos"] = {cfg.srcpos[0], cfg.srcpos[1], cfg.srcpos[2]};
-        dump["Optode"]["Source"]["Dir"] = {cfg.srcdir[0], cfg.srcdir[1], cfg.srcdir[2], cfg.srcdir[3]};
-        size_t nn = cfg.nodes.size(), nf = cfg.faces.size();
-        std::vector<float> nd(nn * 3);
-
-        for (size_t i = 0; i < nn; i++) {
-            nd[i * 3] = cfg.nodes[i].x;
-            nd[i * 3 + 1] = cfg.nodes[i].y;
-            nd[i * 3 + 2] = cfg.nodes[i].z;
-        }
-
-        std::vector<size_t> ndim = {nn, 3};
-        dump["Shapes"]["MeshNode"] = jdata_encode("single", ndim, nd.data(), nn * 3 * sizeof(float), true);
-        std::vector<int32_t> sd(nf * 4);
-
-        for (size_t i = 0; i < nf; i++) {
-            sd[i * 4] = (int32_t)(cfg.faces[i][0] + 1);
-            sd[i * 4 + 1] = (int32_t)(cfg.faces[i][1] + 1);
-            sd[i * 4 + 2] = (int32_t)(cfg.faces[i][2] + 1);
-
-            if (i < cfg.face_shape_id.size()) {
-                sd[i * 4 + 3] = (int32_t)cfg.face_shape_id[i];
-            } else {
-                uint32_t pk = 0;
-                memcpy(&pk, &cfg.facedata[i].packed_media, 4);
-                sd[i * 4 + 3] = (int32_t)(pk & 0xFFFF);
-            }
-        }
-
-        std::vector<size_t> sdim = {nf, 4};
-        dump["Shapes"]["MeshSurf"] = jdata_encode("int32", sdim, sd.data(), nf * 4 * sizeof(int32_t), true);
-        std::string mf = cfg.session_id + "_mesh.json";
-        std::ofstream of(mf.c_str());
-        of << dump.dump(2) << std::endl;
-        printf("Mesh saved to %s (%zu nodes, %zu faces, %s mode)\n", mf.c_str(), nn, nf, cfg.is_csg ? "CSG" : "mesh");
-        return 0;
-    }
-
-    if (ovr.debugcurv) {
-        if (!has_curvature || curvData.empty()) {
-            fprintf(stderr, "debugcurv requires curvature data (use -c 1)\n");
-            return 1;
-        }
-
-        // Re-read JSON for shape origins
-        std::ifstream dcf(ovr.inputfile.c_str());
-        json dcroot;
-        dcf >> dcroot;
-        std::vector<ShapeOrigin> origins = extract_shape_origins(dcroot["Shapes"]);
-
-        // ---- Coarse mesh: already built (cfg.nodes, cfg.faces, curvData) ----
-        printf("debugcurv: coarse mesh = %zu nodes, %zu faces (mesh_res=%d)\n",
-               cfg.nodes.size(), cfg.faces.size(), cfg.mesh_res);
-
-        // ---- Fine mesh: rebuild at higher resolution ----
-        int fine_res = cfg.mesh_res * 4;
-        float ext_fine[6] = {0, 60, 0, 60, 0, 60};
-        ShapeMesh fine_mesh = parse_shapes(dcroot["Shapes"], ext_fine, fine_res);
-        printf("debugcurv: fine mesh = %zu nodes, %zu faces (mesh_res=%d)\n",
-               fine_mesh.nodes.size(), fine_mesh.faces.size(), fine_res);
-
-        // ---- For each fine mesh node, find enclosing coarse triangle ----
-        // Build per-shape coarse face lists for faster lookup
-        // shape_id is 1-based in cfg.face_shape_id
-
-        size_t nn_fine = fine_mesh.nodes.size();
-        size_t nf_fine = fine_mesh.faces.size();
-
-        // Compute analytic normal at each fine node
-        // Also compute curvature-predicted normal using coarse mesh
-        // node_shape mapping for fine mesh
-        std::vector<int> fine_node_shape(nn_fine, -1);
-
-        for (size_t fi = 0; fi < fine_mesh.faces.size(); fi++) {
-            int si = (fi < fine_mesh.shape_id.size()) ? (int)fine_mesh.shape_id[fi] - 1 : -1;
-
-            for (int k = 0; k < 3; k++) {
-                uint32_t ni = fine_mesh.faces[fi][k];
-
-                if (ni < nn_fine && fine_node_shape[ni] < 0) {
-                    fine_node_shape[ni] = si;
-                }
-            }
-        }
-
-        // Output: x, y, z, curv_error, flat_error per fine node
-        std::vector<float> out_nodes(nn_fine * 5);
-        double curv_err_sum = 0, curv_err_max = 0;
-        double flat_err_sum = 0, flat_err_max = 0;
-        int counted = 0;
-
-        // Helper: compute analytic normal at a point for a given shape
-        auto analytic_normal = [&](float px, float py, float pz, int si, Vec3 fallback) -> Vec3 {
-            Vec3 N = fallback;
-
-            if (si >= 0 && si < (int)origins.size()) {
-                const ShapeOrigin& so = origins[si];
-
-                if (so.type == 1) { // sphere
-                    float dx = px - so.cx, dy = py - so.cy, dz = pz - so.cz;
-                    float dl = std::sqrt(dx * dx + dy * dy + dz * dz);
-
-                    if (dl > 1e-10f) {
-                        N.x = dx / dl;
-                        N.y = dy / dl;
-                        N.z = dz / dl;
-                    }
-                } else if (so.type == 2) { // cylinder
-                    float dx = px - so.cx, dy = py - so.cy, dz = pz - so.cz;
-                    float proj = dx * so.ax + dy * so.ay + dz * so.az;
-                    float rx = dx - proj * so.ax, ry = dy - proj * so.ay, rz = dz - proj * so.az;
-                    float rl = std::sqrt(rx * rx + ry * ry + rz * rz);
-
-                    if (rl > 1e-10f) {
-                        N.x = rx / rl;
-                        N.y = ry / rl;
-                        N.z = rz / rl;
-                    }
-                } else if (so.type == 3) { // lens spherical cap: (P - C), flip for concave
-                    float dx = px - so.cx, dy = py - so.cy, dz = pz - so.cz;
-                    float dl2 = std::sqrt(dx * dx + dy * dy + dz * dz);
-
-                    if (dl2 > 1e-10f) {
-                        N.x = dx / dl2;
-                        N.y = dy / dl2;
-                        N.z = dz / dl2;
-
-                        /* Concave cap (R<0): sphere center is on far side,
-                           so (P-C) points inward — flip to outward */
-                        if (so.R < 0.0f) {
-                            N.x = -N.x;
-                            N.y = -N.y;
-                            N.z = -N.z;
-                        }
-                    }
-                }
-            }
-
-            return N;
-        };
-
-        // Helper: compute barycentric coords of point P in triangle (A, B, C)
-        // Returns true if P is inside, sets u, v, w (barycentric weights)
-        auto barycentric = [](Vec3 P, Vec3 A, Vec3 B, Vec3 C, float & u, float & v, float & w) -> bool {
-            Vec3 v0 = {B.x - A.x, B.y - A.y, B.z - A.z};
-            Vec3 v1 = {C.x - A.x, C.y - A.y, C.z - A.z};
-            Vec3 v2 = {P.x - A.x, P.y - A.y, P.z - A.z};
-            float d00 = v0.x * v0.x + v0.y * v0.y + v0.z * v0.z;
-            float d01 = v0.x * v1.x + v0.y * v1.y + v0.z * v1.z;
-            float d11 = v1.x * v1.x + v1.y * v1.y + v1.z * v1.z;
-            float d20 = v2.x * v0.x + v2.y * v0.y + v2.z * v0.z;
-            float d21 = v2.x * v1.x + v2.y * v1.y + v2.z * v1.z;
-            float denom = d00 * d11 - d01 * d01;
-
-            if (std::fabs(denom) < 1e-20f) {
-                return false;
-            }
-
-            v = (d11 * d20 - d01 * d21) / denom;
-            w = (d00 * d21 - d01 * d20) / denom;
-            u = 1.0f - v - w;
-            return (u >= -0.01f && v >= -0.01f && w >= -0.01f);
-        };
-
-        // Helper: curvature-predicted normal at point (sx,sy,sz) using coarse triangle fi
-        // If the triangle is flagged as flat (bit 31 of packed_media), returns
-        // the precomputed face normal directly without curvature correction.
-        auto curv_normal_at = [&](float sx, float sy, float sz, size_t fi) -> Vec3 {
-            // Check flat flag (bit 31 of packed_media)
-            uint32_t pk = 0;
-            memcpy(&pk, &cfg.facedata[fi].packed_media, 4);
-
-            if (pk & 0x80000000u) {
-                // Flat triangle: return precomputed face normal directly
-                return {cfg.facedata[fi].nx, cfg.facedata[fi].ny, cfg.facedata[fi].nz};
-            }
-
-            uint32_t cv0 = cfg.faces[fi][0], cv1 = cfg.faces[fi][1], cv2 = cfg.faces[fi][2];
-            float NB[3] = {0, 0, 0};
-            uint32_t vidx[3] = {cv0, cv1, cv2};
-
-            for (int vi = 0; vi < 3; vi++) {
-                uint32_t idx = vidx[vi];
-                float Ni[3] = {curvData[idx].nx, curvData[idx].ny, curvData[idx].nz};
-                float k1 = curvData[idx].k1, k2 = curvData[idx].k2;
-                float ui[3] = {curvData[idx].px, curvData[idx].py, curvData[idx].pz};
-                float Pi[3] = {cfg.nodes[idx].x, cfg.nodes[idx].y, cfg.nodes[idx].z};
-                // v = cross(u, N) — same as shader
-                float vdir[3] = {
-                    ui[1]* Ni[2] - ui[2]* Ni[1], ui[2]* Ni[0] - ui[0]* Ni[2], ui[0]* Ni[1] - ui[1]* Ni[0]
-                };
-                float di[3] = {sx - Pi[0], sy - Pi[1], sz - Pi[2]};
-
-                // Use full displacement as in the paper
-                float du = di[0] * ui[0] + di[1] * ui[1] + di[2] * ui[2];
-                float dv = di[0] * vdir[0] + di[1] * vdir[1] + di[2] * vdir[2];
-                NB[0] += Ni[0] + k1 * du * ui[0] + k2 * dv * vdir[0];
-                NB[1] += Ni[1] + k1 * du * ui[1] + k2 * dv * vdir[1];
-                NB[2] += Ni[2] + k1 * du * ui[2] + k2 * dv * vdir[2];
-            }
-
-            float nbl = std::sqrt(NB[0] * NB[0] + NB[1] * NB[1] + NB[2] * NB[2]);
-
-            if (nbl > 1e-10f) {
-                NB[0] /= nbl;
-                NB[1] /= nbl;
-                NB[2] /= nbl;
-            }
-
-            // Ensure consistent with coarse face normal
-            float fn[3] = {cfg.facedata[fi].nx, cfg.facedata[fi].ny, cfg.facedata[fi].nz};
-
-            if (NB[0]*fn[0] + NB[1]*fn[1] + NB[2]*fn[2] < 0) {
-                NB[0] = -NB[0];
-                NB[1] = -NB[1];
-                NB[2] = -NB[2];
-            }
-
-            return {NB[0], NB[1], NB[2]};
-        };
-
-        // For each fine node, find closest coarse triangle by projecting onto
-        // the triangle plane and checking containment. Use the triangle whose
-        // centroid is nearest as fallback.
-        printf("debugcurv: computing normal errors...\n");
-
-        for (size_t ni = 0; ni < nn_fine; ni++) {
-            Vec3 P = fine_mesh.nodes[ni];
-            int si = fine_node_shape[ni];
-            out_nodes[ni * 5 + 0] = P.x;
-            out_nodes[ni * 5 + 1] = P.y;
-            out_nodes[ni * 5 + 2] = P.z;
-            out_nodes[ni * 5 + 3] = 0;
-            out_nodes[ni * 5 + 4] = 0;
-
-            Vec3 fallback = {0, 0, 1};
-            Vec3 N_analytic = analytic_normal(P.x, P.y, P.z, si, fallback);
-
-            // Find nearest coarse triangle centroid of same shape
-            int best_fi = -1;
-            float best_cdist = 1e30f;
-
-            for (size_t fi = 0; fi < cfg.faces.size(); fi++) {
-                int csi = (fi < cfg.face_shape_id.size()) ? (int)cfg.face_shape_id[fi] - 1 : -1;
-
-                if (csi != si) {
-                    continue;
-                }
-
-                Vec3 A = cfg.nodes[cfg.faces[fi][0]];
-                Vec3 B = cfg.nodes[cfg.faces[fi][1]];
-                Vec3 C = cfg.nodes[cfg.faces[fi][2]];
-                float cx2 = (A.x + B.x + C.x) / 3, cy2 = (A.y + B.y + C.y) / 3, cz2 = (A.z + B.z + C.z) / 3;
-                float d2 = (P.x - cx2) * (P.x - cx2) + (P.y - cy2) * (P.y - cy2) + (P.z - cz2) * (P.z - cz2);
-
-                if (d2 < best_cdist) {
-                    best_cdist = d2;
-                    best_fi = (int)fi;
-                }
-            }
-
-            // Refine: among the closest few triangles, pick the one where
-            // the point projects best (smallest barycentric clamp distance)
-            if (best_fi >= 0) {
-                // Also check the triangles sharing vertices with best_fi
-                // For simplicity, check all same-shape triangles within 2x centroid distance
-                float search_r2 = best_cdist * 4.0f + 1.0f;
-                int refined_fi = best_fi;
-                float best_bary_err = 1e30f;
-
-                for (size_t fi = 0; fi < cfg.faces.size(); fi++) {
-                    int csi = (fi < cfg.face_shape_id.size()) ? (int)cfg.face_shape_id[fi] - 1 : -1;
-
-                    if (csi != si) {
-                        continue;
-                    }
-
-                    Vec3 A = cfg.nodes[cfg.faces[fi][0]];
-                    Vec3 B = cfg.nodes[cfg.faces[fi][1]];
-                    Vec3 C = cfg.nodes[cfg.faces[fi][2]];
-                    float cx2 = (A.x + B.x + C.x) / 3, cy2 = (A.y + B.y + C.y) / 3, cz2 = (A.z + B.z + C.z) / 3;
-                    float d2 = (P.x - cx2) * (P.x - cx2) + (P.y - cy2) * (P.y - cy2) + (P.z - cz2) * (P.z - cz2);
-
-                    if (d2 > search_r2) {
-                        continue;
-                    }
-
-                    float u, v, w;
-
-                    if (barycentric(P, A, B, C, u, v, w)) {
-                        // Clamp distance from valid range
-                        float berr = 0;
-
-                        if (u < 0) {
-                            berr += u * u;
-                        }
-
-                        if (v < 0) {
-                            berr += v * v;
-                        }
-
-                        if (w < 0) {
-                            berr += w * w;
-                        }
-
-                        if (berr < best_bary_err) {
-                            best_bary_err = berr;
-                            refined_fi = (int)fi;
-                        }
-                    }
-                }
-
-                best_fi = refined_fi;
-            }
-
-            if (best_fi >= 0) {
-                // Curvature-predicted normal
-                Vec3 N_curv = curv_normal_at(P.x, P.y, P.z, (size_t)best_fi);
-
-                // Ensure analytic normal consistent direction
-                float fn[3] = {cfg.facedata[best_fi].nx, cfg.facedata[best_fi].ny, cfg.facedata[best_fi].nz};
-
-                if (N_analytic.x * fn[0] + N_analytic.y * fn[1] + N_analytic.z * fn[2] < 0) {
-                    N_analytic.x = -N_analytic.x;
-                    N_analytic.y = -N_analytic.y;
-                    N_analytic.z = -N_analytic.z;
-                }
-
-                // Flat face normal of coarse triangle
-                Vec3 N_flat = {cfg.facedata[best_fi].nx, cfg.facedata[best_fi].ny, cfg.facedata[best_fi].nz};
-
-                float curv_dot = N_curv.x * N_analytic.x + N_curv.y * N_analytic.y + N_curv.z * N_analytic.z;
-                float flat_dot = N_flat.x * N_analytic.x + N_flat.y * N_analytic.y + N_flat.z * N_analytic.z;
-                float cerr = 1.0f - std::min(1.0f, std::max(-1.0f, curv_dot));
-                float ferr = 1.0f - std::min(1.0f, std::max(-1.0f, flat_dot));
-
-                // Debug: print details for high-error nodes
-                static int dbg_printed = 0;
-
-                if (cerr > 0.5f && dbg_printed < 5) {
-                    dbg_printed++;
-                    Vec3 A = cfg.nodes[cfg.faces[best_fi][0]];
-                    Vec3 B = cfg.nodes[cfg.faces[best_fi][1]];
-                    Vec3 C = cfg.nodes[cfg.faces[best_fi][2]];
-                    int csi = (best_fi < (int)cfg.face_shape_id.size()) ? (int)cfg.face_shape_id[best_fi] - 1 : -1;
-                    printf("  HIGH ERR node %zu: pos=(%.2f,%.2f,%.2f) shape=%d\n", ni, P.x, P.y, P.z, si);
-                    printf("    matched coarse face %d: shape=%d\n", best_fi, csi);
-                    printf("    coarse verts: (%.2f,%.2f,%.2f) (%.2f,%.2f,%.2f) (%.2f,%.2f,%.2f)\n",
-                           A.x, A.y, A.z, B.x, B.y, B.z, C.x, C.y, C.z);
-                    printf("    N_curv=(%.4f,%.4f,%.4f) N_anal=(%.4f,%.4f,%.4f) N_flat=(%.4f,%.4f,%.4f)\n",
-                           N_curv.x, N_curv.y, N_curv.z, N_analytic.x, N_analytic.y, N_analytic.z,
-                           N_flat.x, N_flat.y, N_flat.z);
-                    printf("    curv_dot=%.6f flat_dot=%.6f cerr=%.6f ferr=%.6f\n", curv_dot, flat_dot, cerr, ferr);
-
-                    // Print vertex curvature data
-                    for (int vv = 0; vv < 3; vv++) {
-                        uint32_t idx = cfg.faces[best_fi][vv];
-                        printf("    vtx %u: N=(%.3f,%.3f,%.3f) k1=%.4f k2=%.4f u=(%.3f,%.3f,%.3f)\n",
-                               idx, curvData[idx].nx, curvData[idx].ny, curvData[idx].nz,
-                               curvData[idx].k1, curvData[idx].k2,
-                               curvData[idx].px, curvData[idx].py, curvData[idx].pz);
-                    }
-                }
-
-                out_nodes[ni * 5 + 3] = cerr;
-                out_nodes[ni * 5 + 4] = ferr;
-                curv_err_sum += cerr;
-
-                if (cerr > curv_err_max) {
-                    curv_err_max = cerr;
-                }
-
-                flat_err_sum += ferr;
-
-                if (ferr > flat_err_max) {
-                    flat_err_max = ferr;
-                }
-
-                counted++;
-            }
-        }
-
-        printf("debugcurv: %d nodes evaluated\n", counted);
-        printf("  curvature normal error — mean=%.6e  max=%.6e\n", curv_err_sum / counted, curv_err_max);
-        printf("  flat normal error      — mean=%.6e  max=%.6e\n", flat_err_sum / counted, flat_err_max);
-        printf("  improvement ratio      — mean=%.2fx  max=%.2fx\n",
-               (flat_err_sum / counted) / (curv_err_sum / counted + 1e-30),
-               flat_err_max / (curv_err_max + 1e-30));
-
-        // Print worst-error nodes
-        printf("  worst curvature-error nodes:\n");
-        std::vector<std::pair<float, size_t>> errs;
-
-        for (size_t i = 0; i < nn_fine; i++)
-            errs.push_back({out_nodes[i * 5 + 3], i});
-        std::sort(errs.begin(), errs.end(), [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) {
-            return a.first > b.first;
-        });
-
-        for (int i = 0; i < std::min(10, (int)errs.size()); i++) {
-            size_t ni = errs[i].second;
-            printf("    node %zu: pos=(%.2f,%.2f,%.2f) curv_err=%.6f flat_err=%.6f\n",
-                   ni, out_nodes[ni * 5], out_nodes[ni * 5 + 1], out_nodes[ni * 5 + 2],
-                   out_nodes[ni * 5 + 3], out_nodes[ni * 5 + 4]);
-        }
-
-        // Export JData JSON
-        json dump;
-        dump["Session"] = {{"ID", cfg.session_id + "_curv"}};
-        dump["CoarseMesh"] = {{"Nodes", (int)cfg.nodes.size()}, {"Faces", (int)cfg.faces.size()}, {"MeshRes", cfg.mesh_res}};
-        dump["FineMesh"] = {{"Nodes", (int)nn_fine}, {"Faces", (int)nf_fine}, {"MeshRes", fine_res}};
-
-        // MeshNode: Nx5 (x, y, z, curv_error, flat_error)
-        std::vector<size_t> ndim = {nn_fine, 5};
-        dump["Shapes"]["MeshNode"] = jdata_encode("single", ndim,
-                                     out_nodes.data(), nn_fine * 5 * sizeof(float), true);
-
-        // MeshSurf from fine mesh: Mx4 (v1, v2, v3, shape_id) — 1-based
-        std::vector<int32_t> surf_data(nf_fine * 4);
-
-        for (size_t fi = 0; fi < nf_fine; fi++) {
-            surf_data[fi * 4 + 0] = (int32_t)(fine_mesh.faces[fi][0] + 1);
-            surf_data[fi * 4 + 1] = (int32_t)(fine_mesh.faces[fi][1] + 1);
-            surf_data[fi * 4 + 2] = (int32_t)(fine_mesh.faces[fi][2] + 1);
-            surf_data[fi * 4 + 3] = (fi < fine_mesh.shape_id.size()) ? (int32_t)fine_mesh.shape_id[fi] : 1;
-        }
-
-        std::vector<size_t> sdim = {nf_fine, 4};
-        dump["Shapes"]["MeshSurf"] = jdata_encode("int32", sdim,
-                                     surf_data.data(), nf_fine * 4 * sizeof(int32_t), true);
-
-        std::string outf = cfg.session_id + "_curv.json";
-        std::ofstream ofs(outf.c_str());
-        ofs << dump.dump(2) << std::endl;
-        printf("debugcurv: saved to %s\n", outf.c_str());
-
-        return 0;
-    }
 
 #ifdef USE_SHOW
-
-    /* ---- Phase 3a: Interactive viewer (--show flag) ---- */
-    if (ovr.show) {
+/* ================================================================ */
+/*                 Interactive viewer (--show)                      */
+/* ================================================================ */
+static void run_show(const SimConfig& cfg, const SimSetup& st, const CmdOverrides& ovr) {
+    {
         ShowMesh vmesh;
 
         for (auto& n : cfg.nodes)
@@ -1861,10 +981,9 @@ int main(int argc, char** argv) {
            This hides bounding-box walls where both sides have the same n (e.g. Grid boundary
            between medium 0 and medium 1 both at n=1.0), but keeps lens surfaces visible. */
         for (size_t i = 0; i < cfg.faces.size(); i++) {
-            uint32_t pk = 0;
-            memcpy(&pk, &cfg.facedata[i].packed_media, 4);
-            uint32_t front = (pk >> 16) & 0x7FFFu;
-            uint32_t back  =  pk        & 0xFFFFu;
+            uint32_t front, back;
+            bool flat;
+            unpack_media(cfg.facedata[i].packed_media, front, back, flat);
 
             if (front >= cfg.media.size() || back >= cfg.media.size()) {
                 continue;
@@ -2005,7 +1124,7 @@ int main(int argc, char** argv) {
             /* For disk/gaussian/planar sources: draw circle showing source extent */
             float src_r = cfg.srcparam1[0];  /* radius from Param1[0] */
 
-            if ((cfg.srctype == 8 || cfg.srctype == 3 || cfg.srctype == 4) && src_r > 0.0f) {
+            if ((cfg.srctype == SRC_DISK || cfg.srctype == SRC_GAUSSIAN || cfg.srctype == SRC_PLANAR) && src_r > 0.0f) {
                 const int N = 48;
 
                 for (int j = 0; j < N; j++) {
@@ -2023,138 +1142,106 @@ int main(int argc, char** argv) {
             /* Static viewer: load trajectory and/or Fluence volume from jdat file */
             ShowTraj static_traj;
             {
-                std::ifstream tf(ovr.traj_file);
-
-                if (!tf) {
-                    fprintf(stderr, "Cannot open file: %s\n", ovr.traj_file.c_str());
-                    return 1;
-                }
-
-                json jroot = json::parse(tf);
+                json jroot = load_json_file(ovr.traj_file.c_str());
 
                 /* ---- Load Fluence volume (if present) ---- */
                 if (jroot.contains("Fluence")) {
-                    const json& fl = jroot["Fluence"];
+                    /* decoded row-major [nx,ny,nz(,ng)]; the viewer wants ix-fastest */
+                    JDataArray fl = jdata_decode_array(jroot["Fluence"], "Fluence");
+                    vkmmc_require(fl.dims.size() >= 3 && fl.dims.size() <= 4, "Fluence must be a 3-D or 4-D array");
+                    uint32_t nx = (uint32_t)fl.dims[0], ny = (uint32_t)fl.dims[1], nz = (uint32_t)fl.dims[2];
+                    uint32_t ng = (fl.dims.size() == 4) ? (uint32_t)fl.dims[3] : 1;
+                    size_t nvox = (size_t)nx * ny * nz;
+                    std::vector<float> vol3d(nvox, 0.f);
 
-                    if (fl.contains("_ArraySize_") && fl.contains("_ArrayZipType_")) {
-                        auto sz = fl["_ArraySize_"];
-                        uint32_t nx = sz[0].get<uint32_t>();
-                        uint32_t ny = sz[1].get<uint32_t>();
-                        uint32_t nz = sz[2].get<uint32_t>();
-                        uint32_t ng = (sz.size() >= 4) ? sz[3].get<uint32_t>() : 1;
+                    for (uint32_t ix = 0; ix < nx; ix++)
+                        for (uint32_t iy = 0; iy < ny; iy++)
+                            for (uint32_t iz = 0; iz < nz; iz++)
+                                for (uint32_t ig = 0; ig < ng; ig++)
+                                    vol3d[ix + (size_t)iy * nx + (size_t)iz * nx * ny] +=
+                                        (float)fl.at((((size_t)ix * ny + iy) * nz + iz) * ng + ig);
 
-                        /* Decode raw bytes — layout is always ix-fastest (GPU column-major).
-                         * JData default (no _ArrayOrder_ tag) = first dim (ix) varies fastest,
-                         * which matches the GPU's iz*nx*ny + iy*nx + ix voxel index formula.
-                         * If _ArrayOrder_: "c" is present it means C row-major = iz varies fastest;
-                         * in that case we transpose to ix-fastest before uploading. */
-                        bool iz_fastest = (fl.value("_ArrayOrder_", "") == "c");
+                    /* Compute log10 and normalise to [0,1] */
+                    float log_min =  1e30f, log_max = -1e30f;
 
-                        auto raw = jdata_decode(fl);
-                        const float* src = reinterpret_cast<const float*>(raw.data());
-                        uint32_t nvox = nx * ny * nz;
-
-                        /* Sum over gates and optionally transpose to ix-fastest */
-                        std::vector<float> vol3d(nvox, 0.f);
-
-                        for (uint32_t ig = 0; ig < ng; ig++) {
-                            const float* gate = src + (size_t)ig * nvox;
-
-                            if (iz_fastest) {
-                                /* Source: ix*ny*nz + iy*nz + iz — transpose to ix + iy*nx + iz*nx*ny */
-                                for (uint32_t ix = 0; ix < nx; ix++)
-                                    for (uint32_t iy = 0; iy < ny; iy++)
-                                        for (uint32_t iz = 0; iz < nz; iz++)
-                                            vol3d[ix + iy * nx + iz * nx * ny] +=
-                                                gate[ix * (uint32_t)(ny * nz) + iy * nz + iz];
-                            } else {
-                                /* Source already ix-fastest */
-                                for (uint32_t i = 0; i < nvox; i++) {
-                                    vol3d[i] += gate[i];
-                                }
-                            }
+                    for (size_t i = 0; i < nvox; i++) {
+                        if (vol3d[i] > 0.f) {
+                            float lv = log10f(vol3d[i]);
+                            log_min = std::min(log_min, lv);
+                            log_max = std::max(log_max, lv);
                         }
-
-                        /* Compute log10 and normalise to [0,1] */
-                        float log_min =  1e30f, log_max = -1e30f;
-
-                        for (uint32_t i = 0; i < nvox; i++) {
-                            if (vol3d[i] > 0.f) {
-                                float lv = log10f(vol3d[i]);
-
-                                if (lv < log_min) {
-                                    log_min = lv;
-                                }
-
-                                if (lv > log_max) {
-                                    log_max = lv;
-                                }
-                            }
-                        }
-
-                        /* Clamp dynamic range to 6 decades below peak */
-                        log_min = std::max(log_min, log_max - 6.f);
-                        float log_range = (log_max > log_min) ? (log_max - log_min) : 1.f;
-
-                        for (uint32_t i = 0; i < nvox; i++) {
-                            float lv = (vol3d[i] > 0.f) ? log10f(vol3d[i]) : log_min - 1.f;
-                            vol3d[i] = std::max(0.f, std::min(1.f, (lv - log_min) / log_range));
-                        }
-
-                        /* World-space bbox from Domain metadata */
-                        ShowVol sv;
-                        sv.nx = nx;
-                        sv.ny = ny;
-                        sv.nz = nz;
-                        sv.data = std::move(vol3d);
-
-                        if (jroot.contains("Domain")) {
-                            const json& dom = jroot["Domain"];
-                            float vs = dom.value("VoxelSize", 1.f);
-
-                            if (dom.contains("Origin")) {
-                                sv.origin[0] = dom["Origin"][0].get<float>();
-                                sv.origin[1] = dom["Origin"][1].get<float>();
-                                sv.origin[2] = dom["Origin"][2].get<float>();
-                            }
-
-                            sv.extent[0] = nx * vs;
-                            sv.extent[1] = ny * vs;
-                            sv.extent[2] = nz * vs;
-                        } else {
-                            sv.origin[0] = sv.origin[1] = sv.origin[2] = 0.f;
-                            sv.extent[0] = (float)nx;
-                            sv.extent[1] = (float)ny;
-                            sv.extent[2] = (float)nz;
-                        }
-
-                        vmesh.vol = std::move(sv);
-                        printf("Loaded Fluence %ux%ux%u (ng=%u, log10 range [%.1f, %.1f])\n",
-                               nx, ny, nz, ng, log_min, log_max);
                     }
+
+                    /* Clamp dynamic range to 6 decades below peak */
+                    log_min = std::max(log_min, log_max - 6.f);
+                    float log_range = (log_max > log_min) ? (log_max - log_min) : 1.f;
+
+                    for (size_t i = 0; i < nvox; i++) {
+                        float lv = (vol3d[i] > 0.f) ? log10f(vol3d[i]) : log_min - 1.f;
+                        vol3d[i] = std::max(0.f, std::min(1.f, (lv - log_min) / log_range));
+                    }
+
+                    /* World-space bbox from Domain metadata */
+                    ShowVol sv;
+                    sv.nx = nx;
+                    sv.ny = ny;
+                    sv.nz = nz;
+                    sv.data = std::move(vol3d);
+                    sv.origin[0] = sv.origin[1] = sv.origin[2] = 0.f;
+                    float vs = 1.f;
+
+                    if (jroot.contains("Domain") && jroot["Domain"].is_object()) {
+                        const json& dom = jroot["Domain"];
+                        vs = (float)json_num(dom, "VoxelSize", 1.0, "Domain");
+
+                        if (dom.contains("Origin")) {
+                            std::vector<double> o = json_vec(dom["Origin"], 3, 3, "Domain.Origin");
+                            sv.origin[0] = (float)o[0];
+                            sv.origin[1] = (float)o[1];
+                            sv.origin[2] = (float)o[2];
+                        }
+                    }
+
+                    sv.extent[0] = nx * vs;
+                    sv.extent[1] = ny * vs;
+                    sv.extent[2] = nz * vs;
+                    vmesh.vol = std::move(sv);
+                    printf("Loaded Fluence %ux%ux%u (ng=%u, log10 range [%.1f, %.1f])\n",
+                           nx, ny, nz, ng, log_min, log_max);
                 }
 
                 /* ---- Load Trajectory (if present) ---- */
                 bool has_traj_data = false;
 
                 auto load_traj = [&](const json & tr) {
-                    auto pid_raw = jdata_decode(tr["photonid"]);
-                    uint32_t n = (uint32_t)(pid_raw.size() / sizeof(uint32_t));
+                    vkmmc_require(tr.is_object() && tr.contains("photonid") && tr.contains("p"),
+                                  "Trajectory needs photonid and p");
+                    JDataArray pid = jdata_decode_array(tr["photonid"], "Trajectory.photonid");
+                    JDataArray pos = jdata_decode_array(tr["p"], "Trajectory.p");
+                    size_t n = pid.numel();
+                    vkmmc_require(pos.numel() == n * 3, "Trajectory.p must have 3 columns per photonid");
                     static_traj.ids.resize(n);
-                    memcpy(static_traj.ids.data(), pid_raw.data(), n * sizeof(uint32_t));
-                    auto p_raw = jdata_decode(tr["p"]);
                     static_traj.pts.resize(n * 3);
-                    memcpy(static_traj.pts.data(), p_raw.data(), n * 3 * sizeof(float));
+                    static_traj.evts.assign(n, 0u);
 
-                    if (tr.contains("e0")) {
-                        auto e0_raw = jdata_decode(tr["e0"]);
-                        static_traj.evts.resize(n);
-                        memcpy(static_traj.evts.data(), e0_raw.data(), n * sizeof(uint32_t));
-                    } else {
-                        static_traj.evts.assign(n, 0u);
+                    for (size_t i = 0; i < n; i++) {
+                        static_traj.ids[i] = (uint32_t)pid.at(i);
                     }
 
-                    printf("Loaded %u trajectory events\n", n);
+                    for (size_t i = 0; i < n * 3; i++) {
+                        static_traj.pts[i] = (float)pos.at(i);
+                    }
+
+                    if (tr.contains("e0")) {
+                        JDataArray e0 = jdata_decode_array(tr["e0"], "Trajectory.e0");
+                        vkmmc_require(e0.numel() == n, "Trajectory.e0 must have one entry per photonid");
+
+                        for (size_t i = 0; i < n; i++) {
+                            static_traj.evts[i] = (uint32_t)e0.at(i);
+                        }
+                    }
+
+                    printf("Loaded %zu trajectory events\n", n);
                     return n > 0;
                 };
 
@@ -2180,500 +1267,55 @@ int main(int argc, char** argv) {
                 }
 
                 VulkanCtx compute_ctx = init_vulkan(ovr.gpuid);
-                ShowTraj result = run_mc_simulation(compute_ctx, cfg, show_ovr,
-                                                    curvData, has_curvature, spirvFile);
-                vkDestroyDevice(compute_ctx.device, NULL);
-                vkDestroyInstance(compute_ctx.instance, NULL);
+                TrajData td = run_mc_simulation(compute_ctx, cfg, st, show_ovr);
+                destroy_vulkan(compute_ctx);
+                ShowTraj result;
+                result.pts.swap(td.pts);
+                result.ids.swap(td.ids);
+                result.evts.swap(td.evts);
                 return result;
             }, nullptr);
         }
 
-        return 0;
     }
+}
+#endif /* USE_SHOW */
 
-    /* ---- Phase 3: Vulkan simulation (USE_SHOW, non-interactive) ---- */
-    {
+/* ================================================================ */
+/*                             Main                                 */
+/* ================================================================ */
+int main(int argc, char** argv) {
+    try {
+        CmdOverrides ovr;
+        SimConfig cfg;
+        SimSetup st;
+
+        if (!vkmmc_frontend(argc, argv, "Vulkan", 0, ".spv", ovr, cfg, st)) {
+            return 0;
+        }
+
+        if (ovr.listgpu) {
+            list_vulkan_gpus();
+            return 0;
+        }
+
+#ifdef USE_SHOW
+
+        if (ovr.show) {
+            run_show(cfg, st, ovr);
+            return 0;
+        }
+
+#endif
+
         VulkanCtx ctx = init_vulkan(ovr.gpuid);
-        run_mc_simulation(ctx, cfg, ovr, curvData, has_curvature, spirvFile);
-        vkDestroyDevice(ctx.device, NULL);
-        vkDestroyInstance(ctx.instance, NULL);
+        run_mc_simulation(ctx, cfg, st, ovr);
+        destroy_vulkan(ctx);
+    } catch (const std::exception& e) {
+        fflush(stdout);
+        fprintf(stderr, "vkmmc ERROR: %s\n", e.what());
+        return 1;
     }
+
     return 0;
-#else
-    /* ---- Phase 3: Vulkan simulation ---- */
-    VulkanCtx ctx = init_vulkan(ovr.gpuid);
-
-    /* Build BLAS */
-    AccelStruct blas, tlas;
-    {
-        const VkBufferUsageFlags gu = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-        const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        Buffer vb = create_buffer(ctx, cfg.nodes.size() * sizeof(Vec3), gu, hv);
-        upload_host(ctx, vb, cfg.nodes.data(), cfg.nodes.size()*sizeof(Vec3));
-        std::vector<uint32_t> idx;
-        idx.reserve(cfg.faces.size() * 3);
-
-        for (size_t i = 0; i < cfg.faces.size(); i++) {
-            idx.push_back(cfg.faces[i][0]);
-            idx.push_back(cfg.faces[i][1]);
-            idx.push_back(cfg.faces[i][2]);
-        }
-
-        Buffer ib = create_buffer(ctx, idx.size() * sizeof(uint32_t), gu, hv);
-        upload_host(ctx, ib, idx.data(), idx.size()*sizeof(uint32_t));
-        VkAccelerationStructureGeometryTrianglesDataKHR tr = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR};
-        tr.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-        tr.vertexData.deviceAddress = get_addr(ctx, vb.buf);
-        tr.vertexStride = sizeof(Vec3);
-        tr.maxVertex = (uint32_t)cfg.nodes.size() - 1;
-        tr.indexType = VK_INDEX_TYPE_UINT32;
-        tr.indexData.deviceAddress = get_addr(ctx, ib.buf);
-        VkAccelerationStructureGeometryKHR geom = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
-        geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-        geom.geometry.triangles = tr;
-        geom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
-        VkAccelerationStructureBuildGeometryInfoKHR bi = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
-        bi.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-        bi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-        bi.geometryCount = 1;
-        bi.pGeometries = &geom;
-        uint32_t pc = (uint32_t)cfg.faces.size();
-        VkAccelerationStructureBuildSizesInfoKHR sz = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
-        ctx.pfnGetASBuildSizes(ctx.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bi, &pc, &sz);
-        blas.buffer = create_buffer(ctx, sz.accelerationStructureSize,
-                                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        VkAccelerationStructureCreateInfoKHR ac = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
-        ac.buffer = blas.buffer.buf;
-        ac.size = sz.accelerationStructureSize;
-        ac.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-        ctx.pfnCreateAS(ctx.device, &ac, NULL, &blas.handle);
-        Buffer scratch = create_buffer(ctx, sz.buildScratchSize,
-                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        bi.dstAccelerationStructure = blas.handle;
-        bi.scratchData.deviceAddress = get_addr(ctx, scratch.buf);
-        VkAccelerationStructureBuildRangeInfoKHR rng;
-        memset(&rng, 0, sizeof(rng));
-        rng.primitiveCount = pc;
-        const VkAccelerationStructureBuildRangeInfoKHR* pR = &rng;
-        VkCommandBuffer cmd = begin_cmd(ctx);
-        ctx.pfnCmdBuildAS(cmd, 1, &bi, &pR);
-        end_submit(ctx, cmd);
-        destroy_buf(ctx, scratch);
-        destroy_buf(ctx, vb);
-        destroy_buf(ctx, ib);
-        printf("BLAS: %u triangles, %lu KB\n", pc, (unsigned long)(sz.accelerationStructureSize / 1024));
-        tlas = build_tlas(ctx, blas);
-    }
-
-    const VkBufferUsageFlags ssbo = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-
-    /* Face buffer: interleaved [normal+media, vertex_indices] per triangle */
-    struct FaceDataGPU {
-        float nx, ny, nz, packed_media;
-        float v0f, v1f, v2f, pad;
-    };
-    std::vector<FaceDataGPU> faceGpu(cfg.faces.size());
-
-    for (size_t i = 0; i < cfg.faces.size(); i++) {
-        faceGpu[i].nx = cfg.facedata[i].nx;
-        faceGpu[i].ny = cfg.facedata[i].ny;
-        faceGpu[i].nz = cfg.facedata[i].nz;
-        faceGpu[i].packed_media = cfg.facedata[i].packed_media;
-        uint32_t v0 = cfg.faces[i][0], v1 = cfg.faces[i][1], v2 = cfg.faces[i][2];
-        memcpy(&faceGpu[i].v0f, &v0, 4);
-        memcpy(&faceGpu[i].v1f, &v1, 4);
-        memcpy(&faceGpu[i].v2f, &v2, 4);
-        faceGpu[i].pad = 0;
-    }
-
-    Buffer faceBuf = create_device_buffer(ctx, faceGpu.size() * sizeof(FaceDataGPU), ssbo);
-    upload_to_device(ctx, faceBuf, faceGpu.data(), faceGpu.size()*sizeof(FaceDataGPU));
-
-    /* Curvature buffer: 3 x vec4 per node */
-    struct GpuNodeCurv {
-        float nx, ny, nz, k1, px, py, pz, k2, posx, posy, posz, pad;
-    };
-    std::vector<GpuNodeCurv> gpuCurv;
-
-    if (has_curvature && !curvData.empty()) {
-        gpuCurv.resize(curvData.size());
-
-        for (size_t i = 0; i < curvData.size(); i++) {
-            gpuCurv[i] = {curvData[i].nx, curvData[i].ny, curvData[i].nz, curvData[i].k1,
-                          curvData[i].px, curvData[i].py, curvData[i].pz, curvData[i].k2,
-                          cfg.nodes[i].x, cfg.nodes[i].y, cfg.nodes[i].z, 0
-                         };
-        }
-    } else {
-        gpuCurv.resize(1);
-        memset(&gpuCurv[0], 0, sizeof(GpuNodeCurv));
-    }
-
-    Buffer curvBuf = create_device_buffer(ctx, gpuCurv.size() * sizeof(GpuNodeCurv), ssbo);
-    upload_to_device(ctx, curvBuf, gpuCurv.data(), gpuCurv.size()*sizeof(GpuNodeCurv));
-
-    /* Media buffer */
-    Buffer mediaBuf = create_device_buffer(ctx, cfg.media.size() * sizeof(Medium), ssbo);
-    upload_to_device(ctx, mediaBuf, cfg.media.data(), cfg.media.size()*sizeof(Medium));
-
-    /* Output grid */
-    float vs = cfg.unitinmm;
-
-    if (cfg.has_steps) {
-        vs = cfg.steps[0];
-    }
-
-    float ge = vs * 0.5f;
-    float gmin[3] = {cfg.nmin.x - ge, cfg.nmin.y - ge, cfg.nmin.z - ge};
-    float gmax[3] = {cfg.nmax.x + ge, cfg.nmax.y + ge, cfg.nmax.z + ge};
-    uint32_t nx = (uint32_t)ceil((gmax[0] - gmin[0]) / vs);
-    uint32_t ny = (uint32_t)ceil((gmax[1] - gmin[1]) / vs);
-    uint32_t nz = (uint32_t)ceil((gmax[2] - gmin[2]) / vs);
-    uint32_t crop0w = nx * ny * nz * cfg.maxgate, outSz = crop0w * 2;
-
-    Buffer outBuf = create_device_buffer(ctx, outSz * sizeof(float), ssbo);
-    {
-        VkCommandBuffer cmd = begin_cmd(ctx);
-        vkCmdFillBuffer(cmd, outBuf.buf, 0, outSz * sizeof(float), 0);
-        end_submit(ctx, cmd);
-    }
-    printf("Grid: %ux%ux%u x %d gates, voxel=%.3fmm, origin=[%.2f,%.2f,%.2f]\n",
-           nx, ny, nz, cfg.maxgate, vs, gmin[0], gmin[1], gmin[2]);
-
-    {
-        float bbx_pad = vs * 2.0f;  // 2 voxels padding beyond grid
-        float bbmin[3] = {gmin[0] - bbx_pad, gmin[1] - bbx_pad, gmin[2] - bbx_pad};
-        float bbmax[3] = {gmax[0] + bbx_pad, gmax[1] + bbx_pad, gmax[2] + bbx_pad};
-
-        ShapeMesh bbx_mesh;
-        bbx_mesh.nodes = cfg.nodes;    // start with existing nodes
-        bbx_mesh.faces = cfg.faces;
-        bbx_mesh.facedata = cfg.facedata;
-        bbx_mesh.shape_id = cfg.face_shape_id;
-
-        gen_box(bbx_mesh, bbmin[0], bbmin[1], bbmin[2], bbmax[0] - bbmin[0], bbmax[1] - bbmin[1], bbmax[2] - bbmin[2], 0xFFFF);
-
-        cfg.nodes = bbx_mesh.nodes;
-        cfg.faces = bbx_mesh.faces;
-        cfg.facedata = bbx_mesh.facedata;
-        cfg.face_shape_id = bbx_mesh.shape_id;
-
-        printf("After BBox: %zu nodes, %zu faces\n", cfg.nodes.size(), cfg.faces.size());
-    }
-
-    /* Threads */
-    uint32_t tt = (ovr.totalthread > 0) ? ovr.totalthread : 65536;
-
-    if (cfg.nphoton < tt) {
-        tt = ((uint32_t)cfg.nphoton + 63) / 64 * 64;
-
-        if (!tt) {
-            tt = 64;
-        }
-    }
-
-    /* MCParams */
-    MCParams params;
-    memset(&params, 0, sizeof(params));
-
-    for (int i = 0; i < 3; i++) {
-        params.srcpos[i] = cfg.srcpos[i];
-        params.srcdir[i] = cfg.srcdir[i];
-    }
-
-    for (int i = 0; i < 4; i++) {
-        params.srcparam1[i] = cfg.srcparam1[i];
-        params.srcparam2[i] = cfg.srcparam2[i];
-    }
-
-    params.nmin[0] = gmin[0];
-    params.nmin[1] = gmin[1];
-    params.nmin[2] = gmin[2];
-    params.nmax[0] = gmax[0] - gmin[0];
-    params.nmax[1] = gmax[1] - gmin[1];
-    params.nmax[2] = gmax[2] - gmin[2];
-    params.crop0[0] = nx;
-    params.crop0[1] = nx * ny;
-    params.crop0[2] = nx * ny * nz;
-    params.crop0[3] = crop0w;
-
-    params.dstep = 1.0f / vs;
-    params.tstart = cfg.t0;
-    params.tend = cfg.t1;
-    params.Rtstep = 1.0f / cfg.dt;
-
-    params.srctype = cfg.srctype;
-    params.maxgate = cfg.maxgate;
-    params.outputtype = cfg.output_type;
-    params.isreflect = cfg.do_mismatch ? 1u : 0u;
-
-    params.mediumid0 = cfg.mediumid0;
-    params.total_threads = tt;
-    params.num_media = (uint32_t)cfg.media.size();
-    params.seed = cfg.rng_seed;
-
-    params.do_csg = cfg.is_csg ? 1u : 0u;
-    params.has_curvature = has_curvature ? 1u : 0u;
-    params.minenergy = cfg.minenergy;
-    params.roulettesize = cfg.roulettesize;
-    bool do_traj = (cfg.debuglevel & 8192u) != 0u;
-    params.do_traj = do_traj ? 1u : 0u;
-    params.max_traj = do_traj ? cfg.maxjumpdebug : 0u;
-    printf("DEBUG: has_curvature=%d, params.has_curvature=%u\n",
-           has_curvature, params.has_curvature);
-
-    Buffer paramBuf = create_device_buffer(ctx, sizeof(MCParams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-
-    /* RNG seeds — allocated once, re-seeded per batch to ensure unique photon paths.
-     * Hash-based per-thread seeding avoids the sequential correlations that arise
-     * when using consecutive rand() outputs (which also only provide 31-bit values). */
-    uint32_t base_seed = (cfg.rng_seed > 0) ? cfg.rng_seed : (uint32_t)time(0);
-    struct uint4_t {
-        uint32_t x, y, z, w;
-    };
-    std::vector<uint4_t> seeds(tt);
-
-    auto make_seed = [](uint32_t base, uint32_t idx) -> uint32_t {
-        uint32_t v = base ^ (idx * 2654435761u);
-        v ^= v >> 16; v *= 0x45d9f3bu; v ^= v >> 16; v *= 0x45d9f3bu; v ^= v >> 16;
-        return v;
-    };
-    for (uint32_t i = 0; i < tt; i++)
-        seeds[i] = {make_seed(base_seed, i*4u+0u), make_seed(base_seed, i*4u+1u),
-                    make_seed(base_seed, i*4u+2u), make_seed(base_seed, i*4u+3u)};
-
-    Buffer seedBuf = create_device_buffer(ctx, tt * sizeof(uint4_t), ssbo);
-
-    upload_to_device(ctx, seedBuf, seeds.data(), tt * sizeof(uint4_t));
-
-    /* Trajectory buffer: [0]=atomic counter, [1..6*N]=records (6 uints each) */
-    uint32_t traj_cap = do_traj ? cfg.maxjumpdebug : 0u;
-
-    VkDeviceSize traj_buf_sz = (1 + (VkDeviceSize)traj_cap * 6) * sizeof(uint32_t);
-
-    Buffer trajBuf = create_device_buffer(ctx, traj_buf_sz, ssbo);
-
-    {
-        VkCommandBuffer zcmd = begin_cmd(ctx);
-        vkCmdFillBuffer(zcmd, trajBuf.buf, 0, sizeof(uint32_t), 0);  // zero counter
-        end_submit(ctx, zcmd);
-    }
-
-    if (has_curvature && !curvData.empty()) {
-        gpuCurv.resize(curvData.size());
-
-        for (size_t i = 0; i < curvData.size(); i++) {
-            gpuCurv[i] = { curvData[i].nx, curvData[i].ny, curvData[i].nz, curvData[i].k1,
-                           curvData[i].px, curvData[i].py, curvData[i].pz, curvData[i].k2,
-                           cfg.nodes[i].x, cfg.nodes[i].y, cfg.nodes[i].z, 0
-                         };
-        }
-    } else {
-        gpuCurv.resize(1); // dummy
-        memset(&gpuCurv[0], 0, sizeof(GpuNodeCurv));
-    }
-
-    ComputePipe cp = create_pipeline(ctx, spirvFile);
-
-    update_desc(ctx, cp, tlas.handle, faceBuf, mediaBuf, outBuf, paramBuf, seedBuf, curvBuf, trajBuf);
-
-    // Batched dispatch
-    uint64_t batchsz;
-
-    if (ovr.batch_size == 0) {
-        batchsz = cfg.nphoton;
-    } else if (ovr.batch_size != UINT64_MAX) {
-        batchsz = ovr.batch_size;
-    } else {
-        batchsz = 500000;
-    }
-
-    uint64_t pdone = 0;
-    int batch = 0;
-    uint32_t wg = tt / 64;
-    printf("Threads: %u (%u x 64), batch: %lu photons\n", tt, wg, (unsigned long)batchsz);
-
-    typedef std::chrono::high_resolution_clock Clk;
-    double kms = 0;
-    Clk::time_point t0 = Clk::now();
-
-    while (pdone < cfg.nphoton) {
-        uint64_t rem = cfg.nphoton - pdone, bp = (rem < batchsz) ? rem : batchsz;
-        params.threadphoton = (int)(bp / tt);
-        params.oddphoton = (int)(bp - (uint64_t)params.threadphoton * tt);
-        params.photon_base = (uint32_t)pdone;
-        /* Re-seed per batch so each batch simulates distinct photon paths. */
-        if (pdone > 0) {
-            uint32_t batch_seed = base_seed + (uint32_t)pdone;
-            for (uint32_t i = 0; i < tt; i++)
-                seeds[i] = {make_seed(batch_seed, i*4u+0u), make_seed(batch_seed, i*4u+1u),
-                            make_seed(batch_seed, i*4u+2u), make_seed(batch_seed, i*4u+3u)};
-            upload_to_device(ctx, seedBuf, seeds.data(), tt * sizeof(uint4_t));
-        }
-        upload_to_device(ctx, paramBuf, &params, sizeof(params));
-        VkCommandBuffer cmd = begin_cmd(ctx);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeLayout, 0, 1, &cp.descSet, 0, NULL);
-        vkCmdDispatch(cmd, wg, 1, 1);
-        Clk::time_point ks = Clk::now();
-        end_submit(ctx, cmd);
-        kms += std::chrono::duration<double, std::milli>(Clk::now() - ks).count();
-        pdone += bp;
-        batch++;
-        printf("  batch %d: %lu photons (%lu/%lu)\n", batch, (unsigned long)bp, (unsigned long)pdone, (unsigned long)cfg.nphoton);
-    }
-
-    double tms = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
-    printf("Done (%d batches), kernel: %.3f ms, total: %.3f ms\n", batch, kms, tms);
-    printf("Speed: %.2f photon/ms (kernel), %.2f photon/ms (total)\n", (double)cfg.nphoton / kms, (double)cfg.nphoton / tms);
-
-    // Readback
-    std::vector<float> raw(outSz);
-    download_from_device(ctx, outBuf, raw.data(), outSz * sizeof(float));
-    uint32_t hc_gpu;
-    memcpy(&hc_gpu, &raw[crop0w - 11], 4);
-    printf("DEBUG GPU has_curvature: %u\n", hc_gpu);
-    std::vector<float> fluence(crop0w);
-    double absorbed = 0;
-    int nans = 0, infs = 0;
-
-    for (uint32_t i = 0; i < crop0w; i++) {
-        fluence[i] = raw[i] + raw[i + crop0w];
-
-        if (fluence[i] != fluence[i]) {
-            nans++;
-            fluence[i] = 0;
-        } else if (fluence[i] > 1e30f || fluence[i] < -1e30f) {
-            infs++;
-            fluence[i] = 0;
-        } else {
-            absorbed += fluence[i];
-        }
-    }
-
-    if (nans || infs) {
-        printf("WARNING: %d NaN, %d Inf voxels zeroed\n", nans, infs);
-    }
-
-    printf("simulated %lu photons, absorbed: %.5f%%\n", (unsigned long)cfg.nphoton, absorbed / (double)cfg.nphoton * 100.0);
-
-    if (cfg.do_normalize) {
-        float vv = vs * vs * vs;
-
-        for (uint32_t i = 0; i < crop0w; i++) {
-            fluence[i] /= (float)cfg.nphoton * vv;
-        }
-    }
-
-    // Save JData
-    {
-        std::vector<size_t> dims;
-        dims.push_back(nx);
-        dims.push_back(ny);
-        dims.push_back(nz);
-
-        if (cfg.maxgate > 1) {
-            dims.push_back((size_t)cfg.maxgate);
-        }
-
-        json root;
-        root["Session"] = {{"ID", cfg.session_id}, {"Photons", cfg.nphoton}};
-        root["Forward"] = {{"T0", cfg.t0}, {"T1", cfg.t1}, {"Dt", cfg.dt}};
-        root["Domain"] = {{"LengthUnit", cfg.unitinmm}, {"VoxelSize", vs}, {"Dim", {nx, ny, nz}}, {"Origin", {gmin[0], gmin[1], gmin[2]}}};
-        root["Fluence"] = jdata_encode("single", dims, fluence.data(), crop0w * sizeof(float), false);
-        std::string outname = cfg.session_id + ".jdat";
-        std::ofstream of(outname.c_str());
-        of << root.dump(2) << std::endl;
-        printf("Output: %s (%ux%ux%u", outname.c_str(), nx, ny, nz);
-
-        if (cfg.maxgate > 1) {
-            printf("x%d", cfg.maxgate);
-        }
-
-        printf(")\n");
-    }
-
-    // Save trajectory
-    if (do_traj && traj_cap > 0) {
-        std::vector<uint32_t> trajRaw(1 + (size_t)traj_cap * 6);
-        download_from_device(ctx, trajBuf, trajRaw.data(), traj_buf_sz);
-        uint32_t n = std::min(trajRaw[0], traj_cap);
-        printf("Trajectory: %u events recorded (max %u)\n", n, traj_cap);
-
-        if (n > 0) {
-            // Extract separate arrays: photon_id (uint32), position (float32 [N,3]),
-            // weight (float32), event (uint32)
-            std::vector<uint32_t> tpid(n), tevt(n);
-            std::vector<float> tpos(n * 3), twgt(n);
-
-            for (uint32_t i = 0; i < n; i++) {
-                uint32_t base = 1u + i * 6u;
-                tpid[i]        = trajRaw[base + 0];
-                memcpy(&tpos[i * 3 + 0], &trajRaw[base + 1], 4);
-                memcpy(&tpos[i * 3 + 1], &trajRaw[base + 2], 4);
-                memcpy(&tpos[i * 3 + 2], &trajRaw[base + 3], 4);
-                memcpy(&twgt[i],          &trajRaw[base + 4], 4);
-                tevt[i]        = trajRaw[base + 5];
-            }
-
-            json troot;
-            json& mdata = troot["MCXData"];
-
-            json media_arr = json::array();
-
-            for (const auto& m : cfg.media) {
-                media_arr.push_back({{"mua", m.mua / cfg.unitinmm}, {"mus", m.mus / cfg.unitinmm}, {"g", m.g}, {"n", m.n}});
-            }
-
-            mdata["Info"] = {
-                {"Version",        1},
-                {"MediaNum",       (int)cfg.media.size()},
-                {"DetNum",         0},
-                {"ColumnNum",      5},
-                {"TotalPhoton",    cfg.nphoton},
-                {"DetectedPhoton", n},
-                {"SavedPhoton",    n},
-                {"LengthUnit",     cfg.unitinmm},
-                {"SeedByte",       0},
-                {"Normalizer",     1.0},
-                {"Repeat",         1},
-                {"SrcNum",         1},
-                {"SaveDetFlag",    0},
-                {"Media",          media_arr}
-            };
-
-            json& tdat = mdata["Trajectory"];
-            tdat["photonid"] = jdata_encode("uint32", {n, 1}, tpid.data(), n * sizeof(uint32_t));
-            tdat["p"]        = jdata_encode("single", {n, 3}, tpos.data(), n * 3 * sizeof(float));
-            tdat["w0"]       = jdata_encode("single", {n, 1}, twgt.data(), n * sizeof(float));
-            tdat["e0"]       = jdata_encode("uint32", {n, 1}, tevt.data(), n * sizeof(uint32_t));
-
-            std::string tname = cfg.session_id + "_traj.jdat";
-            std::ofstream tf(tname.c_str());
-            tf << troot.dump() << std::endl;
-            printf("Trajectory saved: %s\n", tname.c_str());
-        }
-    }
-
-    // Cleanup
-    ctx.pfnDestroyAS(ctx.device, tlas.handle, NULL);
-    ctx.pfnDestroyAS(ctx.device, blas.handle, NULL);
-    destroy_buf(ctx, tlas.buffer);
-    destroy_buf(ctx, blas.buffer);
-    destroy_buf(ctx, faceBuf);
-    destroy_buf(ctx, mediaBuf);
-    destroy_buf(ctx, outBuf);
-    destroy_buf(ctx, paramBuf);
-    destroy_buf(ctx, seedBuf);
-    destroy_buf(ctx, curvBuf);
-    destroy_buf(ctx, trajBuf);
-    vkDestroyPipeline(ctx.device, cp.pipeline, NULL);
-    vkDestroyPipelineLayout(ctx.device, cp.pipeLayout, NULL);
-    vkDestroyDescriptorPool(ctx.device, cp.descPool, NULL);
-    vkDestroyDescriptorSetLayout(ctx.device, cp.descLayout, NULL);
-    vkDestroyCommandPool(ctx.device, ctx.cmdPool, NULL);
-    vkDestroyDevice(ctx.device, NULL);
-    vkDestroyInstance(ctx.instance, NULL);
-    return 0;
-#endif /* !USE_SHOW */
 }

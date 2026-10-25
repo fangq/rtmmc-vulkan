@@ -35,16 +35,6 @@ struct NodeCurvature {
     float px, py, pz;    /* first principal direction */
 };
 
-/* Per-shape origin info needed for analytic curvature */
-struct ShapeOrigin {
-    int type;             /* 0=box/slab, 1=sphere, 2=cylinder */
-    float cx, cy, cz;    /* center (sphere) or C0 (cylinder) */
-    float ax, ay, az;    /* axis direction (cylinder only, unit vector) */
-    float R;              /* radius */
-    float length;         /* cylinder axis length */
-    uint32_t node_start, node_end;
-};
-
 /* ================================================================ */
 /*  Compute tangent basis for a normal vector                       */
 /* ================================================================ */
@@ -80,7 +70,7 @@ static void make_tangent(float nx, float ny, float nz,
 static bool face_is_flat(const FaceData& fd) {
     uint32_t pk = 0;
     std::memcpy(&pk, &fd.packed_media, 4);
-    return (pk & 0x80000000u) != 0;
+    return (pk & VKMMC_FACE_FLAT) != 0;
 }
 
 /* ================================================================ */
@@ -341,94 +331,12 @@ static std::vector<NodeCurvature> compute_curvature(
 
 /* ================================================================ */
 /*  Build ShapeOrigin list from JSON Shapes array                   */
+/*  (parse_shapes() is the single source of truth for shape ids)    */
 /* ================================================================ */
-static std::vector<ShapeOrigin> extract_shape_origins(const json& arr) {
+static inline std::vector<ShapeOrigin> extract_shape_origins(const json& arr, int mesh_res = 24) {
     std::vector<ShapeOrigin> origins;
-
-    for (size_t si = 0; si < arr.size(); si++) {
-        const json& shape = arr[si];
-
-        if (!shape.is_object()) {
-            continue;
-        }
-
-        std::string key;
-
-        for (json::const_iterator it = shape.begin(); it != shape.end(); ++it) {
-            key = it.key();
-            break;
-        }
-
-        const json& obj = shape[key];
-        ShapeOrigin so;
-        memset(&so, 0, sizeof(so));
-
-        if (key == "Sphere") {
-            so.type = 1;
-            so.cx = obj["O"][0].get<float>();
-            so.cy = obj["O"][1].get<float>();
-            so.cz = obj["O"][2].get<float>();
-            so.R = obj["R"].get<float>();
-        } else if (key == "Cylinder") {
-            so.type = 2;
-            float x0 = obj["C0"][0].get<float>(), y0 = obj["C0"][1].get<float>(), z0 = obj["C0"][2].get<float>();
-            float x1 = obj["C1"][0].get<float>(), y1 = obj["C1"][1].get<float>(), z1 = obj["C1"][2].get<float>();
-            so.cx = x0;
-            so.cy = y0;
-            so.cz = z0;
-            float dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
-            float l = std::sqrt(dx * dx + dy * dy + dz * dz);
-            so.length = l;
-
-            if (l > 1e-10f) {
-                so.ax = dx / l;
-                so.ay = dy / l;
-                so.az = dz / l;
-            }
-
-            so.R = obj["R"].get<float>();
-        } else if (key == "Lens") {
-            /* Lens produces TWO ShapeOrigin entries: front cap then back cap.
-               Must match the origin_counter logic in parse_shapes. */
-            float lox = obj["O"][0].get<float>(), loy = obj["O"][1].get<float>(), loz = obj["O"][2].get<float>();
-            float ldx = obj["Dir"][0].get<float>(), ldy = obj["Dir"][1].get<float>(), ldz = obj["Dir"][2].get<float>();
-            float Df = obj["Front"]["D"].get<float>(), Rf = obj["Front"]["R"].get<float>();
-            float Db = obj["Back"]["D"].get<float>(),  Rb = obj["Back"]["R"].get<float>();
-            float dl = std::sqrt(ldx * ldx + ldy * ldy + ldz * ldz);
-
-            if (dl > 1e-10f) {
-                ldx /= dl;
-                ldy /= dl;
-                ldz /= dl;
-            }
-
-            /* Front spherical cap: center = O + n*(Df-Rf), radius = Rf (signed) */
-            ShapeOrigin sf2;
-            memset(&sf2, 0, sizeof(sf2));
-            sf2.type = 3;
-            sf2.cx = lox + ldx * (Df - Rf);
-            sf2.cy = loy + ldy * (Df - Rf);
-            sf2.cz = loz + ldz * (Df - Rf);
-            sf2.R  = Rf;   /* keep sign: negative = concave cap */
-            origins.push_back(sf2);
-
-            /* Back spherical cap: center = O + n*(Rb-Db), radius = Rb (signed) */
-            ShapeOrigin sb2;
-            memset(&sb2, 0, sizeof(sb2));
-            sb2.type = 3;
-            sb2.cx = lox + ldx * (Rb - Db);
-            sb2.cy = loy + ldy * (Rb - Db);
-            sb2.cz = loz + ldz * (Rb - Db);
-            sb2.R  = Rb;   /* keep sign: negative = concave cap */
-            origins.push_back(sb2);
-            continue;  /* already pushed both entries */
-        } else {
-            so.type = 0;
-        }
-
-        origins.push_back(so);
-    }
-
+    float ext[6] = {0, 60, 0, 60, 0, 60};
+    parse_shapes(arr, ext, mesh_res, VKMMC_MAX_CSG_TAG, &origins);
     return origins;
 }
 

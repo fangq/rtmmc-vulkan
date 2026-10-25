@@ -13,7 +13,10 @@
  * Compile-time flags (passed via -D to glslangValidator):
  *   USE_CSG         — enable CSG shape-based media state tracking
  *   USE_CURVATURE   — enable curvature-corrected normals (requires USE_CSG)
- *   USE_ATOMIC_FLOAT — NVIDIA native atomicAdd(float)
+ *   USE_ATOMIC_INT64 — native 64-bit integer atomics (GL_EXT_shader_atomic_int64);
+ *                      without it the 64-bit sums use pairs of 32-bit atomics
+ * The Makefile builds all six combinations and embeds them in vkmmc; the host
+ * picks one per input and device.
  *
  * Optimizations for curvature mode:
  *   - Main ray trace uses trace_ray (no barycentrics) always
@@ -22,18 +25,15 @@
  *     to reduce register pressure (no 3x simultaneous vec4 loads)
  *   - Single get_normal() used everywhere (no inlined duplication)
  *
- * Build examples:
- *   glslangValidator --target-env vulkan1.2 -e main -o vkmmc_core.spv vkmmc_core.comp
- *   glslangValidator --target-env vulkan1.2 -e main -DUSE_CSG -o vkmmc_core.spv vkmmc_core.comp
- *   glslangValidator --target-env vulkan1.2 -e main -DUSE_CSG -DUSE_CURVATURE -o vkmmc_core.spv vkmmc_core.comp
+ * Build example (a kernel passed as the last vkmmc argument overrides the embedded one):
+ *   glslangValidator --target-env vulkan1.2 -e main -DUSE_CSG -DUSE_CURVATURE -o my.spv vkmmc_core.comp
  */
 #version 460
 #extension GL_EXT_ray_query : require
 
-//#define USE_ATOMIC_FLOAT
-
-#ifdef USE_ATOMIC_FLOAT
-    #extension GL_EXT_shader_atomic_float : require
+#ifdef USE_ATOMIC_INT64
+    #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+    #extension GL_EXT_shader_atomic_int64 : require
 #endif
 
 layout(local_size_x = 64) in;
@@ -49,8 +49,9 @@ struct Medium {
 };
 layout(std430, set = 0, binding = 2) readonly buffer MediaBuffer { Medium media[]; };
 
-#ifdef USE_ATOMIC_FLOAT
-layout(std430, set = 0, binding = 3) buffer OutputBuffer { float output_data[]; };
+// output: one unsigned 64-bit fixed-point sum (FIXED_SCALE units) per element
+#ifdef USE_ATOMIC_INT64
+layout(std430, set = 0, binding = 3) buffer OutputBuffer { uint64_t output_data[]; };
 #else
 layout(std430, set = 0, binding = 3) buffer OutputBuffer { uint output_data[]; };
 #endif
@@ -130,7 +131,6 @@ layout(std430, set = 0, binding = 7) buffer TrajBuffer { uint traj_data[]; };
 
 const float INV_C0       = 3.335640951981520e-12;  // 1/C0 in s/mm
 const float SAFETY_DIST  = 0.001;       // heuristic to ensure ray crosses triangle
-const float DOUBLE_SAFETY = 0.002;
 const float TWO_PI       = 6.28318530717959;       // 2*pi
 const float FEPS         = 1.19209290E-07;         // float epsilon / round-off limit
 const float FMAX         = 3.402823466e+38;        // float max
@@ -191,12 +191,17 @@ bool trace_ray(vec3 o, vec3 d, float tmin, float tmax,
 
 /**
  * Unpack front and back media IDs from packed float.
- * Bits [31] = flat flag (ignored here via mask), [30:16] = front, [15:0] = back.
+ * Bit 31 = flat flag, bit 30 = coplanar flag, [29:16] = front, [15:0] = back.
  */
 void unpack_media(float pw, out uint front_med, out uint back_med) {
-    uint p = floatBitsToUint(pw) & 0x7FFFFFFFu;  // mask off flat flag
-    front_med = p >> 16u;
+    uint p = floatBitsToUint(pw);
+    front_med = (p >> 16u) & 0x3FFFu;
     back_med  = p & 0xFFFFu;
+}
+
+/* the triangle overlaps a coplanar triangle of another CSG surface */
+bool is_coplanar_triangle(float pw) {
+    return (floatBitsToUint(pw) & 0x40000000u) != 0u;
 }
 
 #ifdef USE_CURVATURE
@@ -298,78 +303,121 @@ uvec2 ms_leave(uvec2 ms, uint back_id) {
 // ==================== Output ====================
 
 /**
- * Atomic float addition to output buffer.
- * Uses native atomicAdd when available, otherwise CAS loop fallback.
+ * Add a deposit to output element idx. Sums are kept as unsigned 64-bit
+ * fixed-point numbers (FIXED_SCALE = 2^32 units per photon weight): integer
+ * sums are exact and independent of the order of the additions, so a run is
+ * bit-reproducible and its precision does not degrade with the photon count,
+ * unlike float atomics. Without native 64-bit atomics the sum is a (low, high)
+ * pair of 32-bit words with an explicit carry; both layouts are identical in
+ * memory.
  */
-void atomic_add_float(uint idx, float val) {
-#ifdef USE_ATOMIC_FLOAT
-    atomicAdd(output_data[idx], val);
-#else
-    uint prev = output_data[idx], nv, old;
+const float FIXED_SCALE = 4294967296.0;
 
-    do {
-        old = prev;
-        nv = floatBitsToUint(uintBitsToFloat(old) + val);
-        prev = atomicCompSwap(output_data[idx], old, nv);
-    } while (prev != old);
+void atomic_add_float(uint idx, float val) {
+    float v = val * FIXED_SCALE + 0.5;   // round to nearest
+#ifdef USE_ATOMIC_INT64
+    atomicAdd(output_data[idx], uint64_t(v));
+#else
+    uint hi = uint(v * (1.0 / FIXED_SCALE));
+    uint lo = uint(v - float(hi) * FIXED_SCALE);
+    uint old = atomicAdd(output_data[2u * idx], lo);
+
+    if (old + lo < old) {
+        hi++;               // carry out of the low word
+    }
+
+    if (hi != 0u) {
+        atomicAdd(output_data[2u * idx + 1u], hi);
+    }
 
 #endif
 }
 
 /**
- * Convert 3D position (relative to grid origin) to 1D voxel index.
- */
-uint voxel_index(vec3 rp) {
-    uint ix = rp.x > 0.0 ? uint(min(rp.x, grid_extent.x) * voxel_scale) : 0u;
-    uint iy = rp.y > 0.0 ? uint(min(rp.y, grid_extent.y) * voxel_scale) : 0u;
-    uint iz = rp.z > 0.0 ? uint(min(rp.z, grid_extent.z) * voxel_scale) : 0u;
-    return iz * grid_stride.y + iy * grid_stride.x + ix;
-}
-
-/**
- * Get the offset of the current time frame in the output buffer.
- */
-uint time_offset(float tof) {
-    return uint(min(int((tof - time_start) * inv_timestep), max_gate - 1)) * grid_stride.z;
-}
-
-/**
- * Accumulate output quantities to the 3D grid.
- * Divides path into segments of equal length, depositing weight loss
- * of each segment to the corresponding grid voxel.
+ * Accumulate output along a path of length L from p in direction d.
+ *
+ * The path is traversed voxel by voxel (3-D DDA) and split at time-gate
+ * boundaries, so every piece deposits into the voxel and gate it lies in.
+ * A piece of length l carrying weight w deposits
+ *   energy:        w (1 - exp(-mua l))
+ *   fluence/flux:  w (1 - exp(-mua l)) / mua   (-> w l when mua -> 0)
+ * Deposits outside [time_start, time_end) are dropped.
  */
 void accumulate(vec3 p, vec3 d, uint mid, float w, float tof, float L) {
-    Medium pr = media[mid];
-    int sc = (int(L * voxel_scale) + 1) << 1;
-    float sl = L / float(sc), decay = exp(-pr.mua * sl);
-    float loss = (output_type == OUT_ENERGY) ? w * (1.0 - decay)
-                 : (pr.mua > 0.0 ? w * (1.0 - decay) / pr.mua : 0.0);
-
-    // deposit weight loss of each segment to the corresponding grid
-    vec3 step = sl * d, sm = p - grid_min.xyz + 0.5 * step;
-    float ct = tof + sl * INV_C0 * pr.n;
-    uint oe = time_offset(ct) + voxel_index(sm);
-    float ow = loss;
-
-    // iterate over the rest of the segments
-    for (int i = 1; i < sc; ++i) {
-        loss *= decay;
-        sm += step;
-        ct += sl * INV_C0 * pr.n;
-        uint ne = time_offset(ct) + voxel_index(sm);
-
-        // save when entering a new element
-        if (ne != oe) {
-            atomic_add_float(oe, ow);
-            oe = ne;
-            ow = 0.0;
-        }
-
-        ow += loss;
+    if (!(L > 0.0)) {
+        return;
     }
 
-    // save the weight loss of the last segment
-    atomic_add_float(oe, ow);
+    Medium pr = media[mid];
+    ivec3 dim = ivec3(int(grid_stride.x), int(grid_stride.y / grid_stride.x), int(grid_stride.z / grid_stride.y));
+    vec3 s = (p - grid_min.xyz) * voxel_scale;          // start in voxel coordinates
+    float Lv = L * voxel_scale;                          // length in voxels
+    float lscale = 1.0 / voxel_scale;                    // voxel length in length units
+    ivec3 iv = clamp(ivec3(floor(s)), ivec3(0), dim - 1);
+    float g0 = (tof - time_start) * inv_timestep;        // gate coordinate at the start
+    float gstep = INV_C0 * pr.n * lscale * inv_timestep; // gate coordinate per voxel length
+    float gi = floor(g0);                                // current gate, advanced incrementally
+
+    // fast path: a step that starts and ends in the same voxel and gate
+    if (iv == clamp(ivec3(floor(s + d * Lv)), ivec3(0), dim - 1) && floor(g0 + Lv * gstep) == gi) {
+        if (gi >= 0.0 && gi < float(max_gate)) {
+            float x = pr.mua * L;
+            float frac = (x < 1e-3) ? x * (1.0 - 0.5 * x) : 1.0 - exp(-x);
+            atomic_add_float(uint(gi) * grid_stride.z + uint(iv.z) * grid_stride.y + uint(iv.y) * grid_stride.x + uint(iv.x),
+                             (output_type == OUT_ENERGY) ? w * frac : w * ((x < 1e-3) ? L * (1.0 - 0.5 * x) : frac / pr.mua));
+        }
+
+        return;
+    }
+
+    vec3 ad = abs(d), tdel = 1.0 / max(ad, vec3(1e-20));
+    vec3 tm;
+    tm.x = (ad.x < 1e-20) ? FMAX : max(((d.x > 0.0) ? float(iv.x + 1) - s.x : s.x - float(iv.x)) * tdel.x, 0.0);
+    tm.y = (ad.y < 1e-20) ? FMAX : max(((d.y > 0.0) ? float(iv.y + 1) - s.y : s.y - float(iv.y)) * tdel.y, 0.0);
+    tm.z = (ad.z < 1e-20) ? FMAX : max(((d.z > 0.0) ? float(iv.z + 1) - s.z : s.z - float(iv.z)) * tdel.z, 0.0);
+    ivec3 dir = ivec3(d.x > 0.0 ? 1 : -1, d.y > 0.0 ? 1 : -1, d.z > 0.0 ? 1 : -1);
+
+    float tg = (gi + 1.0 - g0) / gstep;                  // distance to the next gate boundary
+    float t = 0.0;
+
+    for (int guard = 0; guard < 65536 && t < Lv; guard++) {
+        if (gi >= float(max_gate)) {
+            break;          // later pieces are later in time
+        }
+
+        float tv = min(min(tm.x, tm.y), tm.z);
+        float te = min(min(tv, tg), Lv);
+        float x = pr.mua * (te - t) * lscale;
+        float frac = (x < 1e-3) ? x * (1.0 - 0.5 * x) : 1.0 - exp(-x);
+
+        if (gi >= 0.0) {
+            float dep = (output_type == OUT_ENERGY) ? w * frac
+                        : w * ((x < 1e-3) ? (te - t) * lscale * (1.0 - 0.5 * x) : frac / pr.mua);
+            atomic_add_float(uint(gi) * grid_stride.z + uint(iv.z) * grid_stride.y + uint(iv.y) * grid_stride.x + uint(iv.x), dep);
+        }
+
+        w *= 1.0 - frac;
+        t = te;
+
+        if (te == tg) {
+            gi += 1.0;
+            tg = (gi + 1.0 - g0) / gstep;
+        }
+
+        if (te == tv && te < Lv) {
+            // step into the next voxel along the axis whose boundary was reached
+            if (tm.x <= tm.y && tm.x <= tm.z) {
+                iv.x = clamp(iv.x + dir.x, 0, dim.x - 1);
+                tm.x += tdel.x;
+            } else if (tm.y <= tm.z) {
+                iv.y = clamp(iv.y + dir.y, 0, dim.y - 1);
+                tm.y += tdel.y;
+            } else {
+                iv.z = clamp(iv.z + dir.z, 0, dim.z - 1);
+                tm.z += tdel.z;
+            }
+        }
+    }
 }
 
 // ==================== Scattering ====================
@@ -394,24 +442,32 @@ vec3 scatter_dir(vec3 d, float g, inout uvec4 rng) {
     float ct;
 
     if (abs(g) > FEPS) {
-        float t = (1.0 - g * g) / (1.0 - g + 2.0 * g * rand01(rng));
+        float t = (1.0 - g * g) / max(1.0 - g + 2.0 * g * rand01(rng), FEPS);
         ct = clamp((1.0 + g * g - t * t) / (2.0 * g), -1.0, 1.0);
     } else {
         ct = 2.0 * rand01(rng) - 1.0;
     }
 
     float phi = rand_range(rng, 0.0, TWO_PI);
-    return rotate_dir(d, vec2(sin(acos(ct)), ct), vec2(sin(phi), cos(phi)));
+    return rotate_dir(d, vec2(sqrt(max(1.0 - ct * ct, 0.0)), ct), vec2(sin(phi), cos(phi)));
 }
 
 // ==================== Fresnel Reflection/Refraction ====================
 
 /**
  * Reflect or refract a ray at a mismatched boundary.
+ * N is the shading normal (curvature corrected or flat), Ng the geometric
+ * normal of the hit triangle; either orientation is accepted. A direction
+ * computed from a smooth N that would not leave the facet on the correct
+ * side (reflection back through it, refraction staying on the incoming side)
+ * is recomputed from Ng, and the photon is placed SAFETY_DIST off the facet
+ * plane on its new side, so the next ray cannot tunnel through the facet.
  * Returns true if reflected, false if transmitted.
  */
-bool do_reflection(vec3 N, float n1, float n2, inout uvec4 rng, inout vec3 p, inout vec3 d) {
-    float ci = -dot(d, N);
+bool do_reflection(vec3 N, vec3 Ng, float n1, float n2, inout uvec4 rng, vec3 hit, inout vec3 p, inout vec3 d) {
+    vec3 d0 = d;
+    vec3 Nin = (dot(d0, Ng) < 0.0) ? Ng : -Ng;   // facet normal on the incoming side
+    float ci = -dot(d0, N);
 
     if (ci < 0.0) {
         N = -N;
@@ -420,6 +476,7 @@ bool do_reflection(vec3 N, float n1, float n2, inout uvec4 rng, inout vec3 p, in
 
     float n12 = n1 * n1, n22 = n2 * n2;
     float ct2 = 1.0 - n12 / n22 * (1.0 - ci * ci);
+    bool reflect = true;
 
     if (ct2 > 0.0) {
         // if no total internal reflection
@@ -429,26 +486,44 @@ bool do_reflection(vec3 N, float n1, float n2, inout uvec4 rng, inout vec3 p, in
         re = n22 * ci * ci + n12 * ct * ct;
         float rt = (rp + (re - im) / (re + im)) * 0.5;  // (Rp+Rs)/2
 
-        if (rand01(rng) <= rt) {
-            // do reflection, correct photon position
-            p -= d * DOUBLE_SAFETY;
-            d = d + 2.0 * ci * N;
-        } else {
+        if (rand01(rng) > rt) {
             // do transmission
             float ratio = n1 / n2;
-            d = ratio * d + (ratio * ci - ct) * N;
-            d *= inversesqrt(dot(d, d));
-            return false;
+            d = ratio * d0 + (ratio * ci - ct) * N;
+
+            if (dot(d, Nin) >= 0.0) {
+                // smooth normal sends the photon back: refract about the facet
+                float cig = -dot(d0, Nin), ctg2 = 1.0 - ratio * ratio * (1.0 - cig * cig);
+
+                if (ctg2 > 0.0) {
+                    d = ratio * d0 + (ratio * cig - sqrt(ctg2)) * Nin;
+                } else {
+                    d = d0 + 2.0 * cig * Nin;
+                    p = hit + Nin * SAFETY_DIST;
+                    d *= inversesqrt(dot(d, d));
+                    return true;
+                }
+            }
+
+            p = hit - Nin * SAFETY_DIST;
+            reflect = false;
         }
-    } else {
-        // total internal reflection, correct photon position
-        p -= d * DOUBLE_SAFETY;
-        d = d + 2.0 * ci * N;
+    }
+
+    if (reflect) {
+        d = d0 + 2.0 * ci * N;
+
+        if (dot(d, Nin) <= 0.0) {
+            // smooth normal sends the photon through the facet: reflect about the facet
+            d = d0 - 2.0 * dot(d0, Nin) * Nin;
+        }
+
+        p = hit + Nin * SAFETY_DIST;
     }
 
     // normalize new direction
     d *= inversesqrt(dot(d, d));
-    return true;
+    return reflect;
 }
 
 // ==================== Curvature Normal ====================
@@ -509,6 +584,127 @@ vec3 get_normal(int tri_id, vec3 hit_pos) {
 #endif
 }
 
+#ifdef USE_CSG
+const float COPLANAR_EPS = 2e-4;    // half width of the window around a facet plane
+
+/* tag bit sets for tags 1..64 */
+bool tagset_has(uvec2 set, uint tag) {
+    return (((tag > 32u) ? set.y : set.x) & (1u << ((tag - 1u) & 31u))) != 0u;
+}
+
+uvec2 tagset_add(uvec2 set, uint tag) {
+    uint bit = 1u << ((tag - 1u) & 31u);
+    return (tag > 32u) ? uvec2(set.x, set.y | bit) : uvec2(set.x | bit, set.y);
+}
+
+/**
+ * All CSG triangles at the point where a photon moving along nfar crossed a
+ * coplanar-flagged facet: cast a probe back from p (SAFETY_DIST past the
+ * facet) along -nfar and enumerate, without committing, every triangle within
+ * COPLANAR_EPS of the plane. A ray tracer reports only one of several
+ * coincident triangles; this recovers all of them.
+ * Mode 0 updates the media state ms (enter/leave each tag once per direction);
+ * mode 1 updates the enclosure walk sets seen/inside (first crossing per tag).
+ */
+void coplanar_crossings(vec3 p, vec3 nfar, int mode, inout uvec2 ms, inout uvec2 seen, inout uvec2 inside) {
+    rayQueryEXT q;
+    uvec2 entered = uvec2(0u, 0u), left = uvec2(0u, 0u);
+    rayQueryInitializeEXT(q, scene, gl_RayFlagsNoOpaqueEXT, 0xFF, p, SAFETY_DIST - COPLANAR_EPS, -nfar,
+                          SAFETY_DIST + COPLANAR_EPS);
+
+    while (rayQueryProceedEXT(q)) {
+        if (rayQueryGetIntersectionTypeEXT(q, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
+            continue;
+        }
+
+        int tid = rayQueryGetIntersectionPrimitiveIndexEXT(q, false);
+        // the probe runs against the photon, so it sees the faces from the other side
+        bool enter = !rayQueryGetIntersectionFrontFaceEXT(q, false);
+        uint fm, bm;
+        unpack_media(face_normal[tid * 2].w, fm, bm);
+
+        if (bm < 1u || bm > 64u) {
+            continue;
+        }
+
+        if (mode == 0) {
+            if (enter && !tagset_has(entered, bm)) {
+                entered = tagset_add(entered, bm);
+                ms = ms_enter(ms, bm);
+            } else if (!enter && !tagset_has(left, bm)) {
+                left = tagset_add(left, bm);
+                ms = ms_leave(ms, bm);
+            }
+        } else if (!tagset_has(seen, bm)) {
+            seen = tagset_add(seen, bm);
+
+            if (!enter) {
+                inside = tagset_add(inside, bm);
+            }
+        }
+    }
+}
+
+/**
+ * Enclosure walk: cast a ray forward through all surfaces and return the set
+ * of tags (bit t-1 for tag t, tags 1..64) of the shapes enclosing p. The point
+ * is inside a shape exactly when the first crossing of that shape's tag along
+ * the ray is an exit (back-face hit); overlapping shapes of the same tag are
+ * thus counted once. The start point is perturbed perpendicular to d to avoid
+ * degenerate ray-edge/vertex hits.
+ */
+uvec2 csg_enclosure(vec3 p, vec3 d) {
+    uvec2 seen = uvec2(0u, 0u), inside = uvec2(0u, 0u), ms = uvec2(0u, 0u);
+    vec3 perp = (abs(d.z) < 0.999) ? normalize(cross(d, vec3(0.0, 0.0, 1.0)))
+                : normalize(cross(d, vec3(1.0, 0.0, 0.0)));
+    vec3 wp = p + perp * 2e-4;
+
+    for (int wk = 0; wk < 64; wk++) {
+        float hd;
+        int tid;
+        bool ff;
+
+        if (!trace_ray(wp, d, RAY_TMIN, FMAX, hd, tid, ff)) {
+            break;
+        }
+
+        vec4 fn = face_normal[tid * 2];
+        vec3 nfar = (dot(d, fn.xyz) > 0.0) ? fn.xyz : -fn.xyz;
+        vec3 hit = wp + d * hd;
+        wp = hit + nfar * SAFETY_DIST;
+
+        if (is_coplanar_triangle(fn.w)) {
+            coplanar_crossings(wp, nfar, 1, ms, seen, inside);
+        } else {
+            uint fm, bm;
+            unpack_media(fn.w, fm, bm);
+
+            if (bm >= 1u && bm <= 64u && !tagset_has(seen, bm)) {
+                seen = tagset_add(seen, bm);
+
+                if (!ff) {
+                    inside = tagset_add(inside, bm);
+                }
+            }
+        }
+    }
+
+    return inside;
+}
+
+/* media state buffer holding the tags of an enclosure set */
+uvec2 csg_state(uvec2 inside) {
+    uvec2 ms = uvec2(0u, 0u);
+
+    for (uint t = 1u; t <= 64u; t++)
+        if (tagset_has(inside, t)) {
+            ms = ms_enter(ms, t);
+        }
+
+    return ms;
+}
+#endif
+
 // ==================== Photon Launch ====================
 
 /**
@@ -519,7 +715,7 @@ vec3 get_normal(int tri_id, vec3 hit_pos) {
  */
 void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
                    inout float tof, inout uint mid, inout uvec2 mstate, inout uvec4 rng,
-                   out vec3 launch_pos) {
+                   out vec3 launch_pos, inout uvec2 csg_cache, inout bool csg_cached) {
     p = src_pos.xyz;
     d = src_dir.xyz;
     w = 1.0;
@@ -555,47 +751,25 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
 #ifdef USE_CSG
 
     if (do_csg > 0u) {
-        // CSG parity walk: cast ray forward, count boundary crossings
-        // to determine which shapes enclose the source point.
-        // Perturb the start point slightly perpendicular to d to avoid
-        // degenerate ray-edge/vertex intersections: when the launch
-        // position lands exactly on a mesh edge (e.g. phi=0 ray through a
-        // mesh vertex at r_edge), only one of the two cap faces may be hit,
-        // giving an odd parity count and an incorrect initial medium.
-        mstate = uvec2(0u, 0u);
-        uint parity = 0u;
-        vec3 perp = (abs(d.z) < 0.999) ? normalize(cross(d, vec3(0.0, 0.0, 1.0)))
-                                        : normalize(cross(d, vec3(1.0, 0.0, 0.0)));
-        vec3 wp = p + perp * 2e-4;
+        // Enclosure walk: cast a ray forward through all surfaces. The source
+        // is inside a shape exactly when the first crossing of that shape's
+        // tag along the ray is an exit (back-face hit); overlapping shapes of
+        // the same tag are thus counted once. The start point is perturbed
+        // perpendicular to d to avoid degenerate ray-edge/vertex hits.
+        // A pencil source launches every photon from the same point, so the
+        // walk is done once per thread and cached in csg_cache.
+        uvec2 inside = csg_cache;
 
-        for (int wk = 0; wk < 64; wk++) {
-            float hd;
-            int tid;
-            bool ff;
-
-            if (!trace_ray(wp, d, RAY_TMIN, FMAX, hd, tid, ff)) {
-                break;
-            }
-
-            uint fm, bm;
-            unpack_media(face_normal[tid * 2].w, fm, bm);
-
-            if (bm > 0u && bm <= 8u) {
-                parity ^= (1u << (bm - 1u));
-            }
-
-            wp += d * (hd + SAFETY_DIST);
+        if (src_type != 0 || !csg_cached) {
+            inside = csg_enclosure(p, d);
+            csg_cache = inside;
+            csg_cached = true;
         }
 
-        // Set media state from parity bits
-        for (int i = 0; i < 8; i++)
-            if ((parity & (1u << i)) != 0u) {
-                mstate = ms_enter(mstate, uint(i + 1));
-            }
-
+        mstate = csg_state(inside);
         mid = ms_get(mstate, 0);
 
-        // If source is outside all shapes, try to enter the first shape
+        // If the source is outside all shapes, enter the first shape it points at
         if (mid == 0u) {
             float hd;
             int tid;
@@ -604,28 +778,17 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
             if (trace_ray(p, d, 0.0, FMAX, hd, tid, ff) && ff) {
                 uint fm, bm;
                 unpack_media(face_normal[tid * 2].w, fm, bm);
-                p += d * (hd + SAFETY_DIST);
+                vec3 hp = p + d * hd;
+                p = hp + d * SAFETY_DIST;
                 mstate = ms_enter(mstate, bm);
                 mid = ms_get(mstate, 0);
 
-                // Handle Fresnel reflection at entry boundary
-                if (do_reflect > 0u && mid < num_media) {
-                    float n_out = media[mid].n;
-
-                    if (1.0 != n_out) {
-                        vec3 hp = p - d * SAFETY_DIST;
-                        vec3 N = get_normal(tid, hp);
-
-                        if (!ff) {
-                            N = -N;
-                        }
-
-                        if (do_reflection(N, 1.0, n_out, rng, p, d)) {
-                            mstate = uvec2(0u, 0u);
-                            mid = MEDIUM_DEAD;
-                            w = 0.0;
-                        }
-                    }
+                // Fresnel reflection at the entry boundary
+                if (do_reflect > 0u && mid < num_media && media[0].n != media[mid].n
+                        && do_reflection(get_normal(tid, hp), face_normal[tid * 2].xyz, media[0].n, media[mid].n, rng, hp, p, d)) {
+                    mstate = uvec2(0u, 0u);
+                    mid = MEDIUM_DEAD;
+                    w = 0.0;
                 }
             } else {
                 mid = MEDIUM_DEAD;
@@ -634,7 +797,7 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
     } else
 #endif
     {
-        // Mesh mode: initial medium is pre-determined or probed
+        // Mesh mode: initial medium is pre-determined (InitElem) or probed
         mid = initial_medium;
 
         if (mid == MEDIUM_UNKNOWN) {
@@ -646,6 +809,19 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
                 uint fm, bm;
                 unpack_media(face_normal[tid * 2].w, fm, bm);
                 mid = ff ? fm : bm;
+
+                // Source outside the mesh, pointing at it: enter through the hit face
+                if (mid == MEDIUM_AMBIENT && ff) {
+                    vec3 hp = p + d * hd;
+                    p = hp + d * SAFETY_DIST;
+                    mid = bm;
+
+                    if (do_reflect > 0u && media[0].n != media[mid].n
+                            && do_reflection(get_normal(tid, hp), face_normal[tid * 2].xyz, media[0].n, media[mid].n, rng, hp, p, d)) {
+                        mid = MEDIUM_DEAD;
+                        w = 0.0;
+                    }
+                }
             } else {
                 mid = MEDIUM_DEAD;
             }
@@ -687,11 +863,6 @@ void main() {
         return;
     }
 
-    // Debug: store has_curvature flag for host readback
-    if (tid == 0u) {
-        atomicExchange(output_data[grid_stride.w - 11u], has_curvature);
-    }
-
     uvec4 rng = thread_seeds[tid];
     int done = 0, maxph = photons_per_thread + int(tid < uint(extra_photons));
 
@@ -706,7 +877,9 @@ void main() {
     uint photon_id = photon_base + tid;  // globally unique across batches
 
     vec3 launch_pos;
-    launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng, launch_pos);
+    uvec2 csg_cache = uvec2(0u, 0u);
+    bool csg_cached = false;
+    launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng, launch_pos, csg_cache, csg_cached);
     save_traj(launch_pos, 1.0, photon_id, 0u);         // save original source position
 
     if (any(notEqual(launch_pos, pos))) {
@@ -743,9 +916,11 @@ void main() {
                 // save output
                 accumulate(pos, dir, mid, weight, tof, L);
 
-                // update photon position, weight, timer
+                // update photon position, weight, timer; a crossing photon is
+                // placed SAFETY_DIST off the facet plane on the far side
                 vec3 hit_pos = pos + dir * L;   /* exact surface hit point for trajectory */
-                pos = hit_pos + dir * SAFETY_DIST;
+                vec3 Ng = face_normal[tri * 2].xyz;
+                pos = hit_pos + ((dot(dir, Ng) > 0.0) ? Ng : -Ng) * SAFETY_DIST;
                 weight *= exp(-prop.mua * L);
                 tof += L * INV_C0 * prop.n;
 
@@ -762,6 +937,13 @@ void main() {
                     // CSG mode: update media state buffer
                     uint old_mid = mid;
                     uvec2 new_ms = ff ? ms_enter(mstate, bm) : ms_leave(mstate, bm);
+
+                    if (is_coplanar_triangle(face_normal[tri * 2].w)) {
+                        uvec2 unused0 = uvec2(0u), unused1 = uvec2(0u);
+                        new_ms = mstate;
+                        coplanar_crossings(pos, (dot(dir, Ng) > 0.0) ? Ng : -Ng, 0, new_ms, unused0, unused1);
+                    }
+
                     uint new_mid = ms_get(new_ms, 0);
 
                     bool reflected = false;
@@ -770,7 +952,7 @@ void main() {
                     if (do_reflect > 0u && new_mid != old_mid
                             && new_mid < num_media && old_mid < num_media) {
                         float n_in = media[old_mid].n;
-                        float n_out = (new_mid == 0u) ? 1.0 : media[new_mid].n;
+                        float n_out = media[new_mid].n;   // media[0] is the background
 
                         if (n_in != n_out) {
                             // Only compute curvature normal at actual refractive boundary
@@ -780,7 +962,7 @@ void main() {
                                 N = -N;
                             }
 
-                            reflected = do_reflection(N, n_in, n_out, rng, pos, dir);
+                            reflected = do_reflection(N, face_normal[tri * 2].xyz, n_in, n_out, rng, hit_pos, pos, dir);
                         }
                     }
 
@@ -817,7 +999,7 @@ void main() {
                                 N = -N;
                             }
 
-                            reflected = do_reflection(N, prop.n, n_out, rng, pos, dir);
+                            reflected = do_reflection(N, face_normal[tri * 2].xyz, prop.n, n_out, rng, hit_pos, pos, dir);
                         }
                     }
 
@@ -851,10 +1033,22 @@ void main() {
                     pos += dir * L;
                     weight *= exp(-prop.mua * L);
                     tof += L * INV_C0 * prop.n;
-                    dir = scatter_dir(dir, prop.g, rng);
-                    slen = rand_scatlen(rng);
-                    save_traj(pos, weight, photon_id, 1u);
-                    traj_need_term = true;
+
+                    // Russian roulette: survivors carry the weight of the terminated photons
+                    if (weight < minenergy) {
+                        if (rand01(rng) * roulettesize <= 1.0) {
+                            weight *= roulettesize;
+                        } else {
+                            mid = MEDIUM_DEAD;
+                        }
+                    }
+
+                    if (mid != MEDIUM_DEAD) {
+                        dir = scatter_dir(dir, prop.g, rng);
+                        slen = rand_scatlen(rng);
+                        save_traj(pos, weight, photon_id, 1u);
+                        traj_need_term = true;
+                    }
                 }
             }
         }
@@ -865,7 +1059,7 @@ void main() {
                 save_traj(pos, weight, photon_id, 2u);
             }
 
-            launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng, launch_pos);
+            launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng, launch_pos, csg_cache, csg_cached);
             ++done;
             photon_id = photon_base + total_threads * uint(done) + tid;
 

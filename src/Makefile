@@ -1,150 +1,135 @@
-# Vulkan RT-MMC Makefile
+#################################################################
+#  Makefile for vkmmc - Vulkan ray-query accelerated mesh/shape MC
 #
-# Build variants:
-#   make                       — mesh-only (fastest, no CSG/curvature)
-#   make CSG=1                 — CSG shapes, no curvature
-#   make CSG=1 CURV=1          — CSG + curvature
-#   make nvidia                — NVIDIA native atomicAdd (combine with CSG/CURV)
-#   make CSG=1 CURV=1 nvidia   — full featured NVIDIA build
+#  make               build ../bin/vkmmc (all kernel variants embedded)
+#  make SHOW=1        also build the interactive --show viewer (needs GLFW)
+#  make HAVE_ZLIB=yes link the system zlib instead of the bundled miniz
+#  make DEBUG=1       debug build (-g -O0)
+#  make test          run the functional tests (needs a ray-query GPU)
+#  make unittest      build and run the host-side unit tests (no GPU needed)
+#  make fuzz          build the libFuzzer harnesses (needs clang)
+#  make clean         remove build products
+#
+#  The kernel variants (mesh, CSG, CSG+curvature, each with native 64-bit
+#  or paired 32-bit integer atomics) are compiled from vkmmc_core.comp and embedded
+#  in the binary; vkmmc picks the one matching the input and the GPU at run
+#  time, so no build flag selects the simulation mode.
+#################################################################
 
-CXX      ?= g++
-CXXFLAGS  = -std=c++11 -O2 -Wall -I. -Iminiz
-LDFLAGS   = -lvulkan
+CXX       ?= g++
+CC        ?= gcc
+GLSLC     ?= glslangValidator
+XXD       ?= xxd
 
-GLSLC    ?= glslangValidator
-GLSLFLAGS = --target-env vulkan1.2 -e main
+BINDIR    := ../bin
+BINARY    := $(BINDIR)/vkmmc
 
-BINARY        = vkmmc
-SHADER        = vkmmc_core.spv
-SHADER_HEADER = vkmmc_core_spv.h
-SOURCES       = vkmmc.cpp miniz/miniz.c
-HEADERS       = vkmmc_io.h vkmmc_shapes.h vkmmc_curvature.h nlohmann/json.hpp $(SHADER_HEADER)
-COMP_SRC      = vkmmc_core.comp
-
-INPUT    ?= input.json
-NPHOTON  ?= 100000
-GPUID    ?= 1
-
-# CSG support
-ifdef CSG
-    GLSLFLAGS += -DUSE_CSG
-    CXXFLAGS  += -DUSE_CSG
+OPTFLAGS  := -O3
+ifdef DEBUG
+    OPTFLAGS := -g -O0
 endif
 
-# Curvature support (requires CSG)
-ifdef CURV
-    ifndef CSG
-        $(error CURV=1 requires CSG=1)
-    endif
-    GLSLFLAGS += -DUSE_CURVATURE
-    CXXFLAGS  += -DUSE_CURVATURE
+CXXFLAGS  += -std=c++11 $(OPTFLAGS) -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -I. -Izmat
+CFLAGS    += $(OPTFLAGS) -Wall -Izmat
+LDFLAGS   += -lvulkan -lpthread
+
+# zmat: only zlib/gzip are used; deflate/inflate in parallel blocks with pthreads
+ZMATFLAGS := -DNO_LZMA -DNO_LZ4 -DNO_BLOSC2 -DNO_ZSTD
+ZMATOBJS  := zmat/zmatlib.o
+ifeq ($(HAVE_ZLIB),yes)
+    LDFLAGS   += -lz
+else
+    ZMATFLAGS += -DNO_ZLIB -Izmat/miniz
+    ZMATOBJS  += zmat/miniz/miniz.o
 endif
+
+GLSLFLAGS := --target-env vulkan1.2 -e main
+
+SOURCES   := vkmmc.cpp
+HEADERS   := vkmmc_io.h vkmmc_host.h vkmmc_shapes.h vkmmc_curvature.h nlohmann/json.hpp zmat/zmatlib.h
+COMP_SRC  := vkmmc_core.comp
+SHADER_HEADER := vkmmc_core_spv.h
+
+# kernel variants: <name>:<glslang defines>
+VARIANT_mesh    :=
+VARIANT_csg     := -DUSE_CSG
+VARIANT_curv    := -DUSE_CSG -DUSE_CURVATURE
+VARIANTS        := mesh csg curv
+SPVS            := $(foreach v,$(VARIANTS),vkmmc_core_$(v).spv vkmmc_core_$(v)_i64.spv)
 
 # Interactive viewer support
-GLFW_INC  ?= $(shell pkg-config --cflags glfw3 2>/dev/null || echo "-I/usr/local/optix/SDK/support/GLFW/include")
-GLFW_LIB  ?= $(shell pkg-config --libs   glfw3 2>/dev/null || echo "-L/usr/local/optix/SDK/lib -Wl,-rpath,/usr/local/optix/SDK/lib -lglfw")
 ifdef SHOW
+    GLFW_INC  ?= $(shell pkg-config --cflags glfw3 2>/dev/null || echo "-I/usr/local/optix/SDK/support/GLFW/include")
+    GLFW_LIB  ?= $(shell pkg-config --libs   glfw3 2>/dev/null || echo "-L/usr/local/optix/SDK/lib -Wl,-rpath,/usr/local/optix/SDK/lib -lglfw")
     CXXFLAGS  += -DUSE_SHOW $(GLFW_INC)
     LDFLAGS   += $(GLFW_LIB)
     SHOW_DEPS  = vkmmc_show_vert_spv.h vkmmc_show_frag_spv.h \
                  vkmmc_show_vol_vert_spv.h vkmmc_show_vol_frag_spv.h
-    HEADERS   += $(SHOW_DEPS)
+    HEADERS   += vkmmc_show.h $(SHOW_DEPS)
 endif
 
-.PHONY: all nvidia host shader shader-nvidia clean listgpu run help pretty
+.PHONY: all clean test unittest fuzz listgpu help pretty
 
-all: $(BINARY) $(SHADER)
-
-nvidia: $(BINARY) shader-nvidia
+all: $(BINARY)
 
 help:
-	@echo "Vulkan RT-MMC Build System"
-	@echo ""
-	@echo "Targets:"
-	@echo "  make                 mesh-only (fastest)"
-	@echo "  make CSG=1           CSG shapes, no curvature"
-	@echo "  make CSG=1 CURV=1    CSG + curvature"
-	@echo "  make nvidia          NVIDIA atomicAdd (combine with CSG/CURV)"
-	@echo "  make host            host binary only"
-	@echo "  make shader          shader only"
-	@echo "  make clean           remove artifacts"
-	@echo "  make listgpu         list Vulkan GPUs"
-	@echo "  make run             run simulation"
+	@sed -n '2,17p' Makefile
 
-$(BINARY): $(SOURCES) $(HEADERS)
-	$(CXX) $(CXXFLAGS) -o $@ $(SOURCES) $(LDFLAGS)
+$(BINARY): $(SOURCES) $(HEADERS) $(SHADER_HEADER) $(ZMATOBJS)
+	@mkdir -p $(BINDIR)
+	$(CXX) $(CXXFLAGS) -o $@ $(SOURCES) $(ZMATOBJS) $(LDFLAGS)
 	@echo "Built: $@"
 
-$(SHADER_HEADER): $(SHADER)
-	xxd -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
-	@echo "Built: $@"
+zmat/zmatlib.o: zmat/zmatlib.c zmat/zmatlib.h
+	$(CC) $(CFLAGS) $(ZMATFLAGS) -c -o $@ $<
+
+zmat/miniz/miniz.o: zmat/miniz/miniz.c zmat/miniz/miniz.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# one SPIR-V per variant; *_i64 variants use native 64-bit integer atomics
+vkmmc_core_%_i64.spv: $(COMP_SRC)
+	$(GLSLC) $(GLSLFLAGS) $(VARIANT_$*) -DUSE_ATOMIC_INT64 -o $@ $<
+
+vkmmc_core_%.spv: $(COMP_SRC)
+	$(GLSLC) $(GLSLFLAGS) $(VARIANT_$*) -o $@ $<
+
+$(SHADER_HEADER): $(SPVS)
+	@echo "/* generated by the Makefile from $(COMP_SRC), do not edit */" > $@
+	@for f in $(SPVS); do $(XXD) -i $$f | sed 's/^unsigned char/alignas(4) static const unsigned char/; s/^unsigned int/static const unsigned int/' >> $@; done
+	@echo "Built: $@ ($(words $(SPVS)) kernel variants)"
 
 vkmmc_show_vert.spv: vkmmc_show.vert
-	glslangValidator --target-env vulkan1.2 -e main -S vert -o $@ $<
+	$(GLSLC) $(GLSLFLAGS) -S vert -o $@ $<
 
 vkmmc_show_frag.spv: vkmmc_show.frag
-	glslangValidator --target-env vulkan1.2 -e main -S frag -o $@ $<
-
-vkmmc_show_vert_spv.h: vkmmc_show_vert.spv
-	xxd -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
-
-vkmmc_show_frag_spv.h: vkmmc_show_frag.spv
-	xxd -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
+	$(GLSLC) $(GLSLFLAGS) -S frag -o $@ $<
 
 vkmmc_show_vol_vert.spv: vkmmc_show_vol.vert
-	glslangValidator --target-env vulkan1.2 -e main -S vert -o $@ $<
+	$(GLSLC) $(GLSLFLAGS) -S vert -o $@ $<
 
 vkmmc_show_vol_frag.spv: vkmmc_show_vol.frag
-	glslangValidator --target-env vulkan1.2 -e main -S frag -o $@ $<
+	$(GLSLC) $(GLSLFLAGS) -S frag -o $@ $<
 
-vkmmc_show_vol_vert_spv.h: vkmmc_show_vol_vert.spv
-	xxd -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
+%_spv.h: %.spv
+	$(XXD) -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
 
-vkmmc_show_vol_frag_spv.h: vkmmc_show_vol_frag.spv
-	xxd -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
+test: $(BINARY)
+	cd ../test && ./testvkmmc.sh ../bin/vkmmc
 
-host: $(BINARY)
+unittest:
+	$(MAKE) -C ../test/unit run
 
-# Force shader rebuild when flags change
-SHADER_FLAGS_FILE = .shader_flags
-CURRENT_FLAGS := $(GLSLFLAGS)
-
-.PHONY: check_flags
-check_flags:
-	@echo '$(CURRENT_FLAGS)' | cmp -s - $(SHADER_FLAGS_FILE) || echo '$(CURRENT_FLAGS)' > $(SHADER_FLAGS_FILE)
-
-$(SHADER): $(COMP_SRC) check_flags $(SHADER_FLAGS_FILE)
-	$(GLSLC) $(GLSLFLAGS) -o $@ $<
-	@echo "Built: $@ (flags: $(GLSLFLAGS))"
-
-shader: $(SHADER)
-
-shader-nvidia: $(COMP_SRC)
-	sed 's|^//#define USE_ATOMIC_FLOAT|#define USE_ATOMIC_FLOAT|' $< > _mc_nvidia.comp
-	$(GLSLC) $(GLSLFLAGS) -o $(SHADER) _mc_nvidia.comp
-	@rm -f _mc_nvidia.comp
-	xxd -i $(SHADER) | sed 's/^unsigned char/alignas(4) unsigned char/' > $(SHADER_HEADER)
-	@echo "Built: $(SHADER) (NVIDIA atomicAdd float)"
+fuzz:
+	$(MAKE) -C ../test/fuzz
 
 listgpu: $(BINARY)
-	./$(BINARY) -L
-
-run: $(BINARY) $(SHADER)
-	./$(BINARY) -f $(INPUT) -n $(NPHOTON) -G $(GPUID)
+	$(BINARY) -L
 
 clean:
-	rm -f $(BINARY) $(SHADER) $(SHADER_HEADER) _mc_nvidia.comp .shader_flags *.jdat *.o \
+	rm -f $(BINARY) $(SPVS) $(SHADER_HEADER) $(ZMATOBJS) .shader_flags *.jdat \
 	    vkmmc_show_vert.spv vkmmc_show_frag.spv vkmmc_show_vert_spv.h vkmmc_show_frag_spv.h \
 	    vkmmc_show_vol_vert.spv vkmmc_show_vol_frag.spv \
 	    vkmmc_show_vol_vert_spv.h vkmmc_show_vol_frag_spv.h
-
-miniz/miniz.c:
-	@echo "Error: miniz.c not found. Download from https://github.com/richgel999/miniz"
-	@exit 1
-
-nlohmann/json.hpp:
-	@echo "Error: nlohmann/json.hpp not found."
-	@exit 1
 
 pretty:
 	astyle \
@@ -166,4 +151,4 @@ pretty:
 	    --suffix=none \
 	    --formatted \
 	    --break-blocks \
-	   "*.h" "*.cpp" "*.comp"
+	   "vkmmc*.h" "*.cpp" "*.comp"
