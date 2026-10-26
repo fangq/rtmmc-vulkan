@@ -176,9 +176,9 @@ No build option selects the simulation mode: the mesh, CSG and
 CSG+curvature kernels are all compiled and embedded, and the one matching the
 input is used. The source settings (type, focus, patterns, multiple sources)
 are compile-time constants of the kernel, set when it is loaded (Vulkan
-specialization constants, OptiX bound values): the GPU driver compiles only
-the source code a run uses, so the many source types cost a pencil beam
-nothing.
+specialization constants, OptiX bound values), as are `DoSpecular` and a
+known initial medium: the GPU driver compiles only the source code a run
+uses, so the many source types cost a pencil beam nothing.
 
 
 Running Simulations
@@ -218,6 +218,7 @@ The run prints the absorbed fraction and the speed, and saves the volume to
 | `-E/--seed int` | RNG seed; 0 seeds from the clock | `Session.RNGSeed` |
 | `-O/--outputtype c` | `x` energy, `f` flux, `l` fluence | `Session.OutputType` |
 | `-b/--reflect 0\|1` | Fresnel reflection at refractive index mismatches | `Session.DoMismatch` |
+| `-V/--specular 0\|1` | Fresnel reflection where photons from outside enter the domain | `Session.DoSpecular` |
 | `-U/--normalize 0\|1` | normalize the output | `Session.DoNormalize` |
 | `-t/--thread num` | total GPU threads, rounded up to a multiple of 64 | 65536 |
 | `-B/--batch num` | photons per kernel launch (0: all at once) | 500000 |
@@ -241,10 +242,10 @@ embedded kernel, for kernel development. The environment variable
 
 The input is an MMC/MCX-style JSON file:
 
-* `Session`: `ID`, `Photons`, `RNGSeed`, `DoMismatch`, `DoNormalize`,
-  `OutputType` (`x`/`energy`, `f`/`flux`, `l`/`fluence`), `RussianRoulette`
-  (weight threshold, default 1e-6), `RussianRouletteSize` (10), `DebugFlag`,
-  `MaxJumpDebug`
+* `Session`: `ID`, `Photons`, `RNGSeed`, `DoMismatch`, `DoSpecular`,
+  `DoNormalize`, `OutputType` (`x`/`energy`, `f`/`flux`, `l`/`fluence`),
+  `RussianRoulette` (weight threshold, default 1e-6), `RussianRouletteSize`
+  (10), `DebugFlag` (a number or MCX's letters, e.g. `"M"`), `MaxJumpDebug`
 * `Forward`: `T0`, `T1`, `Dt` in seconds; the output has `round((T1-T0)/Dt)`
   time gates; energy deposited outside `[T0, T1)` is not recorded
 * `Domain`: `Media` (a list of `{mua, mus, g, n}` objects or `[mua, mus, g, n]`
@@ -256,8 +257,15 @@ The input is an MMC/MCX-style JSON file:
   [Sources](#sources)
 * `Shapes`: a list of CSG shapes, or a mesh object (see below)
 
-A source outside the domain launches photons toward it; they enter at the
-first surface they hit, with Fresnel reflection when the indices differ.
+A source outside the domain launches photons toward it, as in MCX: they
+enter at the first surface they hit, after the time of flight through the
+background; with `DoSpecular` they are reflected there by Fresnel's law
+(the default, as MCX and MMC, is no reflection or refraction at the entry;
+in a mesh with MMC's negative wide-field labels, where the photons cross a
+real surface, `DoMismatch` applies there). Photons that miss the domain are launched again, so
+the launched energy counts the photons that enter. A source on a surface is
+inside the tissue there: a photon pointing out of it meets the boundary
+(Fresnel reflection with `DoMismatch`).
 
 ### Sources
 
@@ -294,16 +302,17 @@ same `Param1`/`Param2` conventions (see the MCX documentation for details):
   `SrcNum` > 1, simulates SrcNum patterns with the same photons; the output has
   one field per pattern.
 * Multiple sources: `Pos`, `Dir`, `Param1`, `Param2` given as lists of rows
-  (a single row applies to all); `Pos[3]` is the source weight (default 1) and
-  `Param1[0]` an optional disk radius. `ID` 0 (or -1) launches each photon
-  from a random source and saves one field per source, `ID` k simulates
-  source k only.
+  (a single row applies to all), each row a source of `Type` with its own
+  parameters as in MCX; `Pos[3]` is the source weight (default 1), and for
+  `pencil` rows `Param1[0]` is an optional disk radius (as mmc-optix). `ID` 0
+  (or -1) launches each photon from a random source and saves one field per
+  source, `ID` k simulates source k only. An isotropic (`"_NaN_"`) or
+  Lambertian (`"-_Inf_"`) `Dir[3]` must be the same for all rows.
 * The output is normalized by the launched energy (the sum of the launch
   weights; per pattern for shared patterns), and the printed absorbed
   fraction is relative to it.
 * `InitElem` gives the initial medium of a single source with a fixed launch
-  direction; otherwise the medium is found per photon, so a source on the
-  surface loses the photons that point out of it.
+  direction; otherwise the medium is found per photon.
 
 Differences to mmc's OptiX backend: the `cone`, `arcsine` and `zgaussian`
 directions are rotated to `Dir` (as in mmc's CPU and MCX; mmc-optix leaves
