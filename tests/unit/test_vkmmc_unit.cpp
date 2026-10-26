@@ -1291,8 +1291,17 @@ TEST(config_mesh_errors) {
     bad["Shapes"]["MeshElem"][1][4] = 3;    /* 3 media: labels 0..2 */
     CHECK_THROWS(load_json_config(bad), "Shapes.MeshElem row 2: label 3.000000 is not an integer in [0, 2]");
     bad = j;
+    bad["Shapes"]["MeshElem"][1][4] = -1;   /* MMC wide-field domain: the background */
+    SimConfig neg = load_json_config(bad);
+    bad["Shapes"]["MeshElem"][1][4] = 0;
+    SimConfig zero = load_json_config(bad);
+    CHECK(neg.faces.size() == zero.faces.size() && neg.faces == zero.faces);
     bad["Shapes"]["MeshElem"][1][4] = -1;
-    CHECK_THROWS(load_json_config(bad), "label");
+    bad["Shapes"]["InitElem"] = 2;          /* source in the background: probed like no InitElem */
+    CHECK(load_json_config(bad).mediumid0 == 0xFFFFFFFFu);
+    bad = j;
+    bad["Shapes"]["MeshROI"] = json::array({json::array({0, 0, 0, 0, 0, 0})});
+    CHECK_THROWS(load_json_config(bad), "Shapes.MeshROI");
     bad = j;
     bad["Shapes"]["MeshElem"][1][4] = 1.5;
     CHECK_THROWS(load_json_config(bad), "label 1.500000 is not an integer");

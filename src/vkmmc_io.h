@@ -1089,6 +1089,7 @@ static std::vector<int32_t> load_elems(const json& me, size_t nnodes, size_t nno
     size_t cols = 0;
     std::vector<double> d = load_table(me, nnode_cols + 1, count, cols, ctx);
     std::vector<int32_t> out(count * (nnode_cols + 1));
+    size_t nneg = 0;
 
     for (size_t i = 0; i < count; i++) {
         for (size_t j = 0; j < nnode_cols; j++) {
@@ -1104,12 +1105,22 @@ static std::vector<int32_t> load_elems(const json& me, size_t nnodes, size_t nno
 
         double lab = d[i * cols + cols - 1];
 
-        if (!(lab >= 0 && lab <= (double)maxlabel) || lab != std::floor(lab)) {
+        /* negative labels (MMC's wide-field source/detector domains, -1/-2) are
+           not tissue: they are treated as the background, medium 0 */
+        if (!(lab >= -65535 && lab <= (double)maxlabel) || lab != std::floor(lab)) {
             vkmmc_fail(ctx + " row " + std::to_string(i + 1) + ": label " + std::to_string(lab) +
-                       " is not an integer in [0, " + std::to_string(maxlabel) + "]");
+                       " is not an integer in [0, " + std::to_string(maxlabel) + "] (or negative for the background)");
         }
 
-        out[i * (nnode_cols + 1) + nnode_cols] = (int32_t)lab;
+        if (lab < 0) {
+            nneg++;
+        }
+
+        out[i * (nnode_cols + 1) + nnode_cols] = (int32_t)std::max(lab, 0.0);
+    }
+
+    if (nneg) {
+        printf("%s: %zu rows with a negative label are treated as the background (medium 0)\n", ctx.c_str(), nneg);
     }
 
     return out;
@@ -1312,6 +1323,7 @@ static SimConfig load_json_config(const json& j) {
                                                  "Shapes.MeshSurf");
             load_mesh_surf(cfg.nodes, sd.data(), nf, cfg.faces, cfg.facedata);
         } else if (shapes.contains("MeshElem")) {
+            vkmmc_require(!shapes.contains("MeshROI"), "Shapes.MeshROI (implicit MMC edges, nodes and faces) is not supported");
             elem = load_elems(shapes["MeshElem"], cfg.nodes.size(), 4, max_label(cfg), elem_count,
                               "Shapes.MeshElem");
             printf("MeshElem: %zu tetrahedra\n", elem_count);
@@ -1332,6 +1344,13 @@ static SimConfig load_json_config(const json& j) {
                 vkmmc_require(cfg.init_elem <= (int)elem_count, "Shapes.InitElem is larger than the element count");
                 cfg.mediumid0 = (uint32_t)elem[(size_t)(cfg.init_elem - 1) * 5 + 4];
                 printf("InitElem: %d, medium type: %u\n", cfg.init_elem, cfg.mediumid0);
+
+                /* a background element (e.g. MMC's wide-field source domain): the
+                   photon is launched outside the tissue and enters the first
+                   surface it points at, as with no InitElem */
+                if (cfg.mediumid0 == 0) {
+                    cfg.mediumid0 = 0xFFFFFFFFu;
+                }
             }
         }
     }
