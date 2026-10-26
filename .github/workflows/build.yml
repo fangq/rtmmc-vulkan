@@ -58,6 +58,58 @@ jobs:
         run: ctest --test-dir build -LE gpu --output-on-failure
 
   # ---------------------------------------------------------------
+  # Windows (MSVC) and macOS (Intel and Apple Silicon): the LunarG Vulkan
+  # SDK, CMake build, unit and smoke tests. macOS has no Vulkan ray-query
+  # driver (MoltenVK lacks it), so no simulation runs there; on Windows the
+  # functional suite is tried on Mesa's lavapipe
+  # ---------------------------------------------------------------
+  cross:
+    name: CMake (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, macos-15-intel, macos-14]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          install_runtime: true
+          install_lavapipe: ${{ runner.os == 'Windows' }}
+          cache: true
+          stripdown: true
+      - name: Put the Vulkan loader and glslangValidator on PATH (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          echo "$(cygpath -u "$VULKAN_SDK")/Bin" >> "$GITHUB_PATH"
+          dll=$(find "$(cygpath -u "$VULKAN_SDK")/.." /c/VulkanSDK -name vulkan-1.dll 2>/dev/null | head -1)
+          echo "vulkan-1.dll: $dll"
+          [ -n "$dll" ] && dirname "$dll" >> "$GITHUB_PATH"
+      - name: Configure
+        run: cmake -S . -B build -DVKMMC_BUILD_OPTIX=OFF -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Unit and smoke tests
+        run: ctest --test-dir build -C Release -LE gpu --output-on-failure
+      - name: Functional tests on lavapipe (Windows, experimental)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: |
+          icd=$(find /c/lavapipe -name '*.json' 2>/dev/null | head -1)
+          echo "lavapipe ICD: $icd"
+          export VK_DRIVER_FILES="$(cygpath -w "$icd")" VK_ICD_FILENAMES="$(cygpath -w "$icd")"
+          # the scripts call python3
+          mkdir -p ~/bin && printf '#!/bin/sh\nexec python "$@"\n' > ~/bin/python3 && chmod +x ~/bin/python3
+          export PATH=~/bin:$PATH
+          exe=$(ls build/bin/Release/vkmmc.exe build/bin/vkmmc.exe 2>/dev/null | head -1)
+          "$exe" -L
+          cd tests && ./test_vkmmc.sh "../$exe"
+
+  # ---------------------------------------------------------------
   # The full functional suite on the CPU: Mesa's lavapipe implements
   # Vulkan ray query (tested with Mesa 25.0 and 26.0; here Ubuntu 26.04)
   # ---------------------------------------------------------------
