@@ -311,10 +311,11 @@ python3 tests/fuzz/fuzz_vkmmc.py bin/vkmmc --gpu -n 1000        # ... on the GPU
 
 * `tests/unit`: 58 tests (966 checks) of the JSON/JData parser, input
   validation, mesh extraction, shape triangulation, curvature, command line,
-  normalization and file output; about 97-100% line coverage of the host code
-* `tests/test_vkmmc.sh`: 38 GPU tests (80 checks) against analytic solutions
+  normalization and file output; 97-100% line coverage of the host headers
+* `tests/test_vkmmc.sh`: 39 GPU tests (86 checks) against analytic solutions
   (Beer-Lambert, Fresnel, time of flight), conservation identities and
-  equivalent inputs (mesh vs. CSG, every JData encoding, coplanar CSG faces)
+  equivalent inputs (mesh vs. CSG, every JData encoding, coplanar CSG faces);
+  they cover 98.9% of the lines of the Vulkan front-end `vkmmc.cpp`
 * `tests/fuzz`: libFuzzer harnesses for the input pipeline, the JData decoder
   and the command line, and a JSON-aware mutation fuzzer for the binaries
 

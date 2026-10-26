@@ -1047,6 +1047,41 @@ else
 fi
 
 # =============================================================================
+# TEST 39: GPU selection and user-supplied kernels (Vulkan)
+# =============================================================================
+log_test "GPU selection (-G) and user kernels (.spv)"
+if [ "$ISOPTIX" = 1 ]; then
+    log_skip "Vulkan only"
+else
+    SPV="$SCRIPT_DIR/../src/vkmmc_core_csg_i64.spv"
+    if run_sim t16.json t39a.log -E 1 -G 1 -s t39a; then
+        check_close "$(get_absorbed t39a.log)" "$(get_absorbed t16.log)" 1e-5 "-G 1 selects the first usable GPU"
+    else
+        log_fail "-G 1 failed"
+    fi
+    run_sim t16.json t39b.log -G 99
+    [ $? = 1 ] && grep -q "usable GPU" "$TESTDIR/t39b.log" && log_pass "-G 99 rejected" || log_fail "-G 99 not rejected"
+    if [ -f "$SPV" ] && grep -q "64-bit atomics" "$TESTDIR/t16.log"; then
+        if run_sim t16.json t39c.log -E 1 -c 0 -s t39c "$SPV"; then
+            grep -q "user supplied" "$TESTDIR/t39c.log" && check_close "$(get_absorbed t39c.log)" "$(get_absorbed t16.log)" 1e-5 \
+                "User .spv kernel = embedded kernel" || log_fail "user kernel not used"
+        else
+            log_fail "user kernel run failed"
+        fi
+    else
+        log_skip "no $SPV for this GPU (64-bit atomics needed)"
+    fi
+    printf 'not a kernel' > "$TESTDIR/bad.spv"
+    run_sim t16.json t39d.log "$TESTDIR/bad.spv"
+    [ $? = 1 ] && grep -q "not a SPIR-V binary" "$TESTDIR/t39d.log" && log_pass "invalid .spv rejected" || log_fail "invalid .spv not rejected"
+    head -c 64 /dev/zero > "$TESTDIR/zero.spv"
+    run_sim t16.json t39e.log "$TESTDIR/zero.spv"
+    [ $? = 1 ] && grep -q "bad magic" "$TESTDIR/t39e.log" && log_pass "bad SPIR-V magic rejected" || log_fail "bad magic not rejected"
+    run_sim t16.json t39f.log "$TESTDIR/missing.spv"
+    [ $? = 1 ] && grep -q "cannot open SPIR-V" "$TESTDIR/t39f.log" && log_pass "missing .spv rejected" || log_fail "missing .spv not rejected"
+fi
+
+# =============================================================================
 echo ""
 echo "============================================================"
 echo -e " Results: ${TOTAL} tests; checks: ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC}, ${YELLOW}${SKIP} skipped${NC}"
