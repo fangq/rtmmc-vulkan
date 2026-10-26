@@ -82,6 +82,7 @@ jobs:
           install_lavapipe: ${{ runner.os == 'Windows' }}
           cache: true
           stripdown: true
+          github_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Put the Vulkan loader and glslangValidator on PATH (Windows)
         if: runner.os == 'Windows'
         run: |
