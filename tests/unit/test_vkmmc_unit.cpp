@@ -995,12 +995,16 @@ TEST(small_parsers) {
     CHECK(parse_srctype("slit") == SRC_SLIT);
     CHECK(parse_srctype("") == -1);
     CHECK(parse_srctype("laser") == -1);
-    CHECK(srctype_supported(SRC_PENCIL) && srctype_supported(SRC_PLANAR) && srctype_supported(SRC_DISK));
-    CHECK(!srctype_supported(SRC_ISOTROPIC) && !srctype_supported(SRC_CONE));
+    CHECK(parse_srctype("Ring") == SRC_RING && parse_srctype("HYPERBOLOID") == SRC_HYPERBOLOID);
+
+    for (int t = 0; t < SRC_TYPE_COUNT; t++) {
+        CHECK(parse_srctype(srctype_name(t)) == t);   /* every MCX/MMC type round-trips */
+    }
+
     CHECK(std::string(srctype_name(SRC_PENCIL)) == "pencil");
-    CHECK(std::string(srctype_name(SRC_PLANAR)) == "planar");
-    CHECK(std::string(srctype_name(SRC_DISK)) == "disk");
-    CHECK(std::string(srctype_name(SRC_CONE)) == "unknown");
+    CHECK(std::string(srctype_name(SRC_PATTERN3D)) == "pattern3d");
+    CHECK(std::string(srctype_name(SRC_TYPE_COUNT)) == "unknown");
+    CHECK(std::string(srctype_name(-1)) == "unknown");
     CHECK(std::string(kernel_variant_name(KV_MESH)) == "mesh");
     CHECK(std::string(kernel_variant_name(KV_CSG_CURV)) == "csg+curvature");
     CHECK(std::string(kernel_variant_name(7)) == "unknown");
@@ -1157,15 +1161,16 @@ TEST(config_validation_errors) {
     CHECK_CFG_THROWS(b, R"({"Domain": {"MeshRes": 4096}})", "Domain.MeshRes=4096 is out of range");
     CHECK_CFG_THROWS(b, R"({"Optode": {"Source": 3}})", "Optode.Source must be an object");
     CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "laser"}}})", "Optode.Source.Type 'laser' is not a known source type");
-    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "isotropic"}}})", "'isotropic' is not supported yet");
-    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "cone"}}})", "not supported yet");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "cone"}}})", "Param1[0] (the cone half angle) must be positive");
     CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Pos": [1, 2]}}})", "Optode.Source.Pos needs at least 3 numbers");
     CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Pos": [1, 2, "z"]}}})", "Optode.Source.Pos[2] must be a number");
     CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Dir": [0, 0, 0]}}})", "Optode.Source.Dir must be a non-zero vector");
     CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Dir": [1, 0]}}})", "Optode.Source.Dir needs at least 3 numbers");
-    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Param1": []}}})", "Optode.Source.Param1 needs at least 1 numbers");
-    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Param2": "x"}}})", "Optode.Source.Param2 must be an array");
-    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "disk", "Param1": [-1]}}})", "disk radius) must be non-negative");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Param1": []}}})", "Optode.Source.Param1 must be a non-empty array");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Param1": [[]]}}})", "Optode.Source.Param1[0] needs at least 1 numbers");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Param2": "x"}}})", "Optode.Source.Param2 must be a non-empty array");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Param2": [1, 2, 3, 4, 5]}}})", "Optode.Source.Param2 has more than 4 numbers");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "disk", "Param1": [-1]}}})", "(radii) must be non-negative");
     CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": 5}}})", "Optode.Source.Type must be a string");
     CHECK_CFG_THROWS(b, R"({"Shapes": null})", "input requires 'Shapes'");
     CHECK_CFG_THROWS(b, R"({"Shapes": []})", "Shapes is an empty array");
@@ -1210,7 +1215,220 @@ TEST(config_source) {
     CHECK(c.srctype == SRC_PENCIL && c.srcpos[0] == 0 && c.srcdir[2] == 1);
 }
 
-static json cube_mesh_json(int label2 = 2) {
+static json cube_mesh_json(int label2 = 2);
+
+TEST(config_source_types) {
+    json b = base_csg();
+    /* every MCX/MMC source type loads with sensible parameters */
+    const char* ok[] = {
+        R"({"Type": "pencil"})", R"({"Type": "isotropic"})", R"({"Type": "cone", "Param1": [0.5]})",
+        R"({"Type": "gaussian", "Param1": [3]})", R"({"Type": "planar", "Param1": [10, 0, 0], "Param2": [0, 10, 0]})",
+        R"({"Type": "pattern", "Param1": [10, 0, 0, 2], "Param2": [0, 10, 0, 2], "Pattern": {"Nx": 2, "Ny": 2, "Data": [1, 0, 0.5, 0.25]}})",
+        R"({"Type": "fourier", "Param1": [10, 0, 0, 2], "Param2": [0, 10, 0, 1.5]})", R"({"Type": "arcsine"})",
+        R"({"Type": "disk", "Param1": [5]})", R"({"Type": "fourierx", "Param1": [10, 0, 0, 10], "Param2": [1, 2, 0, 0.5]})",
+        R"({"Type": "fourierx2d", "Param1": [10, 0, 0, 10], "Param2": [1, 2, 0, 0]})", R"({"Type": "zgaussian", "Param1": [0.2]})",
+        R"({"Type": "line", "Param1": [10, 0, 0]})", R"({"Type": "slit", "Param1": [10, 0, 0]})",
+        R"({"Type": "pencilarray", "Param1": [10, 0, 0, 3], "Param2": [0, 10, 0, 1]})",
+        R"({"Type": "pattern3d", "Param1": [2, 1, 2], "Pattern": {"Nx": 2, "Ny": 1, "Nz": 2, "Data": [1, 2, 3, 4]}})",
+        R"({"Type": "hyperboloid", "Param1": [1, 5, 2]})", R"({"Type": "ring", "Param1": [5, 2, 0, 3.14]})"
+    };
+
+    for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+        json j = b;
+        j["Optode"]["Source"] = J(ok[i]);
+        j["Optode"]["Source"]["Pos"] = J("[30, 30, 0]");
+        SimConfig c = load_json_config(j);
+        CHECK(c.srctype == (int)i && c.srcnum == 1 && c.extrasrc.empty() && c.srcid == 0);
+        CHECK(src_fields(c) == 1);
+    }
+
+    /* parameter checks */
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "cone", "Param1": [-0.1]}}})", "cone half angle");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "ring", "Param1": [5, -1]}}})", "(radii) must be non-negative");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "gaussian", "Param1": [-1]}}})", "(the width) must be non-negative");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "hyperboloid", "Param1": [1, 2, -1]}}})", "Rayleigh range");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "pencilarray", "Param1": [10, 0, 0, 0], "Param2": [0, 1, 0, 2]}}})",
+                     "(the beam counts) must be positive integers");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "pencilarray", "Param1": [10, 0, 0, 2.5], "Param2": [0, 1, 0, 2]}}})",
+                     "(the beam counts) must be positive integers");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "fourierx", "Param1": [0, 0, 0, 1]}}})", "Param1[0..2] must be a non-zero vector");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "line"}}})", "Param1[0..2] (the segment) must be a non-zero vector");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "slit", "Param1": [1, 0, 0], "Param2": [0, -1]}}})", "Param2[0..1] must be non-negative");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "fourierx", "Param1": [1, 0, 0, 1], "Param2": [1, 1, 0, 3]}}})",
+                     "(the modulation depth M) must be in [0, 2]");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "pattern", "Param1": [1, 0, 0, 2], "Param2": [0, 1, 0, 2]}}})",
+                     "requires Optode.Source.Pattern");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "pattern", "Param1": [1, 0, 0, 0], "Param2": [0, 1, 0, 2]}}})",
+                     "(the pattern size) must be positive integers");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "pattern3d", "Param1": [2, 2, 0.5]}}})", "(the pattern size) must be positive integers");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "disk", "SrcNum": 2}}})", "SrcNum > 1 requires a pattern or pattern3d source");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"SrcNum": 0}}})", "Optode.Source.SrcNum=0 is out of range");
+
+    /* focal length: a number or the JData NaN/Inf strings, never normalized */
+    SimConfig c = load_json_config(patched(b, R"({"Optode": {"Source": {"Dir": [0, 0, 2, "_NaN_"]}}})"));
+    CHECK(std::isnan(c.srcdir[3]) && c.srcdir[2] == 1.0f);
+    c = load_json_config(patched(b, R"({"Optode": {"Source": {"Dir": [0, 0, 1, "-_Inf_"]}}})"));
+    CHECK(std::isinf(c.srcdir[3]) && c.srcdir[3] < 0);
+    c = load_json_config(patched(b, R"({"Optode": {"Source": {"Dir": [0, 0, 1, "_Inf_"]}}})"));
+    CHECK(std::isinf(c.srcdir[3]) && c.srcdir[3] > 0);
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Dir": [0, 0, 1, "inf"]}}})", "Optode.Source.Dir[3] must be a number (or");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Dir": [0, "_NaN_", 1]}}})", "Optode.Source.Dir[1] must be a number");
+    CHECK(kernel_focus_mode(0) == 0 && kernel_focus_mode(INFINITY) == 0 && kernel_focus_mode(-5) == 1);
+    CHECK(kernel_focus_mode(NAN) == 2 && kernel_focus_mode(-INFINITY) == 3);
+
+    /* a 4th Pos element (the weight) is accepted and ignored for a single source */
+    c = load_json_config(patched(b, R"({"Optode": {"Source": {"Pos": [1, 2, 3, 0.5]}}})"));
+    CHECK(c.srcpos[2] == 3 && c.extrasrc.empty());
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Pos": [1, 2, 3e7]}}})", "Optode.Source.Pos is beyond +-1e6");
+
+    /* the initial medium: InitElem only for sources with a fixed launch direction */
+    json m = cube_mesh_json();
+    m["Shapes"]["InitElem"] = 1;
+    c = load_json_config(m);
+    CHECK(kernel_initial_medium(c) == 1);
+    m["Optode"]["Source"]["Type"] = "isotropic";
+    CHECK(kernel_initial_medium(load_json_config(m)) == 0xFFFFFFFFu);
+    m["Optode"]["Source"]["Type"] = "planar";
+    m["Optode"]["Source"]["Dir"] = J(R"([0, 0, 1, "-_Inf_"])");
+    CHECK(kernel_initial_medium(load_json_config(m)) == 0xFFFFFFFFu);
+}
+
+TEST(config_multi_source) {
+    json b = base_csg();
+    SimConfig c = load_json_config(patched(b, R"({"Optode": {"Source": {"Type": "pencil",
+        "Pos": [[1, 2, 3, 0.5], [4, 5, 6]], "Dir": [[0, 0, 2, 7], [3, 0, 4]], "Param1": [2], "ID": 0}}})"));
+    CHECK(c.extrasrc.size() == 2 && c.srcid == -1 && src_fields(c) == 2);
+    CHECK(c.srcpos[0] == 1 && c.srcdir[3] == 7);                       /* row 0 is also the main source */
+    CHECK(c.extrasrc[0].pos[3] == 0.5f && c.extrasrc[1].pos[3] == 1.0f); /* the weight defaults to 1 */
+    CHECK(c.extrasrc[1].pos[0] == 4 && c.extrasrc[1].dir[0] == 0.6f && c.extrasrc[1].dir[2] == 0.8f);
+    CHECK(c.extrasrc[0].param1[0] == 2 && c.extrasrc[1].param1[0] == 2); /* a single row applies to all */
+    std::vector<float> ks = kernel_extrasrc(c);
+    CHECK(ks.size() == 32 && ks[16] == 4 && ks[7] == 7 && ks[8] == 2);
+    CHECK(kernel_initial_medium(c) == 0xFFFFFFFFu);
+
+    /* ID k: source k only, one field; -1 like 0 */
+    c = load_json_config(patched(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3], [4, 5, 6], [7, 8, 9]], "ID": 3}}})"));
+    CHECK(c.extrasrc.size() == 3 && c.srcid == 3 && src_fields(c) == 1);
+    c = load_json_config(patched(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3], [4, 5, 6]], "ID": -1}}})"));
+    CHECK(c.srcid == -1 && src_fields(c) == 2);
+    c = load_json_config(patched(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3]]}}})"));
+    CHECK(c.extrasrc.size() == 1 && c.srcid == -1);
+    c = load_json_config(patched(b, R"({"Optode": {"Source": {"ID": 2}}})"));   /* no list: ignored */
+    CHECK(c.extrasrc.empty() && c.srcid == 0);
+    /* a non-finite focal length is not passed to the kernels of a multi-source run */
+    c = load_json_config(patched(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3]], "Dir": [[0, 0, 1, "_NaN_"]]}}})"));
+    CHECK(kernel_extrasrc(c)[7] == 0);
+
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3], [4, 5, 6]], "Dir": [[0, 0, 1], [0, 0, 1], [0, 0, 1]]}}})",
+                     "Pos, Dir, Param1 and Param2 must have the same number of rows");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3], [4, 5, 6]], "ID": 3}}})", "Optode.Source.ID is larger than");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3]], "ID": -2}}})", "Optode.Source.ID must be -1, 0 or");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3, -1]]}}})", "Optode.Source.Pos[0][3] (the source weight)");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3], [4, 5]]}}})", "Optode.Source.Pos[1] needs at least 3 numbers");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3]], "Dir": [[0, 0, 0]]}}})", "Optode.Source.Dir must be a non-zero vector");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3]], "Param1": [[-1]]}}})", "(the disk radius) must be non-negative");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "pattern", "SrcNum": 2, "Pos": [[1, 2, 3]], "Param1": [1, 0, 0, 1],
+        "Param2": [0, 1, 0, 1], "Pattern": {"Nx": 1, "Ny": 1, "Data": [1, 1]}}}})", "cannot be combined");
+}
+
+TEST(config_pattern) {
+    json b = base_csg();
+    /* JData [Nx, Ny], row-major in the file, read with the first index fastest as MMC does */
+    std::vector<float> p = {1, 2, 3, 4, 5, 6};   /* [3][2]: p[x][y] */
+    json j = b;
+    j["Optode"]["Source"] = J(R"({"Type": "pattern", "Param1": [30, 0, 0, 3], "Param2": [0, 20, 0, 2]})");
+    j["Optode"]["Source"]["Pattern"] = jdata_encode("single", {3, 2}, p.data(), p.size() * sizeof(float));
+    SimConfig c = load_json_config(j);
+    CHECK(c.srcnum == 1 && c.srcpattern.size() == 6);
+    /* pixel (x, y) at x + 3 y */
+    CHECK(c.srcpattern[0] == 1 && c.srcpattern[1] == 3 && c.srcpattern[2] == 5 && c.srcpattern[3] == 2 && c.srcpattern[5] == 6);
+
+    /* [SrcNum, Nx, Ny] sets SrcNum; the patterns of a pixel are adjacent */
+    std::vector<float> q(2 * 3 * 2);
+
+    for (size_t i = 0; i < q.size(); i++) {
+        q[i] = (float)i;   /* row-major [k][x][y]: k*6 + x*2 + y */
+    }
+
+    j["Optode"]["Source"]["Pattern"] = jdata_encode("single", {2, 3, 2}, q.data(), q.size() * sizeof(float));
+    c = load_json_config(j);
+    CHECK(c.srcnum == 2 && src_fields(c) == 2 && c.srcpattern.size() == 12);
+    bool ok = true;
+
+    for (int k = 0; k < 2; k++)
+        for (int x = 0; x < 3; x++)
+            for (int y = 0; y < 2; y++) {
+                ok &= c.srcpattern[(y * 3 + x) * 2 + k] == (float)(k * 6 + x * 2 + y);
+            }
+
+    CHECK(ok);
+    /* a column-major file gives the same pattern */
+    json cm = j;
+    cm["Optode"]["Source"]["Pattern"] = jdata_encode("single", {2, 3, 2}, c.srcpattern.data(), 12 * sizeof(float), false);
+    CHECK(load_json_config(cm).srcpattern == c.srcpattern);
+
+    /* {Nx, Ny, Data}: Data in kernel order, SrcNum from the source */
+    j["Optode"]["Source"]["SrcNum"] = 2;
+    j["Optode"]["Source"]["Pattern"] = J(R"({"Nx": 3, "Ny": 2, "Data": [0,1,2,3,4,5,6,7,8,9,10,11]})");
+    c = load_json_config(j);
+    CHECK(c.srcnum == 2 && c.srcpattern[11] == 11 && c.srcpattern[4] == 4);
+
+    /* Data from a float32 file */
+    std::string fn = tmpfile_path("pattern.bin");
+    {
+        std::ofstream f(fn.c_str(), std::ios::binary);
+        std::vector<float> d(12, 0.25f);
+        f.write(reinterpret_cast<const char*>(d.data()), 48);
+    }
+    j["Optode"]["Source"]["Pattern"] = {{"Nx", 3}, {"Ny", 2}, {"Data", fn}};
+    c = load_json_config(j);
+    CHECK(c.srcpattern.size() == 12 && c.srcpattern[7] == 0.25f);
+
+    json e = j;
+    e["Optode"]["Source"]["Pattern"] = J(R"({"Nx": 3, "Ny": 2, "Data": [1, 2]})");
+    CHECK_THROWS(load_json_config(e), "Data must hold Nx*Ny*Nz*SrcNum numbers");
+    e["Optode"]["Source"]["Pattern"] = {{"Nx", 3}, {"Ny", 4}, {"Data", fn}};
+    CHECK_THROWS(load_json_config(e), "the file is too short");
+    e["Optode"]["Source"]["Pattern"] = {{"Nx", 3}, {"Ny", 2}, {"Data", fn + ".none"}};
+    CHECK_THROWS(load_json_config(e), "cannot open");
+    e["Optode"]["Source"]["Pattern"] = J(R"({"Nx": 3, "Ny": 2, "Data": [0,1,2,3,4,5,6,7,8,9,10,-1]})");
+    CHECK_THROWS(load_json_config(e), "Optode.Source.Pattern values must be in [0, 1000]");
+    e["Optode"]["Source"]["Pattern"] = J(R"({"Ny": 2, "Data": [1]})");
+    CHECK_THROWS(load_json_config(e), "Optode.Source.Pattern.Nx=0 is out of range");
+    e["Optode"]["Source"]["Pattern"] = J("[1, 2]");
+    CHECK_THROWS(load_json_config(e), "Optode.Source.Pattern must be a JData array or an object");
+    e["Optode"]["Source"]["SrcNum"] = 1;
+    e["Optode"]["Source"]["Pattern"] = jdata_encode("single", {2, 2}, p.data(), 4 * sizeof(float));
+    CHECK_THROWS(load_json_config(e), "Optode.Source.Pattern must hold 6 x SrcNum values");
+
+    /* source_json writes a pattern that loads back unchanged */
+    j["Optode"]["Source"]["Pattern"] = jdata_encode("single", {2, 3, 2}, q.data(), q.size() * sizeof(float));
+    j["Optode"]["Source"].erase("SrcNum");
+    c = load_json_config(j);
+    json r = b;
+    r["Optode"]["Source"] = source_json(c, true);
+    SimConfig c2 = load_json_config(r);
+    CHECK(c2.srcnum == 2 && c2.srcpattern == c.srcpattern && c2.srctype == SRC_PATTERN && c2.srcparam1[3] == 3);
+    CHECK(source_json(c, false)["PatternSize"] == J("[2, 3, 2]"));
+}
+
+TEST(source_json_round_trip) {
+    json b = base_csg();
+    SimConfig c = load_json_config(patched(b, R"({"Optode": {"Source": {"Type": "disk",
+        "Pos": [[1, 2, 3, 0.5], [4, 5, 6, 1]], "Dir": [[0, 0, 1, "_NaN_"], [0, 0, 1, -3]], "Param1": [[2], [3]], "ID": 2}}})"));
+    json r = b;
+    r["Optode"]["Source"] = source_json(c, true);
+    SimConfig c2 = load_json_config(r);
+    CHECK(c2.extrasrc.size() == 2 && c2.srcid == 2 && c2.extrasrc[1].dir[3] == -3 && std::isnan(c2.extrasrc[0].dir[3]));
+    CHECK(c2.extrasrc[0].pos[3] == 0.5f && c2.extrasrc[1].param1[0] == 3);
+    c = load_json_config(patched(b, R"({"Optode": {"Source": {"Type": "ring", "Dir": [0, 0, 1, "-_Inf_"], "Param1": [5, 2, 1, 2]}}})"));
+    r["Optode"]["Source"] = source_json(c, false);
+    CHECK(r["Optode"]["Source"]["Dir"][3] == "-_Inf_");
+    c2 = load_json_config(r);
+    CHECK(c2.srctype == SRC_RING && std::isinf(c2.srcdir[3]) && c2.srcparam1[2] == 1);
+}
+
+static json cube_mesh_json(int label2) {
     std::vector<Vec3> n = cube_nodes();
     std::vector<int32_t> e = cube_elems(label2);
     json j = base_csg();
@@ -2676,6 +2894,9 @@ static OutputGrid small_grid(uint32_t nx, uint32_t ny, uint32_t nz, int nt, floa
     g.gmax[0] = g.gmax[1] = g.gmax[2] = 10;
     g.nvox = (uint64_t)nx * ny * nz;
     g.nelem = g.nvox * nt;
+    g.nfield = 1;
+    g.nlaunch = 1;
+    g.nout = g.nelem + 1;
     return g;
 }
 
@@ -2752,6 +2973,53 @@ TEST(finalize_output_normalization) {
     CHECK(o[0] == 1.0f && o[1] == 0.0f);
 }
 
+TEST(finalize_output_fields) {
+    /* two patterns of a shared pattern source: each field normalized by its launched energy */
+    SimConfig c;
+    c.nphoton = 100;
+    c.srcnum = 2;
+    c.do_normalize = true;
+    c.output_type = OT_ENERGY;
+    OutputGrid g = small_grid(2, 1, 1, 1, 1.0f);
+    g.nfield = 2;
+    g.nlaunch = 2;
+    g.nout = 2 * g.nelem + 2;
+    std::vector<double> acc = {1, 2, 3, 4, 10, 40};   /* field 0, field 1, launched 0, launched 1 */
+    double absorbed = 0;
+    std::vector<float> o = finalize_output(c, g, acc, &absorbed);
+    CHECK(o.size() == 4);
+    CHECK_CLOSE(o[0], 0.1, 1e-7);
+    CHECK_CLOSE(o[1], 0.2, 1e-7);
+    CHECK_CLOSE(o[2], 3.0 / 40, 1e-7);
+    CHECK_CLOSE(o[3], 0.1, 1e-7);
+    CHECK_CLOSE(absorbed, 10.0 / 50, 1e-12);
+
+    /* sources of a multi-source run share the total */
+    c.srcnum = 1;
+    g.nlaunch = 1;
+    g.nout = 2 * g.nelem + 1;
+    acc = {1, 2, 3, 4, 20};
+    o = finalize_output(c, g, acc, &absorbed);
+    CHECK_CLOSE(o[0], 0.05, 1e-7);
+    CHECK_CLOSE(o[3], 0.2, 1e-7);
+    CHECK_CLOSE(absorbed, 0.5, 1e-12);
+
+    /* no launched energy: nothing to normalize by */
+    acc = {1, 2, 3, 4, 0};
+    o = finalize_output(c, g, acc, &absorbed);
+    CHECK(o[0] == 0 && absorbed == 0);
+    c.do_normalize = false;
+    o = finalize_output(c, g, acc);
+    CHECK(o[3] == 4);
+
+    /* a short accumulator: every photon of weight 1 */
+    acc = {1, 2, 3, 4};
+    c.do_normalize = true;
+    o = finalize_output(c, g, acc, &absorbed);
+    CHECK_CLOSE(o[0], 0.01, 1e-7);
+    CHECK_CLOSE(absorbed, 0.1, 1e-12);
+}
+
 TEST(save_fluence_round_trip) {
     for (int nt : {1, 2}) {
         OutputGrid g = small_grid(3, 4, 5, nt, 1.5f);
@@ -2796,6 +3064,25 @@ TEST(save_fluence_round_trip) {
         }
 
         CHECK(ok);
+    }
+
+    /* several fields: [nx, ny, nz, gates, fields] */
+    {
+        OutputGrid g = small_grid(2, 1, 1, 1, 1.0f);
+        g.nfield = 3;
+        std::vector<float> vol(6);
+
+        for (size_t i = 0; i < vol.size(); i++) {
+            vol[i] = (float)i;
+        }
+
+        SimConfig c;
+        c.session_id = tmpfile_path("fluence_fields");
+        save_fluence(c, g, vol);
+        json j = load_json_file((c.session_id + ".jdat").c_str());
+        JDataArray a = jdata_decode_array(j["Fluence"]);
+        CHECK(a.dims == std::vector<size_t>({2, 1, 1, 1, 3}));
+        CHECK(a.at(1) == 2 && a.at(3) == 1);   /* row-major [x][y][z][t][f]: (0,0,0,0,1) and (1,0,0,0,0) */
     }
 
     SimConfig bad;

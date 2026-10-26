@@ -55,6 +55,39 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         if (g.nelem == 0 || g.nelem > VKMMC_MAX_VOXELS || tt % 64 || !(idt > 0) || !std::isfinite(idt)) {
             abort();
         }
+
+        /* the source data the kernels index */
+        if (g.nfield < 1 || g.nelem * g.nfield > VKMMC_MAX_VOXELS || g.nout != g.nelem * g.nfield + (uint64_t)cfg.srcnum
+                || cfg.srcnum < 1 || cfg.extrasrc.size() > VKMMC_MAX_SOURCES
+                || (cfg.srcid > 0 && (size_t)cfg.srcid > cfg.extrasrc.size())) {
+            abort();
+        }
+
+        if (cfg.srctype == SRC_PATTERN || cfg.srctype == SRC_PATTERN3D) {
+            double npix = (cfg.srctype == SRC_PATTERN) ? (double)cfg.srcparam1[3] * cfg.srcparam2[3]
+                          : (double)cfg.srcparam1[0] * cfg.srcparam1[1] * cfg.srcparam1[2];
+
+            if ((double)cfg.srcpattern.size() != npix * cfg.srcnum) {
+                abort();
+            }
+        }
+
+        for (size_t i = 0; i < cfg.srcpattern.size(); i++) {
+            if (!(cfg.srcpattern[i] >= 0 && cfg.srcpattern[i] <= VKMMC_MAX_SRC_WEIGHT)) {
+                abort();
+            }
+        }
+
+        std::vector<float> es = kernel_extrasrc(cfg);
+
+        for (size_t i = 0; i < es.size(); i++) {
+            if (!std::isfinite(es[i])) {
+                abort();
+            }
+        }
+
+        (void)kernel_initial_medium(cfg);
+        (void)source_json(cfg, false);
     } catch (const std::exception&) {
         /* rejected input */
     }

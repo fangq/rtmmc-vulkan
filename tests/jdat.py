@@ -87,7 +87,8 @@ def main():
     if cmd == 'sum':
         print('%.9g' % sum(flat))
     elif cmd == 'dims':
-        print('x'.join(str(d) for d in ([nx, ny, nz] + ([ng] if ng > 1 else []))))
+        full = decode(root['Fluence'])[0]   # [nx, ny, nz(, nt)] or [nx, ny, nz, nt, nfield]
+        print('x'.join(str(d) for d in (full if len(full) > 4 else [nx, ny, nz] + ([ng] if ng > 1 else []))))
     elif cmd == 'gates':
         print(' '.join('%.9g' % sum(v(ix, iy, iz, g) for ix in range(nx) for iy in range(ny) for iz in range(nz))
                        for g in range(ng)))

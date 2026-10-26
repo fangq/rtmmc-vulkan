@@ -38,14 +38,16 @@ import jdat  # noqa: E402
 
 KEYS = ['Session', 'ID', 'Photons', 'RNGSeed', 'DoMismatch', 'DoNormalize', 'OutputType', 'RussianRoulette',
         'Forward', 'T0', 'T1', 'Dt', 'Domain', 'LengthUnit', 'Media', 'mua', 'mus', 'g', 'n', 'Step', 'MeshRes',
-        'Optode', 'Source', 'Type', 'Pos', 'Dir', 'Param1', 'Param2', 'Shapes', 'Tag', 'O', 'R', 'Size', 'C0', 'C1',
+        'Optode', 'Source', 'Type', 'Pos', 'Dir', 'Param1', 'Param2', 'Pattern', 'SrcNum', 'Nx', 'Ny', 'Nz',
+        'Data', 'Shapes', 'Tag', 'O', 'R', 'Size', 'C0', 'C1',
         'Bound', 'Front', 'Back', 'D', 'MeshNode', 'MeshElem', 'MeshSurf', 'InitElem', '_ArrayType_', '_ArraySize_',
         '_ArrayZipType_', '_ArrayZipSize_', '_ArrayZipData_', '_ArrayOrder_', '_ArrayData_', '_ArrayZipOffsets_']
 SHAPE_TYPES = ['Grid', 'Subgrid', 'Sphere', 'Box', 'Cylinder', 'XSlabs', 'YSlabs', 'ZSlabs', 'XLayers', 'ZLayers',
                'Lens', 'Name', 'Origin', 'Torus']
 NUMBERS = [0, -0.0, 1, -1, 0.5, 2, 3, 7, 64, 65, 255, 256, 1e-300, 1e-45, 1e-7, 1e6, 1e7, 3.5e38, 1e39, 1e308,
            -1e308, 2 ** 31 - 1, 2 ** 31, 2 ** 32, 2 ** 53 + 1, 2 ** 63, 2 ** 64, -2 ** 63]
-STRINGS = ['', 'pencil', 'disk', 'planar', 'cone', 'x', 'f', 'l', 'fluence', 'zlib', 'gzip', 'c', 'r', 'single',
+STRINGS = ['', 'pencil', 'disk', 'planar', 'cone', 'isotropic', 'pattern', 'pattern3d', 'fourierx', 'line', 'slit',
+           'ring', 'hyperboloid', '_NaN_', '_Inf_', '-_Inf_', 'x', 'f', 'l', 'fluence', 'zlib', 'gzip', 'c', 'r', 'single',
            'double', 'uint8', 'bogus', 'A' * 300, '../../etc/passwd', 'é中']
 OPTIONS = [['-n', '100'], ['-n', '1e18'], ['-n', '0'], ['-E', '-1'], ['-E', '0'], ['-b', '0'], ['-b', '1'],
            ['-U', '0'], ['-O', 'f'], ['-O', 'l'], ['-O', 'q'], ['-t', '64'], ['-t', '65'], ['-t', '16777216'],

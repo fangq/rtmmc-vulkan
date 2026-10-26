@@ -989,7 +989,7 @@ badcase badg '{"Domain":{"Media":[{"mua":0,"mus":0,"g":1,"n":1},{"mua":0,"mus":0
 badcase tag '{"Shapes":[{"Box":{"Tag":5,"O":[0,0,0],"Size":[1,1,1]}}]}' 'Tag'
 badcase radius '{"Shapes":[{"Sphere":{"Tag":1,"O":[0,0,0],"R":-1}}]}' 'R must be positive'
 badcase shape '{"Shapes":[{"Torus":{"Tag":1}}]}' 'unknown shape'
-badcase srctype '{"Optode":{"Source":{"Type":"cone"}}}' 'not supported'
+badcase srctype '{"Optode":{"Source":{"Type":"laser"}}}' 'not a known source type'
 badcase dir '{"Optode":{"Source":{"Dir":[0,0,0]}}}' 'non-zero'
 badcase time '{"Forward":{"T0":1e-9,"T1":1e-10}}' 'T0 < T1'
 badcase gates '{"Forward":{"T1":1,"Dt":1e-12}}' 'time gates'
@@ -1085,6 +1085,106 @@ else
     [ $? = 1 ] && grep -q "bad magic" "$TESTDIR/t39e.log" && log_pass "bad SPIR-V magic rejected" || log_fail "bad magic not rejected"
     run_sim t16.json t39f.log "$TESTDIR/missing.spv"
     [ $? = 1 ] && grep -q "cannot open SPIR-V" "$TESTDIR/t39f.log" && log_pass "missing .spv rejected" || log_fail "missing .spv not rejected"
+fi
+
+# =============================================================================
+# TEST 40: Wide-field sources (MCX/MMC types): every collimated beam crosses
+# the 20 mm absorbing slab (mua=0.05, no scattering) along +z, so each one,
+# whatever its spatial profile or launch weights, absorbs exactly
+# 1-exp(-0.05*20) = 63.212% of the launched energy
+# =============================================================================
+log_test "Wide-field source types through an absorbing slab"
+WREF=$(pyval '100*(1-math.exp(-0.05*20))')
+P1='"Param1":[30,0,0'
+for spec in 'planar|"Pos":[15,15,0],'"$P1"',0],"Param2":[0,30,0,0]' \
+            'disk|"Pos":[30,30,0],"Param1":[15,0,0,0]' \
+            'ring|"Pos":[30,30,0],"Param1":[15,5,0,3]' \
+            'gaussian|"Pos":[30,30,0],"Param1":[3,0,0,0]' \
+            'pencilarray|"Pos":[15,15,0],'"$P1"',4],"Param2":[0,30,0,3]' \
+            'slit|"Pos":[15,30,0],'"$P1"',0]' \
+            'fourier|"Pos":[15,15,0],'"$P1"',2.5],"Param2":[0,30,0,1.5]' \
+            'fourierx|"Pos":[15,15,0],'"$P1"',30],"Param2":[2,1,0.25,0.5]' \
+            'fourierx2d|"Pos":[15,15,0],'"$P1"',30],"Param2":[2,1,0.25,0.1]' \
+            'pattern|"Pos":[15,15,0],'"$P1"',3],"Param2":[0,30,0,2],"Pattern":{"Nx":3,"Ny":2,"Data":[1,0.5,0,0.25,0.75,1]}' \
+            'pattern3d|"Pos":[20,20,1],"Param1":[3,2,2,0],"Pattern":{"Nx":3,"Ny":2,"Nz":2,"Data":[1,2,0,3,0.5,1,1,1,0,2,3,1]}'; do
+    t=${spec%%|*}
+    mkcfg t40_$t.json '{"Session":{"Photons":20000},"Optode":{"Source":{"Type":"'$t'",'"${spec#*|}"'}}}'
+    if run_sim t40_$t.json t40_$t.log -E 3 -s t40_$t; then
+        check_close "$(get_absorbed t40_$t.log)" "$WREF" 0.01 "$t: absorbed = 1-exp(-mua L)"
+    else
+        log_fail "$t failed: $(grep -m1 ERROR "$TESTDIR/t40_$t.log")"
+    fi
+done
+mkcfg t40w.json '{"Session":{"Photons":20000},"Optode":{"Source":{"Type":"fourier","Pos":[15,15,0],"Param1":[30,0,0,2.5],"Param2":[0,30,0,1.5]}}}'
+if run_sim t40w.json t40w.log -E 3 -s t40w -U 0; then
+    le=$(grep -oP 'launched energy:\s*\K[0-9.e+]+' "$TESTDIR/t40w.log")
+    check_close "$(pyval "$(jdat sum t40w.jdat)/$le*100")" "$WREF" 0.01 "Raw sum / launched energy ($le of 20000) = absorbed"
+else
+    log_fail "Execution failed"
+fi
+
+# =============================================================================
+# TEST 41: Launch directions: from the center of an absorbing sphere (R=10,
+# no scattering) every direction travels R to the surface, so any angular
+# distribution absorbs exactly 1-exp(-0.05*10) = 39.347% (the tessellated
+# sphere is a little smaller: MeshRes 128)
+# =============================================================================
+log_test "Directional source types from the center of a sphere"
+SREF=$(pyval '100*(1-math.exp(-0.05*10))')
+for spec in 'isotropic|' 'arcsine|' 'cone|,"Param1":[0.7,0,0,0]' 'cone_angle|,"Param1":[2.5,1,0,0]' \
+            'zgaussian|,"Param1":[0.4,0,0,0]' 'hyperboloid|,"Param1":[0.001,0,1000,0]' \
+            'line|,"Param1":[0.001,0,0,0]' 'line_arc|,"Param1":[0,0.001,0,0],"Param2":[1,0,0,0]' 'pencil_nan|,"Dir":[0,0.6,0.8,"_NaN_"]' 'pencil_lambert|,"Dir":[0.6,0,0.8,"-_Inf_"]'; do
+    t=${spec%%|*}
+    ty=${t%%_*}
+    mkcfg t41_$t.json '{"Session":{"Photons":20000},"Domain":{"MeshRes":128},"Optode":{"Source":{"Type":"'$ty'","Pos":[30,30,30]'"${spec#*|}"'}},
+                      "Shapes":[{"Sphere":{"Tag":1,"O":[30,30,30],"R":10}}]}'
+    if run_sim t41_$t.json t41_$t.log -E 4 -s t41_$t; then
+        check_close "$(get_absorbed t41_$t.log)" "$SREF" 0.05 "$t: absorbed = 1-exp(-mua R)"
+    else
+        log_fail "$t failed: $(grep -m1 ERROR "$TESTDIR/t41_$t.log")"
+    fi
+done
+# a focused beam: a 30x30 planar source converging to the slab center (focal length 20)
+# crosses the 20 mm slab along 20/cos(theta); the deposit has its maximum at the focus
+mkcfg t41f.json '{"Session":{"Photons":50000},"Optode":{"Source":{"Type":"planar","Pos":[15,15,0],"Dir":[0,0,1,20],"Param1":[30,0,0,0],"Param2":[0,30,0,0]}}}'
+if run_sim t41f.json t41f.log -E 4 -s t41f; then
+    ab=$(get_absorbed t41f.log)
+    python3 -c "import sys; sys.exit(0 if $ab > $WREF + 1 else 1)" && log_pass "Focused planar beam: longer paths ($ab% > $WREF%)" \
+        || log_fail "Focused planar beam: $ab%"
+else
+    log_fail "Execution failed"
+fi
+
+# =============================================================================
+# TEST 42: Several output fields: a multi-source list simulated at once
+# (Source.ID 0) and a pattern source shared by two patterns (SrcNum 2)
+# =============================================================================
+log_test "Multi-source fields and shared patterns"
+mkcfg t42a.json '{"Session":{"Photons":30000},"Optode":{"Source":{"Pos":[[20,20,0,1],[40,40,0,0.5]],"Dir":[0,0,1],"ID":0}}}'
+if run_sim t42a.json t42a.log -E 5 -s t42a; then
+    check_close "$(get_absorbed t42a.log)" "$WREF" 0.01 "Two sources: total absorbed"
+    s1=$(grep -oP 'source 1: absorbed:\s*\K[0-9.]+' "$TESTDIR/t42a.log"); s2=$(grep -oP 'source 2: absorbed:\s*\K[0-9.]+' "$TESTDIR/t42a.log")
+    check_close "$(pyval "$s1/$s2")" 2 0.1 "Weights 1 and 0.5: source fields $s1% / $s2%"
+    [ "$(jdat dims t42a.jdat | cut -dx -f4-)" = "1x2" ] && log_pass "Output [nx,ny,nz,1,2]" || log_fail "dims $(jdat dims t42a.jdat)"
+else
+    log_fail "Execution failed"
+fi
+mkcfg t42b.json '{"Session":{"Photons":30000},"Optode":{"Source":{"Pos":[[20,20,0,1],[40,40,0,0.5]],"Dir":[0,0,1],"ID":2}}}'
+if run_sim t42b.json t42b.log -E 5 -s t42b; then
+    check_close "$(get_absorbed t42b.log)" "$WREF" 0.01 "Source.ID 2 alone"
+    [ "$(jdat dims t42b.jdat | tr -cd x)" = "xx" ] && log_pass "One field" || log_fail "dims $(jdat dims t42b.jdat)"
+else
+    log_fail "Execution failed"
+fi
+mkcfg t42c.json '{"Session":{"Photons":30000},"Optode":{"Source":{"Type":"pattern","Pos":[15,15,0],"Param1":[30,0,0,2],"Param2":[0,30,0,2],"SrcNum":2,
+                  "Pattern":{"Nx":2,"Ny":2,"Data":[1,0,0.5,0.5,0,1,0.25,0]}}}}'
+if run_sim t42c.json t42c.log -E 5 -s t42c; then
+    p1=$(grep -oP 'pattern 1: absorbed:\s*\K[0-9.]+' "$TESTDIR/t42c.log"); p2=$(grep -oP 'pattern 2: absorbed:\s*\K[0-9.]+' "$TESTDIR/t42c.log")
+    check_close "$p1" "$WREF" 0.01 "Pattern 1 field normalized by its launched energy"
+    check_close "$p2" "$WREF" 0.01 "Pattern 2 field normalized by its launched energy"
+    [ "$(jdat dims t42c.jdat | cut -dx -f4-)" = "1x2" ] && log_pass "Output [nx,ny,nz,1,2]" || log_fail "dims $(jdat dims t42c.jdat)"
+else
+    log_fail "Execution failed"
 fi
 
 # =============================================================================
