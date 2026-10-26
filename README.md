@@ -106,8 +106,10 @@ Running:
 * `vkmmc`: `libvulkan.so.1` (the Vulkan loader) and a driver with
   `VK_KHR_ray_query` and `VK_KHR_acceleration_structure`: NVIDIA RTX 20xx or
   newer, AMD RX 6000 or newer with RADV, Intel Arc, or Mesa's CPU driver
-  lavapipe (tested with Mesa 25.0 and 26.0); 64-bit shader atomics are used
-  when available and emulated otherwise
+  lavapipe (tested with Mesa 25.0 and 26.0; about 500 times slower than an
+  RTX 4070 Ti SUPER on 16 CPU cores, but with the same results, which makes it
+  useful for testing); 64-bit shader atomics are used when available and
+  emulated otherwise
 * `vkmmc_optix`: an NVIDIA GPU and driver; OptiX comes with the driver and the
   CUDA runtime is linked statically. A binary built with the OptiX 7.5 headers
   needs driver R515 or newer; newer headers need newer drivers
