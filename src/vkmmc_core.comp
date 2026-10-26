@@ -40,8 +40,16 @@ layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
 
+// one triangle: geometric normal, packed media labels and vertex indices; the
+// integers are declared as uint, never read through float registers (a driver
+// may flush their bit patterns as denormal floats to zero)
+struct Face {
+    vec3 normal;
+    uint media;       // bit 31 flat, bit 30 coplanar, 29-16 front, 15-0 back
+    uvec4 vidx;       // .xyz: vertex indices
+};
 layout(std430, set = 0, binding = 1) readonly buffer FaceBuffer {
-    vec4 face_normal[];
+    Face faces[];
 };
 
 struct Medium {
@@ -193,15 +201,14 @@ bool trace_ray(vec3 o, vec3 d, float tmin, float tmax,
  * Unpack front and back media IDs from packed float.
  * Bit 31 = flat flag, bit 30 = coplanar flag, [29:16] = front, [15:0] = back.
  */
-void unpack_media(float pw, out uint front_med, out uint back_med) {
-    uint p = floatBitsToUint(pw);
+void unpack_media(uint p, out uint front_med, out uint back_med) {
     front_med = (p >> 16u) & 0x3FFFu;
     back_med  = p & 0xFFFFu;
 }
 
 /* the triangle overlaps a coplanar triangle of another CSG surface */
-bool is_coplanar_triangle(float pw) {
-    return (floatBitsToUint(pw) & 0x40000000u) != 0u;
+bool is_coplanar_triangle(uint p) {
+    return (p & 0x40000000u) != 0u;
 }
 
 #ifdef USE_CURVATURE
@@ -209,8 +216,8 @@ bool is_coplanar_triangle(float pw) {
  * Check if a triangle is flat-flagged (bit 31 of packed_media).
  * Flat triangles skip curvature correction and use the face normal directly.
  */
-bool is_flat_triangle(float pw) {
-    return (floatBitsToUint(pw) & FLAT_FLAG) != 0u;
+bool is_flat_triangle(uint p) {
+    return (p & FLAT_FLAG) != 0u;
 }
 #endif
 
@@ -539,16 +546,15 @@ bool do_reflection(vec3 N, vec3 Ng, float n1, float n2, inout uvec4 rng, vec3 hi
 #ifdef USE_CURVATURE
 vec3 get_curvature_normal_at(int tri_id, vec3 hit_pos) {
     // Skip curvature for flat-flagged triangles (box faces, cylinder caps)
-    if (has_curvature == 0u || is_flat_triangle(face_normal[tri_id * 2].w)) {
-        return face_normal[tri_id * 2].xyz;
+    if (has_curvature == 0u || is_flat_triangle(faces[tri_id].media)) {
+        return faces[tri_id].normal;
     }
 
-    // face_normal[tri_id*2+1] stores vertex indices as floatBitsToUint
-    vec4 vidx_raw = face_normal[tri_id * 2 + 1];
+    uvec4 vidx = faces[tri_id].vidx;
     vec3 NB = vec3(0.0);
 
     for (int vi = 0; vi < 3; vi++) {
-        uint idx = floatBitsToUint(vidx_raw[vi]);
+        uint idx = vidx[vi];
         vec4 nk = node_curv[idx].vnorm_k1;   // .xyz = normal, .w = k1
         vec4 pk = node_curv[idx].pdir_k2;     // .xyz = principal dir, .w = k2
         vec3 di = hit_pos - node_curv[idx].node_pos.xyz;
@@ -562,7 +568,7 @@ vec3 get_curvature_normal_at(int tri_id, vec3 hit_pos) {
     NB = normalize(NB);
 
     // Ensure consistent orientation with face normal
-    if (dot(NB, face_normal[tri_id * 2].xyz) < 0.0) {
+    if (dot(NB, faces[tri_id].normal) < 0.0) {
         NB = -NB;
     }
 
@@ -580,7 +586,7 @@ vec3 get_normal(int tri_id, vec3 hit_pos) {
 #ifdef USE_CURVATURE
     return get_curvature_normal_at(tri_id, hit_pos);
 #else
-    return face_normal[tri_id * 2].xyz;
+    return faces[tri_id].normal;
 #endif
 }
 
@@ -621,7 +627,7 @@ void coplanar_crossings(vec3 p, vec3 nfar, int mode, inout uvec2 ms, inout uvec2
         // the probe runs against the photon, so it sees the faces from the other side
         bool enter = !rayQueryGetIntersectionFrontFaceEXT(q, false);
         uint fm, bm;
-        unpack_media(face_normal[tid * 2].w, fm, bm);
+        unpack_media(faces[tid].media, fm, bm);
 
         if (bm < 1u || bm > 64u) {
             continue;
@@ -668,16 +674,16 @@ uvec2 csg_enclosure(vec3 p, vec3 d) {
             break;
         }
 
-        vec4 fn = face_normal[tid * 2];
-        vec3 nfar = (dot(d, fn.xyz) > 0.0) ? fn.xyz : -fn.xyz;
+        Face fn = faces[tid];
+        vec3 nfar = (dot(d, fn.normal) > 0.0) ? fn.normal : -fn.normal;
         vec3 hit = wp + d * hd;
         wp = hit + nfar * SAFETY_DIST;
 
-        if (is_coplanar_triangle(fn.w)) {
+        if (is_coplanar_triangle(fn.media)) {
             coplanar_crossings(wp, nfar, 1, ms, seen, inside);
         } else {
             uint fm, bm;
-            unpack_media(fn.w, fm, bm);
+            unpack_media(fn.media, fm, bm);
 
             if (bm >= 1u && bm <= 64u && !tagset_has(seen, bm)) {
                 seen = tagset_add(seen, bm);
@@ -777,7 +783,7 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
 
             if (trace_ray(p, d, 0.0, FMAX, hd, tid, ff) && ff) {
                 uint fm, bm;
-                unpack_media(face_normal[tid * 2].w, fm, bm);
+                unpack_media(faces[tid].media, fm, bm);
                 vec3 hp = p + d * hd;
                 p = hp + d * SAFETY_DIST;
                 mstate = ms_enter(mstate, bm);
@@ -785,7 +791,7 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
 
                 // Fresnel reflection at the entry boundary
                 if (do_reflect > 0u && mid < num_media && media[0].n != media[mid].n
-                        && do_reflection(get_normal(tid, hp), face_normal[tid * 2].xyz, media[0].n, media[mid].n, rng, hp, p, d)) {
+                        && do_reflection(get_normal(tid, hp), faces[tid].normal, media[0].n, media[mid].n, rng, hp, p, d)) {
                     mstate = uvec2(0u, 0u);
                     mid = MEDIUM_DEAD;
                     w = 0.0;
@@ -807,7 +813,7 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
 
             if (trace_ray(p, d, 0.0, FMAX, hd, tid, ff)) {
                 uint fm, bm;
-                unpack_media(face_normal[tid * 2].w, fm, bm);
+                unpack_media(faces[tid].media, fm, bm);
                 mid = ff ? fm : bm;
 
                 // Source outside the mesh, pointing at it: enter through the hit face
@@ -817,7 +823,7 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
                     mid = bm;
 
                     if (do_reflect > 0u && media[0].n != media[mid].n
-                            && do_reflection(get_normal(tid, hp), face_normal[tid * 2].xyz, media[0].n, media[mid].n, rng, hp, p, d)) {
+                            && do_reflection(get_normal(tid, hp), faces[tid].normal, media[0].n, media[mid].n, rng, hp, p, d)) {
                         mid = MEDIUM_DEAD;
                         w = 0.0;
                     }
@@ -910,7 +916,7 @@ void main() {
                 // ---- Hit a boundary ----
             } else if (hit) {
                 uint fm, bm;
-                unpack_media(face_normal[tri * 2].w, fm, bm);
+                unpack_media(faces[tri].media, fm, bm);
                 float L = is_transparent ? hd : min(hd, slen / prop.mus);
 
                 // save output
@@ -919,7 +925,7 @@ void main() {
                 // update photon position, weight, timer; a crossing photon is
                 // placed SAFETY_DIST off the facet plane on the far side
                 vec3 hit_pos = pos + dir * L;   /* exact surface hit point for trajectory */
-                vec3 Ng = face_normal[tri * 2].xyz;
+                vec3 Ng = faces[tri].normal;
                 pos = hit_pos + ((dot(dir, Ng) > 0.0) ? Ng : -Ng) * SAFETY_DIST;
                 weight *= exp(-prop.mua * L);
                 tof += L * INV_C0 * prop.n;
@@ -938,7 +944,7 @@ void main() {
                     uint old_mid = mid;
                     uvec2 new_ms = ff ? ms_enter(mstate, bm) : ms_leave(mstate, bm);
 
-                    if (is_coplanar_triangle(face_normal[tri * 2].w)) {
+                    if (is_coplanar_triangle(faces[tri].media)) {
                         uvec2 unused0 = uvec2(0u), unused1 = uvec2(0u);
                         new_ms = mstate;
                         coplanar_crossings(pos, (dot(dir, Ng) > 0.0) ? Ng : -Ng, 0, new_ms, unused0, unused1);
@@ -962,7 +968,7 @@ void main() {
                                 N = -N;
                             }
 
-                            reflected = do_reflection(N, face_normal[tri * 2].xyz, n_in, n_out, rng, hit_pos, pos, dir);
+                            reflected = do_reflection(N, faces[tri].normal, n_in, n_out, rng, hit_pos, pos, dir);
                         }
                     }
 
@@ -999,7 +1005,7 @@ void main() {
                                 N = -N;
                             }
 
-                            reflected = do_reflection(N, face_normal[tri * 2].xyz, prop.n, n_out, rng, hit_pos, pos, dir);
+                            reflected = do_reflection(N, faces[tri].normal, prop.n, n_out, rng, hit_pos, pos, dir);
                         }
                     }
 
