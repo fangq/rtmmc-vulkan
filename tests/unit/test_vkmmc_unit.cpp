@@ -1266,7 +1266,10 @@ TEST(config_mesh_errors) {
     CHECK_THROWS(load_json_config(bad), "Shapes.MeshNode needs at least 3 columns");
     bad = j;
     bad["Shapes"]["MeshNode"][3][1] = 1e39;
-    CHECK_THROWS(load_json_config(bad), "Shapes.MeshNode: node 4 is outside the float range");
+    CHECK_THROWS(load_json_config(bad), "Shapes.MeshNode: node 4 is beyond +-1e6 length units");
+    bad = j;
+    bad["Shapes"]["MeshNode"][3][1] = 2e6;
+    CHECK_THROWS(load_json_config(bad), "Shapes.MeshNode: node 4 is beyond +-1e6 length units");
     bad = j;
     bad["Shapes"]["MeshNode"][3][1] = NAN;
     CHECK_THROWS(load_json_config(bad), "Shapes.MeshNode contains a NaN or Inf");

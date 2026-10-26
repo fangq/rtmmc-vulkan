@@ -65,15 +65,6 @@ static void make_tangent(float nx, float ny, float nz,
 }
 
 /* ================================================================ */
-/*  Helper: is this face flat-flagged? (bit 31 of packed_media)     */
-/* ================================================================ */
-static bool face_is_flat(const FaceData& fd) {
-    uint32_t pk = 0;
-    std::memcpy(&pk, &fd.packed_media, 4);
-    return (pk & VKMMC_FACE_FLAT) != 0;
-}
-
-/* ================================================================ */
 /*  Compute curvature for a node on a specific shape's surface      */
 /*  Returns true if the node is on a curved part, false if flat     */
 /* ================================================================ */

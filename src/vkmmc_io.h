@@ -47,6 +47,8 @@ using json = nlohmann::json;
 #define VKMMC_MAX_GATES      100000
 #define VKMMC_MAX_VOXELS     ((uint64_t)1 << 30)  /* voxels x gates; kernel indexes with uint32 */
 #define VKMMC_MAX_JDATA_DIM  8
+#define VKMMC_MAX_COORD      1e6         /* |coordinates| in length units; float precision */
+#define VKMMC_MAX_TIME       1.0         /* seconds */
 
 // ============================================================================
 // Data structures
@@ -1068,8 +1070,9 @@ static void load_nodes(const json& mn, SimConfig& cfg) {
     for (size_t i = 0; i < nn; i++) {
         cfg.nodes[i] = {(float)d[i * cols], (float)d[i * cols + 1], (float)d[i * cols + 2]};
 
-        if (!std::isfinite(cfg.nodes[i].x) || !std::isfinite(cfg.nodes[i].y) || !std::isfinite(cfg.nodes[i].z)) {
-            vkmmc_fail("Shapes.MeshNode: node " + std::to_string(i + 1) + " is outside the float range");
+        if (!(std::fabs(cfg.nodes[i].x) <= VKMMC_MAX_COORD && std::fabs(cfg.nodes[i].y) <= VKMMC_MAX_COORD &&
+                std::fabs(cfg.nodes[i].z) <= VKMMC_MAX_COORD)) {
+            vkmmc_fail("Shapes.MeshNode: node " + std::to_string(i + 1) + " is beyond +-1e6 length units");
         }
     }
 
@@ -1151,7 +1154,10 @@ static SimConfig load_json_config(const json& j) {
         double d0 = json_num(fw, "T0", 0.0, "Forward"), d1 = json_num(fw, "T1", 5e-9, "Forward");
         double dd = json_num(fw, "Dt", d1 - d0, "Forward");
         vkmmc_require(d0 >= 0 && d1 > d0, "Forward: need 0 <= T0 < T1");
+        vkmmc_require(d1 <= VKMMC_MAX_TIME, "Forward.T1 must not exceed 1 s");
         vkmmc_require(dd > 0, "Forward.Dt must be positive");
+        dd = std::min(dd, d1 - d0);     /* a gate never extends past T1 */
+        vkmmc_require(dd >= 1e-15, "Forward: the time gate width (Dt, or T1-T0) must be at least 1e-15 s");
         double ng = std::floor((d1 - d0) / dd + 0.5);
         vkmmc_require(ng <= VKMMC_MAX_GATES, "Forward: (T1-T0)/Dt gives more than " + std::to_string(VKMMC_MAX_GATES) + " time gates");
         cfg.t0 = (float)d0;
@@ -1232,6 +1238,7 @@ static SimConfig load_json_config(const json& j) {
             std::vector<double> p = json_vec(src["Pos"], 3, 3, "Optode.Source.Pos");
 
             for (int i = 0; i < 3; i++) {
+                vkmmc_require(std::fabs(p[i]) <= VKMMC_MAX_COORD, "Optode.Source.Pos is beyond +-1e6 length units");
                 cfg.srcpos[i] = (float)p[i];
             }
         }
@@ -1248,6 +1255,7 @@ static SimConfig load_json_config(const json& j) {
             std::vector<double> p = json_vec(src["Param1"], 1, 4, "Optode.Source.Param1");
 
             for (size_t i = 0; i < p.size(); i++) {
+                vkmmc_require(std::fabs(p[i]) <= VKMMC_MAX_COORD, "Optode.Source.Param1 is beyond +-1e6");
                 cfg.srcparam1[i] = (float)p[i];
             }
         }
@@ -1256,6 +1264,7 @@ static SimConfig load_json_config(const json& j) {
             std::vector<double> p = json_vec(src["Param2"], 1, 4, "Optode.Source.Param2");
 
             for (size_t i = 0; i < p.size(); i++) {
+                vkmmc_require(std::fabs(p[i]) <= VKMMC_MAX_COORD, "Optode.Source.Param2 is beyond +-1e6");
                 cfg.srcparam2[i] = (float)p[i];
             }
         }

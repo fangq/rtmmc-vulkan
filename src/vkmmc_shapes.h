@@ -541,6 +541,15 @@ static void gen_lens(ShapeMesh& m,
 /*  Coplanar overlapping faces                                      */
 /* ================================================================ */
 
+/* ================================================================ */
+/*  Helper: is this face flat-flagged? (bit 31 of packed_media)     */
+/* ================================================================ */
+static bool face_is_flat(const FaceData& fd) {
+    uint32_t pk = 0;
+    std::memcpy(&pk, &fd.packed_media, 4);
+    return (pk & VKMMC_FACE_FLAT) != 0;
+}
+
 /* do two coplanar triangles overlap with a positive area? (2-D separating axis test) */
 static bool coplanar_tris_overlap(const Vec3* A, const Vec3* B, int ax0, int ax1, float tol) {
     float a[3][2], b[3][2];
@@ -591,7 +600,9 @@ static bool coplanar_tris_overlap(const Vec3* A, const Vec3* B, int ax0, int ax1
  * box flush with the domain, ...). A ray tracer reports only one of two
  * coincident triangles, which would drop one of the two medium changes, so
  * the kernels re-derive the set of enclosing shapes after crossing a flagged
- * triangle. Returns the number of flagged triangles.
+ * triangle. Only flat-flagged triangles are considered: coincident curved
+ * surfaces (e.g. two identical spheres) are not supported. Returns the number
+ * of flagged triangles.
  */
 static size_t flag_coplanar_faces(ShapeMesh& m) {
     float lo = 1e30f, hi = -1e30f;
@@ -608,6 +619,15 @@ static size_t flag_coplanar_faces(ShapeMesh& m) {
 
     for (size_t i = 0; i < m.faces.size(); i++) {
         float n[3] = {m.facedata[i].nx, m.facedata[i].ny, m.facedata[i].nz};
+
+        if (!(n[0] * n[0] + n[1] * n[1] + n[2] * n[2] > 0.5f)) {
+            continue;   /* degenerate (zero-area) triangle: it is never hit */
+        }
+
+        if (!face_is_flat(m.facedata[i])) {
+            continue;   /* only flat faces (boxes, slabs, caps, rims) can coincide */
+        }
+
         int big = (std::fabs(n[0]) >= std::fabs(n[1]) && std::fabs(n[0]) >= std::fabs(n[2])) ? 0 :
                   (std::fabs(n[1]) >= std::fabs(n[2]) ? 1 : 2);
         float sg = (n[big] < 0) ? -1.f : 1.f;
@@ -643,9 +663,35 @@ static size_t flag_coplanar_faces(ShapeMesh& m) {
                 s1++;
             }
 
+            /* sweep along ax0: only triangles whose extents overlap are tested */
+            struct Ext {
+                float lo, hi;
+                size_t face;
+                bool operator<(const Ext& o) const {
+                    return lo < o.lo;
+                }
+            };
+            std::vector<Ext> ext;
+
             for (size_t i = s0; i < s1; i++) {
-                for (size_t j = i + 1; j < s1; j++) {
-                    size_t fi = g[i].second, fj = g[j].second;
+                size_t fi = g[i].second;
+                float lo2 = 1e30f, hi2 = -1e30f;
+
+                for (int k = 0; k < 3; k++) {
+                    float v = (&m.nodes[m.faces[fi][k]].x)[ax0];
+                    lo2 = std::min(lo2, v);
+                    hi2 = std::max(hi2, v);
+                }
+
+                Ext e = {lo2, hi2, fi};
+                ext.push_back(e);
+            }
+
+            std::sort(ext.begin(), ext.end());
+
+            for (size_t i = 0; i < ext.size(); i++) {
+                for (size_t j = i + 1; j < ext.size() && ext[j].lo < ext[i].hi - tol; j++) {
+                    size_t fi = ext[i].face, fj = ext[j].face;
 
                     if (flag[fi] && flag[fj]) {
                         continue;
@@ -719,6 +765,7 @@ static std::vector<double> shape_pos(const json& obj, const char* key, const dou
 
     for (int i = 0; i < 3; i++) {
         v[i] -= orig[i];
+        vkmmc_require(std::fabs(v[i]) <= VKMMC_MAX_COORD, ctx + "." + key + " is beyond +-1e6 length units");
     }
 
     return v;
@@ -728,7 +775,7 @@ static std::vector<double> shape_size(const json& obj, const std::string& ctx) {
     std::vector<double> v = json_vec_key(obj, "Size", 3, ctx);
 
     for (int i = 0; i < 3; i++) {
-        vkmmc_require(v[i] > 0, ctx + ".Size must be positive");
+        vkmmc_require(v[i] > 0 && v[i] <= VKMMC_MAX_COORD, ctx + ".Size must be positive and at most 1e6");
     }
 
     return v;
@@ -737,7 +784,7 @@ static std::vector<double> shape_size(const json& obj, const std::string& ctx) {
 static double shape_radius(const json& obj, const std::string& ctx) {
     vkmmc_require(obj.contains("R"), ctx + " requires 'R'");
     double r = json_num(obj, "R", 0, ctx);
-    vkmmc_require(r > 0, ctx + ".R must be positive");
+    vkmmc_require(r > 0 && r <= VKMMC_MAX_COORD, ctx + ".R must be positive and at most 1e6");
     return r;
 }
 
@@ -784,6 +831,11 @@ static ShapeMesh parse_shapes(const json& arr, float ext[6], int mesh_res = 24,
             /* label only */
         } else if (key == "Origin") {
             std::vector<double> o = json_vec(obj, 3, 3, ctx);
+
+            for (int i = 0; i < 3; i++) {
+                vkmmc_require(std::fabs(o[i]) <= VKMMC_MAX_COORD, ctx + " is beyond +-1e6 length units");
+            }
+
             orig[0] = o[0];
             orig[1] = o[1];
             orig[2] = o[2];
@@ -865,6 +917,8 @@ static ShapeMesh parse_shapes(const json& arr, float ext[6], int mesh_res = 24,
             for (size_t j = 0; j < bd.size(); j++) {
                 std::vector<double> b = json_vec(bd[j], 2, 2, ctx + ".Bound[" + std::to_string(j) + "]");
                 vkmmc_require(b[1] > b[0], ctx + ".Bound: need lower < upper bound");
+                vkmmc_require(std::fabs(b[0]) <= VKMMC_MAX_COORD && std::fabs(b[1]) <= VKMMC_MAX_COORD,
+                              ctx + ".Bound is beyond +-1e6 length units");
                 gen_slab(m, dir, (float)b[0], (float)b[1], ext, tag);
             }
 
@@ -882,6 +936,8 @@ static ShapeMesh parse_shapes(const json& arr, float ext[6], int mesh_res = 24,
                 std::string lctx = ctx + "[" + std::to_string(j) + "]";
                 std::vector<double> l = json_vec(layers[j], 3, 3, lctx);
                 vkmmc_require(l[1] >= l[0], lctx + ": need start <= end");
+                vkmmc_require(std::fabs(l[0]) <= VKMMC_MAX_COORD && std::fabs(l[1]) <= VKMMC_MAX_COORD,
+                              lctx + " is beyond +-1e6 length units");
                 json t;
                 t["Tag"] = l[2];
                 uint32_t lt = shape_tag(t, maxtag, lctx);
@@ -902,6 +958,9 @@ static ShapeMesh parse_shapes(const json& arr, float ext[6], int mesh_res = 24,
             vkmmc_require(dl > 1e-10, ctx + ".Dir must be a non-zero vector");
             vkmmc_require(Df + Db > 0, ctx + ": the lens thickness Front.D + Back.D must be positive");
             vkmmc_require(Rf != 0 && Rb != 0, ctx + ": Front.R and Back.R must be non-zero");
+            vkmmc_require(std::fabs(Df) <= VKMMC_MAX_COORD && std::fabs(Db) <= VKMMC_MAX_COORD &&
+                          std::fabs(Rf) <= VKMMC_MAX_COORD && std::fabs(Rb) <= VKMMC_MAX_COORD,
+                          ctx + ": Front/Back parameters are beyond +-1e6 length units");
             need_res(ctx);
 
             int nseg   = mesh_res;
