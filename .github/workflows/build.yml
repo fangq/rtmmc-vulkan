@@ -90,11 +90,22 @@ jobs:
           echo "vulkan-1.dll: $dll"
           [ -n "$dll" ] && dirname "$dll" >> "$GITHUB_PATH"
       - name: Configure
-        run: cmake -S . -B build -DVKMMC_BUILD_OPTIX=OFF -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DVKMMC_BUILD_OPTIX=OFF -DCMAKE_BUILD_TYPE=Release -DVKMMC_STATIC_RUNTIME=ON
       - name: Build
         run: cmake --build build --config Release --parallel
       - name: Unit and smoke tests
         run: ctest --test-dir build -C Release -LE gpu --output-on-failure
+      - name: Create the package
+        run: |
+          tag=$(echo "${{ runner.os }}-${{ runner.arch }}-github-latest" | tr '[:upper:]' '[:lower:]')
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          exe=$(ls build/bin/Release/vkmmc.exe build/bin/vkmmc 2>/dev/null | head -1)
+          bash .github/ci/package.sh "$tag" "$exe"
+      - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-vkmmc-packages-${{ env.RELEASE_TAG }}
+          path: packages/vkmmc-${{ env.RELEASE_TAG }}.zip
       - name: Functional tests on lavapipe (Windows, experimental)
         if: runner.os == 'Windows'
         continue-on-error: true
@@ -226,7 +237,17 @@ jobs:
         run: |
           docker run --rm -e HOST_UID=$(id -u) -v "$PWD:/src" -w /src quay.io/pypa/manylinux2014_x86_64 \
               bash .github/ci/manylinux_build.sh
+      - name: Create the package
+        run: |
+          tag=$(echo "${{ runner.os }}-${{ runner.arch }}-github-latest" | tr '[:upper:]' '[:lower:]')
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          bash .github/ci/package.sh "$tag" bin/vkmmc bin/vkmmc_optix
       - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-vkmmc-packages-${{ env.RELEASE_TAG }}
+          path: packages/vkmmc-${{ env.RELEASE_TAG }}.zip
+      - name: Upload the release tarball
         uses: actions/upload-artifact@v4
         with:
           name: vkmmc-linux-x86_64
@@ -236,3 +257,30 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.tar.gz
+
+  # ---------------------------------------------------------------
+  # Copy the packages (vkmmc-<os>-<arch>-github-latest.zip) to the
+  # download server, as the mcx/mcxcl/mmc workflows do
+  # ---------------------------------------------------------------
+  upload_package:
+    name: Upload packages
+    needs: [release, cross]
+    runs-on: ubuntu-22.04
+    if: ${{ !cancelled() && github.repository_owner == 'fangq' && github.actor == 'fangq' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - name: Download the packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: all-vkmmc-packages-*
+          merge-multiple: true
+          path: packages
+      - name: List the packages
+        run: ls -lR packages
+      - name: Copy the packages to the server
+        uses: wlixcc/SFTP-Deploy-Action@v1.2.4
+        with:
+          server: ${{ secrets.MCX_SERVER }}
+          username: ${{ secrets.MCX_SERVER_USER }}
+          ssh_private_key: ${{ secrets.MCX_SERVER_SSH_KEY }}
+          local_path: "packages/*"
+          remote_path: ${{ secrets.MCX_CI_PATH }}

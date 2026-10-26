@@ -14,7 +14,7 @@
 #                                   clone of https://github.com/NVIDIA/optix-dev
 #    -DVKMMC_SHOW=ON                the --show viewer (needs GLFW 3)
 #    -DVKMMC_USE_SYSTEM_ZLIB=ON     link zlib instead of the bundled miniz
-#    -DVKMMC_STATIC_RUNTIME=ON      link libstdc++/libgcc statically
+#    -DVKMMC_STATIC_RUNTIME=ON      link libstdc++/libgcc (MSVC: the CRT) statically
 #    -DVKMMC_BUILD_TESTS=OFF        skip the unit tests
 #
 #  The Makefiles in src/ and optix/ build the same binaries.
@@ -40,6 +40,12 @@ option(VKMMC_STATIC_RUNTIME "link libstdc++ and libgcc statically" OFF)
 option(VKMMC_BUILD_TESTS "build the unit tests and register the test suites" ON)
 
 set(OPTIX_ROOT "$ENV{OPTIX_ROOT}" CACHE PATH "OptiX SDK or optix-dev clone (containing include/optix.h)")
+
+# MSVC: with VKMMC_STATIC_RUNTIME the C/C++ runtime is linked statically (/MT),
+# so the executables do not need the Visual C++ redistributable
+if(VKMMC_STATIC_RUNTIME AND MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 set(SRC ${PROJECT_SOURCE_DIR}/src)
 set(GEN ${PROJECT_BINARY_DIR}/generated)
