@@ -15,7 +15,9 @@
  *   USE_CURVATURE   — enable curvature-corrected normals (requires USE_CSG)
  *   USE_ATOMIC_INT64 — native 64-bit integer atomics (GL_EXT_shader_atomic_int64);
  *                      without it the 64-bit sums use pairs of 32-bit atomics
- * The Makefile builds all six combinations and embeds them in vkmmc; the host
+ *   USE_ATOMIC_FLOAT — 32-bit float sums (GL_EXT_shader_atomic_float, --atomic float):
+ *                      faster, but not bit-reproducible
+ * The Makefile builds all nine combinations and embeds them in vkmmc; the host
  * picks one per input and device.
  *
  * Optimizations for curvature mode:
@@ -31,7 +33,9 @@
 #version 460
 #extension GL_EXT_ray_query : require
 
-#ifdef USE_ATOMIC_INT64
+#if defined(USE_ATOMIC_FLOAT)
+    #extension GL_EXT_shader_atomic_float : require
+#elif defined(USE_ATOMIC_INT64)
     #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
     #extension GL_EXT_shader_atomic_int64 : require
 #endif
@@ -57,8 +61,11 @@ struct Medium {
 };
 layout(std430, set = 0, binding = 2) readonly buffer MediaBuffer { Medium media[]; };
 
-// output: one unsigned 64-bit fixed-point sum (FIXED_SCALE units) per element
-#ifdef USE_ATOMIC_INT64
+// output: one unsigned 64-bit fixed-point sum (FIXED_SCALE units) per element,
+// or one float sum (USE_ATOMIC_FLOAT)
+#if defined(USE_ATOMIC_FLOAT)
+layout(std430, set = 0, binding = 3) buffer OutputBuffer { float output_data[]; };
+#elif defined(USE_ATOMIC_INT64)
 layout(std430, set = 0, binding = 3) buffer OutputBuffer { uint64_t output_data[]; };
 #else
 layout(std430, set = 0, binding = 3) buffer OutputBuffer { uint output_data[]; };
@@ -78,7 +85,7 @@ layout(std430, set = 0, binding = 3) buffer OutputBuffer { uint output_data[]; }
 // offset 112: dstep, tstart, tend, Rtstep          4 floats
 // offset 128: srctype, maxgate, outputtype, isreflect   3 ints + 1 uint
 // offset 144: mediumid0, total_threads, num_media, seed  4 uints
-// offset 160: do_csg, has_curvature, threadphoton, oddphoton  2 uint + 2 int
+// offset 160: do_csg, has_curvature, batch_photons, photon_base_hi  4 uints
 // offset 176: minenergy, roulettesize, do_traj, max_traj    2 floats + 2 uints
 // offset 192: photon_base, src_num, src_id, extra_src_len   2 uints, 1 int, 1 uint
 // offset 208: num_field, focus_mode, do_tally               1 uint, 1 int, 1 uint
@@ -113,8 +120,8 @@ layout(std140, set = 0, binding = 4) uniform SimParams {
     // offset 160: scalar row 3
     uint  do_csg;            // 160
     uint  has_curvature;     // 164
-    int   photons_per_thread;// 168
-    int   extra_photons;     // 172
+    uint  batch_photons;     // 168 — photons in this batch, claimed from photon_counter
+    uint  photon_base_hi;    // 172 — high word of the global index of the batch's first photon
 
     // offset 176: scalar row 4
     float minenergy;         // 176
@@ -123,7 +130,7 @@ layout(std140, set = 0, binding = 4) uniform SimParams {
     uint  max_traj;          // 188
 
     // offset 192: scalar row 5
-    uint  photon_base;       // 192 — global photon index offset for this batch
+    uint  photon_base;       // 192 — low word of the global index of the batch's first photon
     uint  src_num_u;         // 196 — (these source fields are the specialization constants below)
     int   src_id_u;          // 200
     uint  extra_src_len_u;   // 204
@@ -146,7 +153,7 @@ layout(constant_id = 5) const uint do_tally = 0u;         // tally the launched 
 layout(constant_id = 6) const uint do_specular = 0u;      // Fresnel reflection where a photon from outside enters
 layout(constant_id = 7) const uint initial_medium = 0xFFFFFFFFu; // mesh mode: the medium of every photon, or probed
 
-layout(std430, set = 0, binding = 5) readonly buffer SeedBuffer { uvec4 thread_seeds[]; };
+layout(std430, set = 0, binding = 5) buffer PhotonCounter { uint photon_counter; };  // zeroed per batch
 
 struct NodeCurv {
     vec4 vnorm_k1;   // .xyz = vertex normal, .w = k1
@@ -196,6 +203,45 @@ float rand01(inout uvec4 st) {
                ^ uvec2((s0.x >> 5u) | (s0.y << 27u), s0.y >> 5u);
     st.zw = ns;
     return uintBitsToFloat(0x3F800000u | ((ns.x + s0.x) >> 9u)) - 1.0;
+}
+
+uint hash32(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15u;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+/*
+ * The RNG state of the photon with global index (hi, lo): two independent
+ * hashes of the run seed and the index, so photons of runs with different
+ * seeds do not repeat. A photon's random numbers depend only on its index,
+ * so the output does not depend on the thread count, the batch size or the
+ * thread that simulates it.
+ */
+uvec4 photon_seed(uint lo, uint hi) {
+    uint a = hash32(lo ^ hash32(hi ^ hash32(rng_seed)));
+    uint b = hash32(lo ^ hash32(hi ^ hash32(rng_seed ^ 0x9E3779B9u)) ^ 0x85EBCA6Bu);
+    uvec4 st = uvec4(a, b, hash32(a ^ 0xC2B2AE35u), hash32(b ^ 0x27D4EB2Fu));
+    return all(equal(st, uvec4(0u))) ? uvec4(1u) : st;
+}
+
+/*
+ * Claim the next photon of the batch (dynamic load balancing: a thread whose
+ * photons end early takes more); false when the batch is done.
+ */
+bool next_photon(out uint id, out uvec4 rng) {
+    uint k = atomicAdd(photon_counter, 1u);
+    id = photon_base + k;
+
+    if (k >= batch_photons) {
+        return false;
+    }
+
+    rng = photon_seed(id, photon_base_hi + uint(id < photon_base));
+    return true;
 }
 
 float rand_range(inout uvec4 s, float a, float b) {
@@ -348,15 +394,19 @@ uvec2 ms_leave(uvec2 ms, uint back_id) {
  * bit-reproducible and its precision does not degrade with the photon count,
  * unlike float atomics. Without native 64-bit atomics the sum is a (low, high)
  * pair of 32-bit words with an explicit carry; both layouts are identical in
- * memory.
+ * memory. USE_ATOMIC_FLOAT adds floats instead: half the memory traffic, much
+ * faster on large grids, but the sums depend on the order of the additions.
  */
 const float FIXED_SCALE = 4294967296.0;
 
 void atomic_add_float(uint idx, float val) {
+#if defined(USE_ATOMIC_FLOAT)
+    atomicAdd(output_data[idx], val);
+#elif defined(USE_ATOMIC_INT64)
     float v = val * FIXED_SCALE + 0.5;   // round to nearest
-#ifdef USE_ATOMIC_INT64
     atomicAdd(output_data[idx], uint64_t(v));
 #else
+    float v = val * FIXED_SCALE + 0.5;
     uint hi = uint(v * (1.0 / FIXED_SCALE));
     uint lo = uint(v - float(hi) * FIXED_SCALE);
     uint old = atomicAdd(output_data[2u * idx], lo);
@@ -377,7 +427,7 @@ void atomic_add_float(uint idx, float val) {
  * of a pattern source shared by src_num patterns adds the deposit, scaled by
  * the intensity of each pattern at its pixel, to all src_num fields.
  */
-void deposit(uint idx, float val) {
+void deposit_now(uint idx, float val) {
     if (src_num > 1u) {
         uint b = ph_pixel * src_num;
 
@@ -390,6 +440,33 @@ void deposit(uint idx, float val) {
         }
     } else {
         atomic_add_float(ph_field * grid_stride.w + idx, val);
+    }
+}
+
+/*
+ * Deposits are summed in registers while the photon stays in one voxel and
+ * gate, and written by one atomic when it leaves (or ends, flush_deposit):
+ * in a scattering medium with voxels larger than the scattering length this
+ * saves most atomics, which collide on the voxels near the source. A
+ * photon's deposits keep their order, so the output stays reproducible.
+ */
+uint pend_idx = 0xFFFFFFFFu;
+float pend_val = 0.0;
+
+void flush_deposit() {
+    if (pend_idx != 0xFFFFFFFFu) {
+        deposit_now(pend_idx, pend_val);
+        pend_idx = 0xFFFFFFFFu;
+    }
+}
+
+void deposit(uint idx, float val) {
+    if (idx != pend_idx) {
+        flush_deposit();
+        pend_idx = idx;
+        pend_val = val;
+    } else {
+        pend_val += val;
     }
 }
 
@@ -1255,10 +1332,10 @@ void main() {
         return;
     }
 
-    uvec4 rng = thread_seeds[tid];
-    int done = 0, maxph = photons_per_thread + int(tid < uint(extra_photons));
+    uvec4 rng;
+    uint photon_id;     // low word of the global photon index
 
-    if (maxph <= 0) {
+    if (!next_photon(photon_id, rng)) {
         return;
     }
 
@@ -1266,7 +1343,6 @@ void main() {
     float weight, slen, tof;
     uint mid;
     uvec2 mstate;
-    uint photon_id = photon_base + tid;  // globally unique across batches
 
     vec3 launch_pos;
     uvec2 csg_cache = uvec2(0u, 0u);
@@ -1281,7 +1357,7 @@ void main() {
 
     bool traj_need_term = (mid != MEDIUM_DEAD);
 
-    while (done < maxph) {
+    while (true) {
 
         if (mid != MEDIUM_DEAD && mid != MEDIUM_AMBIENT) {
             Medium prop = media[mid];
@@ -1296,6 +1372,18 @@ void main() {
             // Curvature normal is computed from hit_pos, not barycentrics
             bool hit = trace_ray(pos, dir, RAY_TMIN, max_dist, hd, tri, ff);
 
+            // save output along the path to the hit or the scattering site; one
+            // call site, since a second inlined copy costs registers (~20% speed)
+            float L = hit ? (is_transparent ? hd : min(hd, max_dist)) : (is_transparent ? 0.0 : max_dist);
+#ifdef USE_CSG
+
+            if (!hit && do_csg > 0u && ms_get(mstate, 0) == 0u) {
+                L = 0.0;    // outside all shapes: terminated below
+            }
+
+#endif
+            accumulate(pos, dir, mid, weight, tof, L);
+
             // ---- Transparent medium, no hit → photon escapes ----
             if (!hit && is_transparent) {
                 mid = MEDIUM_DEAD;
@@ -1304,10 +1392,6 @@ void main() {
             } else if (hit) {
                 uint fm, bm;
                 unpack_media(faces[tri].media, fm, bm);
-                float L = is_transparent ? hd : min(hd, slen / prop.mus);
-
-                // save output
-                accumulate(pos, dir, mid, weight, tof, L);
 
                 // update photon position, weight, timer; a crossing photon is
                 // placed SAFETY_DIST off the facet plane on the far side
@@ -1421,8 +1505,6 @@ void main() {
 #endif
                 {
                     // Scatter: move to scattering site, update weight, pick new direction
-                    float L = slen / prop.mus;
-                    accumulate(pos, dir, mid, weight, tof, L);
                     pos += dir * L;
                     weight *= exp(-prop.mua * L);
                     tof += L * INV_C0 * prop.n;
@@ -1448,24 +1530,25 @@ void main() {
 
         // When a photon escapes or tof reaches the upper limit, launch a new one
         if (mid == MEDIUM_DEAD || mid == MEDIUM_AMBIENT || tof >= time_end) {
+            flush_deposit();
+
             if (traj_need_term) {
                 save_traj(pos, weight, photon_id, 2u);
             }
 
-            launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng, launch_pos, csg_cache, csg_cached);
-            ++done;
-            photon_id = photon_base + total_threads * uint(done) + tid;
-
-            if (done < maxph) {
-                tally_launch();
-                save_traj(launch_pos, 1.0, photon_id, 0u);  // original source position
-
-                if (any(notEqual(launch_pos, pos))) {
-                    save_traj(pos, weight, photon_id, 3u);   // sphere-entry boundary
-                }
-
-                traj_need_term = (mid != MEDIUM_DEAD);
+            if (!next_photon(photon_id, rng)) {
+                break;
             }
+
+            launch_photon(pos, dir, weight, slen, tof, mid, mstate, rng, launch_pos, csg_cache, csg_cached);
+            tally_launch();
+            save_traj(launch_pos, 1.0, photon_id, 0u);  // original source position
+
+            if (any(notEqual(launch_pos, pos))) {
+                save_traj(pos, weight, photon_id, 3u);   // sphere-entry boundary
+            }
+
+            traj_need_term = (mid != MEDIUM_DEAD);
         }
     }
 }

@@ -52,10 +52,10 @@ struct MCParams {
     uint32_t mediumid0, total_threads;      // 144: 2 uints
     uint32_t num_media, seed;               // 144+8: 2 uints
     uint32_t do_csg, has_curvature;         // 160: 2 uints
-    int      threadphoton, oddphoton;       // 160+8: 2 ints
+    uint32_t batch_photons, photon_base_hi; // 160+8: photons in the batch, high word of its first index
     float    minenergy, roulettesize;       // 176: 2 floats
     uint32_t do_traj, max_traj;             // 184: trajectory flags
-    uint32_t photon_base;                   // 192: global photon index offset for this batch
+    uint32_t photon_base;                   // 192: low word of the global index of the batch's first photon
     uint32_t src_num;                       // 196: patterns sharing the photons
     int      src_id;                        // 200: multi-source mode
     uint32_t extra_src_len;                 // 204: sources in the multi-source list
@@ -90,6 +90,7 @@ struct VulkanCtx {
     PFN_vkCmdBuildAccelerationStructuresKHR pfnCmdBuildAS;
     PFN_vkGetAccelerationStructureDeviceAddressKHR pfnGetASAddr;
     bool atomic64;              /* native 64-bit integer atomics on storage buffers */
+    bool atomicf;               /* float atomic add on storage buffers, enabled (--atomic float) */
     uint32_t max_wg_count;      /* maxComputeWorkGroupCount[0] */
 };
 struct Buffer {
@@ -268,6 +269,19 @@ static bool device_usable(VkPhysicalDevice pd) {
     return true;
 }
 
+/* does the device support float atomic add on storage buffers (--atomic float)? */
+static bool device_atomicf(VkPhysicalDevice pd) {
+    if (!has_extension(device_extensions(pd), VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
+        return false;
+    }
+
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT af = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
+    VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2.pNext = &af;
+    vkGetPhysicalDeviceFeatures2(pd, &f2);
+    return af.shaderBufferFloat32AtomicAdd == VK_TRUE;
+}
+
 /* does the device support 64-bit integer atomics on storage buffers? */
 static bool device_atomic64(VkPhysicalDevice pd) {
     VkPhysicalDeviceShaderAtomicInt64Features i64 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
@@ -317,7 +331,7 @@ void list_vulkan_gpus() {
         bool rq = has_extension(exts, VK_KHR_RAY_QUERY_EXTENSION_NAME);
         bool as = has_extension(exts, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         bool ok = device_usable(pds[j]);
-        bool af = device_atomic64(pds[j]);
+        bool af = device_atomic64(pds[j]), aff = device_atomicf(pds[j]);
         uint64_t tm = 0;
 
         for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
@@ -333,15 +347,16 @@ void list_vulkan_gpus() {
                pr.deviceName, ok ? "" : "(not usable) ");
         printf(" Vendor ID      :\t0x%04x\n Device type    :\t%s\n Global memory  :\t%llu B\n", pr.vendorID,
                dt[pr.deviceType < 5 ? pr.deviceType : 0], (unsigned long long)tm);
-        printf(" Ray query      :\t%s\n Accel structure:\t%s\n Int64 atomics  :\t%s\n", rq ? "Yes" : "No",
-               as ? "Yes" : "No", af ? "Yes" : "No");
+        printf(" Ray query      :\t%s\n Accel structure:\t%s\n Int64 atomics  :\t%s\n Float atomics  :\t%s\n",
+               rq ? "Yes" : "No", as ? "Yes" : "No", af ? "Yes" : "No", aff ? "Yes" : "No");
     }
 
     vkDestroyInstance(inst, NULL);
 }
 
-/* gpuid: 1-based index among usable devices (as listed by -L), 0 = auto (prefer discrete) */
-VulkanCtx init_vulkan(int gpuid) {
+/* gpuid: 1-based index among usable devices (as listed by -L), 0 = auto (prefer discrete);
+   floatatomic enables float atomics if the device has them */
+VulkanCtx init_vulkan(int gpuid, bool floatatomic = false) {
     VulkanCtx c;
     memset(&c, 0, sizeof(c));
     c.instance = create_instance();
@@ -411,9 +426,15 @@ VulkanCtx init_vulkan(int gpuid) {
     qci.pQueuePriorities = &prio;
     /* VKMMC_NO_ATOMIC64=1 forces the portable 32-bit atomic kernels (for testing) */
     c.atomic64 = device_atomic64(c.physDev) && getenv("VKMMC_NO_ATOMIC64") == NULL;
+    c.atomicf = floatatomic && device_atomicf(c.physDev);
+
+    if (floatatomic && !c.atomicf) {
+        fprintf(stderr, "vkmmc WARNING: the GPU has no float atomics on storage buffers; using fixed-point sums\n");
+    }
 
     const char* devExts[] = {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, VK_KHR_RAY_QUERY_EXTENSION_NAME,
-                             VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME
+                             VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+                             VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME
                             };
     VkPhysicalDeviceFeatures f10 = {};
     f10.shaderInt64 = c.atomic64 ? VK_TRUE : VK_FALSE;
@@ -421,7 +442,10 @@ VulkanCtx init_vulkan(int gpuid) {
     i64.shaderBufferInt64Atomics = VK_TRUE;
     VkPhysicalDeviceBufferDeviceAddressFeatures bda = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
     bda.bufferDeviceAddress = VK_TRUE;
-    bda.pNext = c.atomic64 ? (void*)&i64 : NULL;
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT aff = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
+    aff.shaderBufferFloat32AtomicAdd = VK_TRUE;
+    i64.pNext = c.atomicf ? (void*)&aff : NULL;
+    bda.pNext = c.atomic64 ? (void*)&i64 : (c.atomicf ? (void*)&aff : NULL);
     VkPhysicalDeviceAccelerationStructureFeaturesKHR asf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     asf.accelerationStructure = VK_TRUE;
     asf.pNext = &bda;
@@ -431,7 +455,7 @@ VulkanCtx init_vulkan(int gpuid) {
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 4;
+    dci.enabledExtensionCount = c.atomicf ? 5 : 4;
     dci.ppEnabledExtensionNames = devExts;
     dci.pEnabledFeatures = &f10;
     dci.pNext = &rqf;
@@ -679,14 +703,20 @@ struct SpirvBlob {
     unsigned int len;
 };
 
-/* [variant][native 64-bit atomics] — see the Makefile */
-static SpirvBlob embedded_kernel(int variant, bool atomic64) {
-    static const SpirvBlob k[KV_COUNT][2] = {
-        {{vkmmc_core_mesh_spv, vkmmc_core_mesh_spv_len}, {vkmmc_core_mesh_i64_spv, vkmmc_core_mesh_i64_spv_len}},
-        {{vkmmc_core_csg_spv, vkmmc_core_csg_spv_len}, {vkmmc_core_csg_i64_spv, vkmmc_core_csg_i64_spv_len}},
-        {{vkmmc_core_curv_spv, vkmmc_core_curv_spv_len}, {vkmmc_core_curv_i64_spv, vkmmc_core_curv_i64_spv_len}}
+/* [variant][32-bit pair, native 64-bit, float atomics] — see the Makefile */
+static SpirvBlob embedded_kernel(int variant, bool atomic64, bool atomicf) {
+    static const SpirvBlob k[KV_COUNT][3] = {
+        {   {vkmmc_core_mesh_spv, vkmmc_core_mesh_spv_len}, {vkmmc_core_mesh_i64_spv, vkmmc_core_mesh_i64_spv_len},
+            {vkmmc_core_mesh_f32_spv, vkmmc_core_mesh_f32_spv_len}
+        },
+        {   {vkmmc_core_csg_spv, vkmmc_core_csg_spv_len}, {vkmmc_core_csg_i64_spv, vkmmc_core_csg_i64_spv_len},
+            {vkmmc_core_csg_f32_spv, vkmmc_core_csg_f32_spv_len}
+        },
+        {   {vkmmc_core_curv_spv, vkmmc_core_curv_spv_len}, {vkmmc_core_curv_i64_spv, vkmmc_core_curv_i64_spv_len},
+            {vkmmc_core_curv_f32_spv, vkmmc_core_curv_f32_spv_len}
+        }
     };
-    return k[variant][atomic64 ? 1 : 0];
+    return k[variant][atomicf ? 2 : (atomic64 ? 1 : 0)];
 }
 
 static std::vector<uint32_t> load_spirv(const std::string& path) {
@@ -831,7 +861,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
 
     /* Output: one 64-bit fixed-point sum per voxel, gate and field, then the launched energy */
     OutputGrid g = compute_grid(cfg);
-    VkDeviceSize outBytes = g.nout * sizeof(uint64_t);
+    VkDeviceSize outBytes = g.nout * (ctx.atomicf ? sizeof(float) : sizeof(uint64_t));
     Buffer outBuf = create_device_buffer(ctx, outBytes, ssbo);
     {
         VkCommandBuffer cmd = begin_cmd(ctx);
@@ -884,7 +914,6 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
     params.mediumid0    = kernel_initial_medium(cfg);
     params.total_threads = tt;
     params.num_media    = (uint32_t)media.size();
-    params.seed         = cfg.rng_seed;
     params.do_csg        = cfg.is_csg ? 1u : 0u;
     params.has_curvature = st.has_curvature ? 1u : 0u;
     params.minenergy     = cfg.minenergy;
@@ -902,10 +931,9 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
 
     Buffer paramBuf = create_device_buffer(ctx, sizeof(MCParams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
-    /* RNG seeds, re-seeded per batch so that each batch simulates distinct photons */
-    uint32_t seed0 = base_seed(cfg);
-    std::vector<uint32_t> seeds;
-    Buffer seedBuf = create_device_buffer(ctx, (VkDeviceSize)tt * 4 * sizeof(uint32_t), ssbo);
+    /* the counter the threads claim the photons of a batch from; each photon seeds its RNG from its index */
+    params.seed = base_seed(cfg);
+    Buffer cntBuf = create_device_buffer(ctx, sizeof(uint32_t), ssbo);
 
     /* Trajectory buffer: [0]=atomic counter, [1..6*N]=records (6 uints each) */
     uint32_t traj_cap = do_traj ? cfg.maxjumpdebug : 0u;
@@ -918,7 +946,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
     }
 
     /* Kernel: embedded variant, or a user-supplied .spv */
-    SpirvBlob blob = embedded_kernel(st.variant, ctx.atomic64);
+    SpirvBlob blob = embedded_kernel(st.variant, ctx.atomic64, ctx.atomicf);
     std::vector<uint32_t> usercode;
     const uint32_t* code = reinterpret_cast<const uint32_t*>(blob.data);
     size_t codesize = blob.len;
@@ -929,49 +957,55 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
         codesize = usercode.size() * 4;
         printf("Kernel: %s (user supplied)\n", ovr.kernelfile.c_str());
     } else {
-        printf("Kernel: %s, %s atomics\n", kernel_variant_name(st.variant), ctx.atomic64 ? "64-bit" : "32-bit pair");
+        printf("Kernel: %s, %s atomics\n", kernel_variant_name(st.variant),
+               ctx.atomicf ? "float" : (ctx.atomic64 ? "64-bit" : "32-bit pair"));
     }
 
     SourceSpec spec = {params.srctype, params.src_num, params.src_id, params.extra_src_len, params.focus_mode, params.do_tally,
                        kernel_specular(cfg) ? 1u : 0u, params.mediumid0
                       };
     ComputePipe cp = create_pipeline(ctx, code, codesize, spec);
-    update_desc(ctx, cp, tlas.handle, faceBuf, mediaBuf, outBuf, paramBuf, seedBuf, curvBuf, trajBuf, patBuf, srcBuf);
+    update_desc(ctx, cp, tlas.handle, faceBuf, mediaBuf, outBuf, paramBuf, cntBuf, curvBuf, trajBuf, patBuf, srcBuf);
 
     /* Batched dispatch */
-    uint64_t batchsz = batch_size(cfg, ovr), pdone = 0;
+    uint64_t bp = 0, pdone = 0;
+    double bms = 0;
     int batch = 0;
     bool batch_readback = (outBytes <= VKMMC_BATCH_READBACK_BYTES);
     std::vector<double> acc;
     std::vector<uint64_t> raw(g.nout);
-    printf("Threads: %u (%u x 64), batch: %llu photons\n", tt, wg, (unsigned long long)batchsz);
+    printf("Threads: %u (%u x 64)\n", tt, wg);
 
     typedef std::chrono::high_resolution_clock Clk;
     double kms = 0;
     Clk::time_point t0sim = Clk::now();
 
     while (pdone < cfg.nphoton) {
-        uint64_t rem = cfg.nphoton - pdone, bp = (rem < batchsz) ? rem : batchsz;
-        params.threadphoton = (int)(bp / tt);
-        params.oddphoton    = (int)(bp - (uint64_t)params.threadphoton * tt);
-        params.photon_base  = (uint32_t)pdone;
-        make_seeds(seed0, pdone, tt, seeds);
-        upload_to_device(ctx, seedBuf, seeds.data(), seeds.size() * sizeof(uint32_t));
+        bp = next_batch(ovr, cfg.nphoton - pdone, tt, bp, bms);
+        params.batch_photons  = (uint32_t)bp;
+        params.photon_base    = (uint32_t)pdone;
+        params.photon_base_hi = (uint32_t)(pdone >> 32);
         upload_to_device(ctx, paramBuf, &params, sizeof(params));
         VkCommandBuffer cmd = begin_cmd(ctx);
+        vkCmdFillBuffer(cmd, cntBuf.buf, 0, sizeof(uint32_t), 0);
+        VkMemoryBarrier zb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+                             };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &zb, 0, NULL, 0, NULL);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeLayout, 0, 1, &cp.descSet, 0, NULL);
         vkCmdDispatch(cmd, wg, 1, 1);
         Clk::time_point ks = Clk::now();
         end_submit(ctx, cmd);
-        kms += std::chrono::duration<double, std::milli>(Clk::now() - ks).count();
+        bms = std::chrono::duration<double, std::milli>(Clk::now() - ks).count();
+        kms += bms;
         pdone += bp;
         batch++;
 
         /* move the batch output into the double accumulator, clear the GPU buffer */
         if (batch_readback && pdone < cfg.nphoton) {
             download_from_device(ctx, outBuf, raw.data(), outBytes);
-            accumulate_fixed(acc, raw.data(), g.nout);
+            add_batch_output(acc, raw, g.nout, ctx.atomicf);
             VkCommandBuffer zcmd = begin_cmd(ctx);
             vkCmdFillBuffer(zcmd, outBuf.buf, 0, outBytes, 0);
             end_submit(ctx, zcmd);
@@ -987,7 +1021,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
 
     /* Readback, normalization and output */
     download_from_device(ctx, outBuf, raw.data(), outBytes);
-    accumulate_fixed(acc, raw.data(), g.nout);
+    add_batch_output(acc, raw, g.nout, ctx.atomicf);
     std::vector<float> vol = finalize_output(cfg, g, acc);
     save_fluence(cfg, g, vol);
 
@@ -1014,7 +1048,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
     destroy_buf(ctx, mediaBuf);
     destroy_buf(ctx, outBuf);
     destroy_buf(ctx, paramBuf);
-    destroy_buf(ctx, seedBuf);
+    destroy_buf(ctx, cntBuf);
     destroy_buf(ctx, curvBuf);
     destroy_buf(ctx, trajBuf);
     destroy_buf(ctx, patBuf);
@@ -1327,7 +1361,7 @@ static void run_show(const SimConfig& cfg, const SimSetup& st, const CmdOverride
                     show_ovr.batch_size = 100000;
                 }
 
-                VulkanCtx compute_ctx = init_vulkan(ovr.gpuid);
+                VulkanCtx compute_ctx = init_vulkan(ovr.gpuid, ovr.floatatomic);
                 TrajData td = run_mc_simulation(compute_ctx, cfg, st, show_ovr);
                 destroy_vulkan(compute_ctx);
                 ShowTraj result;
@@ -1369,7 +1403,7 @@ int main(int argc, char** argv) {
 
 #endif
 
-        VulkanCtx ctx = init_vulkan(ovr.gpuid);
+        VulkanCtx ctx = init_vulkan(ovr.gpuid, ovr.floatatomic);
         run_mc_simulation(ctx, cfg, st, ovr);
         destroy_vulkan(ctx);
     } catch (const std::exception& e) {

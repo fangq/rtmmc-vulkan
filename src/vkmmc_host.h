@@ -49,12 +49,14 @@ struct CmdOverrides {
     int debuglevel;     // -1 = not set
     int64_t maxjumpdebug;   // -1 = not set
     bool show;          // launch interactive viewer
+    bool floatatomic;   // --atomic float: float sums instead of 64-bit fixed point
     std::string traj_file;  // optional _traj.jdat to display without simulating
     std::string session_id, json_str, inputfile;
     std::string kernelfile; // optional .spv/.ptx kernel overriding the embedded one
     CmdOverrides(): nphoton(0), batch_size(UINT64_MAX), rng_seed(0), totalthread(0), has_seed(false), unitinmm(0),
         outputtype(-1), isreflect(-1), isspecular(-1), isnormalize(-1), gpuid(-1), listgpu(false), dumpjson(false), dumpmesh(false),
-        meshres(0), docurv(-1), debugcurv(false), debuglevel(-1), maxjumpdebug(-1), show(false) {}
+        meshres(0), docurv(-1), debugcurv(false), debuglevel(-1), maxjumpdebug(-1), show(false),
+        floatatomic(false) {}
 };
 
 static void print_version(const char* prog, const char* backend) {
@@ -76,8 +78,9 @@ static void printhelp(const char* prog, const char* backend, int defgpu) {
            " -b/--reflect 0|1    refractive index mismatch at boundaries [1]\n"
            " -V/--specular 0|1   Fresnel reflection where photons from outside enter [0]\n"
            " -U/--normalize 0|1  normalize the output [1]\n"
-           " -t/--thread num     total GPU threads, a multiple of 64 [65536]\n"
-           " -B/--batch  num     photons per kernel launch [500000, 0: all at once]\n"
+           " -t/--thread num     total GPU threads, a multiple of 64 [131072]\n"
+           " -B/--batch  num     photons per kernel launch [auto: about 0.5 s each, 0: all at once]\n"
+           " --atomic fixed|float output sums: exact 64-bit fixed point, or faster float [fixed]\n"
            " -G/--gpuid  id      GPU device [%d]; -L lists them\n"
            " -m/--meshres num    shape mesh resolution [24], %d-%d\n"
            " -c/--curv   -1|0|1  curvature-corrected normals [-1: auto, on for curved shapes]\n"
@@ -190,6 +193,10 @@ static bool parse_cmdline(int argc, char** argv, CmdOverrides& ovr, const char* 
             const char* darg = val();
             ovr.debuglevel = isalpha((unsigned char)darg[0]) ? (int)parse_debugopt(darg, "option -D")
                              : parse_int_arg("-D", darg, 0, INT_MAX);
+        } else if (a == "--atomic") {
+            std::string v = val();
+            vkmmc_require(v == "fixed" || v == "float", "option --atomic expects fixed or float");
+            ovr.floatatomic = (v == "float");
         } else if (a == "--maxjumpdebug") {
             ovr.maxjumpdebug = (int64_t)parse_num_arg(a.c_str(), val(), 0, 1e9);
         } else if (a == "--show") {
@@ -557,7 +564,7 @@ static std::vector<float> kernel_pattern(const SimConfig& cfg) {
 
 /* GPU thread count: a multiple of 64, at most one photon per thread for small runs */
 static uint32_t thread_count(const SimConfig& cfg, const CmdOverrides& ovr) {
-    uint64_t tt = (ovr.totalthread > 0) ? ovr.totalthread : 65536;
+    uint64_t tt = (ovr.totalthread > 0) ? ovr.totalthread : 131072;
 
     if (cfg.nphoton < tt) {
         tt = cfg.nphoton;
@@ -567,39 +574,42 @@ static uint32_t thread_count(const SimConfig& cfg, const CmdOverrides& ovr) {
     return (uint32_t)std::max<uint64_t>(tt, 64);
 }
 
-static uint64_t batch_size(const SimConfig& cfg, const CmdOverrides& ovr) {
-    if (ovr.batch_size == 0) {
-        return cfg.nphoton;
+#define VKMMC_BATCH_MS 500.0                  /* auto batches: target kernel time, below GPU watchdogs */
+#define VKMMC_BATCH_MAX ((uint64_t)1 << 24)    /* auto batches: photons, keeps the fixed-point sums far from overflow */
+
+/*
+ * Photons in the next kernel launch, remaining still to run. -B n fixes the
+ * batch (0: all at once). By default the first launch runs 4 photons per
+ * thread and each later one is sized from the speed of the previous launch
+ * (last photons in last_ms) to take about VKMMC_BATCH_MS, at most
+ * VKMMC_BATCH_MAX photons. A photon's random
+ * numbers depend only on its index, so the batch sizes do not change the
+ * output.
+ */
+static uint64_t next_batch(const CmdOverrides& ovr, uint64_t remaining, uint32_t nthread, uint64_t last, double last_ms) {
+    uint64_t n;
+
+    if (ovr.batch_size != UINT64_MAX) {
+        n = (ovr.batch_size == 0) ? remaining : ovr.batch_size;
+    } else if (last == 0) {
+        n = (uint64_t)nthread * 4;
+    } else {
+        double rate = (double)last / std::max(last_ms, 1e-3);
+        n = (uint64_t)std::min(rate * VKMMC_BATCH_MS, (double)last * 8);
+        n = std::min(std::max(n, (uint64_t)nthread), VKMMC_BATCH_MAX);
+
+        if (remaining - std::min(n, remaining) < n / 4) {
+            n = remaining;     /* no short last launch */
+        }
     }
 
-    return (ovr.batch_size != UINT64_MAX) ? ovr.batch_size : 500000;
+    /* the kernels claim photons with a 32-bit counter, which every thread passes once at the end */
+    return std::min(std::min(n, remaining), (uint64_t)0xFFFFFFFFu - nthread);
 }
 
 /* base RNG seed; 0 picks one from the clock */
 static uint32_t base_seed(const SimConfig& cfg) {
     return (cfg.rng_seed > 0) ? cfg.rng_seed : (uint32_t)time(0);
-}
-
-/* hashed per-thread seeds for one batch, 4 words per thread */
-static void make_seeds(uint32_t base, uint64_t photon_offset, uint32_t nthread, std::vector<uint32_t>& seeds) {
-    auto hash = [](uint32_t v) -> uint32_t {
-        v ^= v >> 16;
-        v *= 0x45d9f3bu;
-        v ^= v >> 16;
-        v *= 0x45d9f3bu;
-        v ^= v >> 16;
-        return v;
-    };
-    uint32_t b = base + (uint32_t)photon_offset;
-    seeds.resize((size_t)nthread * 4);
-
-    for (uint32_t i = 0; i < nthread * 4u; i++) {
-        seeds[i] = hash(b ^ (i * 2654435761u));
-
-        if (seeds[i] == 0) {
-            seeds[i] = 0x9E3779B9u;   /* xorshift128+ must not start from all zero */
-        }
-    }
 }
 
 // ============================================================================
@@ -622,6 +632,24 @@ static void accumulate_fixed(std::vector<double>& acc, const uint64_t* raw, uint
 
     for (uint64_t i = 0; i < nelem; i++) {
         acc[i] += (double)raw[i] * (1.0 / VKMMC_FIXED_SCALE);
+    }
+}
+
+/* the same for float sums (--atomic float) */
+static void accumulate_float(std::vector<double>& acc, const float* raw, uint64_t nelem) {
+    acc.resize(nelem, 0.0);
+
+    for (uint64_t i = 0; i < nelem; i++) {
+        acc[i] += raw[i];
+    }
+}
+
+/* add one batch of kernel output, nelem fixed-point sums or (isfloat) float sums, to acc */
+static void add_batch_output(std::vector<double>& acc, const std::vector<uint64_t>& raw, uint64_t nelem, bool isfloat) {
+    if (isfloat) {
+        accumulate_float(acc, reinterpret_cast<const float*>(raw.data()), nelem);
+    } else {
+        accumulate_fixed(acc, raw.data(), nelem);
     }
 }
 

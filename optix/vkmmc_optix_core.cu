@@ -36,7 +36,7 @@ struct VKMMCParam {
     CUdeviceptr facebuf;
     CUdeviceptr curvbuf;
     CUdeviceptr outputbuf;
-    CUdeviceptr seedbuf;
+    CUdeviceptr cntbuf;           /* the counter the threads claim the photons of a batch from */
     int srctype;
     float3 srcpos, srcdir;
     float4 srcparam1, srcparam2;
@@ -49,7 +49,9 @@ struct VKMMCParam {
     unsigned int num_media;
     unsigned int do_csg;
     unsigned int has_curvature;
-    int threadphoton, oddphoton;
+    unsigned int batch_photons;   /* photons in this batch */
+    unsigned int photon_base, photon_base_hi;   /* global index of its first photon */
+    unsigned int rng_seed;
     float minenergy, roulettesize;
     CUdeviceptr patternbuf;       /* pattern source: src_num intensities per pixel */
     CUdeviceptr extrasrcbuf;      /* multi-source list: 4 float4 per source */
@@ -61,6 +63,7 @@ struct VKMMCParam {
     int focus_mode;               /* 0 none, 1 focused, 2 isotropic, 3 Lambertian */
     unsigned int do_tally;        /* tally the launched energy (sources with varying weights) */
     unsigned int do_specular;     /* Fresnel reflection where a photon from outside enters */
+    unsigned int float_atomic;    /* --atomic float: float sums instead of 64-bit fixed point */
     Medium media[MAX_PROP];
 };
 
@@ -110,6 +113,35 @@ __device__ __forceinline__ float rand01(uint4& st) {
     return s1.f[0] - 1.0f;
 }
 
+__device__ __forceinline__ unsigned int hash32(unsigned int x) {
+    x ^= x >> 16;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    return x;
+}
+
+/* the RNG state of the photon with global index (hi, lo), see photon_seed() in vkmmc_core.comp */
+__device__ __forceinline__ uint4 photon_seed(unsigned int lo, unsigned int hi) {
+    unsigned int a = hash32(lo ^ hash32(hi ^ hash32(gcfg.rng_seed)));
+    unsigned int b = hash32(lo ^ hash32(hi ^ hash32(gcfg.rng_seed ^ 0x9E3779B9u)) ^ 0x85EBCA6Bu);
+    uint4 st = make_uint4(a, b, hash32(a ^ 0xC2B2AE35u), hash32(b ^ 0x27D4EB2Fu));
+    return (st.x | st.y | st.z | st.w) ? st : make_uint4(1, 1, 1, 1);
+}
+
+/* claim the next photon of the batch, see next_photon() in vkmmc_core.comp */
+__device__ __forceinline__ bool next_photon(uint4& rng) {
+    unsigned int k = atomicAdd((unsigned int*)gcfg.cntbuf, 1u), id = gcfg.photon_base + k;
+
+    if (k >= gcfg.batch_photons) {
+        return false;
+    }
+
+    rng = photon_seed(id, gcfg.photon_base_hi + (id < gcfg.photon_base ? 1u : 0u));
+    return true;
+}
+
 __device__ __forceinline__ float rand_scatlen(uint4& rng) {
     return -logf(rand01(rng) + FEPS);
 }
@@ -122,6 +154,8 @@ struct Photon {
     float3 p0, dir;
     float slen, weight, tof;
     unsigned int mid;
+    unsigned int pidx;      /* pending deposit: element (0xFFFFFFFF: none) ... */
+    float pval;             /* ... and its sum, see flush_deposit() */
 #ifdef USE_CSG
     uint2 mstate;
     unsigned int pending;   /* crossed a coplanar triangle: raygen re-derives mstate */
@@ -145,6 +179,11 @@ __device__ __forceinline__ Photon getPhoton() {
     ph.mstate = make_uint2(optixGetPayload_10(), optixGetPayload_11());
     ph.pending = optixGetPayload_16();
     ph.primid = optixGetPayload_17();
+    ph.pidx = optixGetPayload_18();
+    ph.pval = __uint_as_float(optixGetPayload_19());
+#else
+    ph.pidx = optixGetPayload_14();
+    ph.pval = __uint_as_float(optixGetPayload_15());
 #endif
     return ph;
 }
@@ -165,6 +204,11 @@ __device__ __forceinline__ void setPhoton(const Photon& ph) {
     optixSetPayload_11(ph.mstate.y);
     optixSetPayload_16(ph.pending);
     optixSetPayload_17(ph.primid);
+    optixSetPayload_18(ph.pidx);
+    optixSetPayload_19(__float_as_uint(ph.pval));
+#else
+    optixSetPayload_14(ph.pidx);
+    optixSetPayload_15(__float_as_uint(ph.pval));
 #endif
 }
 
@@ -200,20 +244,24 @@ __device__ __forceinline__ void traceRay(Photon& ph, uint4& rng, float tmax, flo
 #ifdef USE_CSG
     unsigned int p10 = ph.mstate.x, p11 = ph.mstate.y;
     unsigned int p12 = rng.x, p13 = rng.y, p14 = rng.z, p15 = rng.w;
-    unsigned int p16 = ph.pending, p17 = ph.primid;
+    unsigned int p16 = ph.pending, p17 = ph.primid, p18 = ph.pidx, p19 = __float_as_uint(ph.pval);
     optixTrace(gcfg.gashandle, ph.p0, ph.dir, tmin, tmax, 0.0f,
                OptixVisibilityMask(255), OPTIX_RAY_FLAG_DISABLE_ANYHIT, 0, 1, 0,
-               p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17);
+               p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15, p16, p17, p18, p19);
     ph.mstate = make_uint2(p10, p11);
     ph.pending = p16;
     ph.primid = p17;
+    ph.pidx = p18;
+    ph.pval = __uint_as_float(p19);
     rng = make_uint4(p12, p13, p14, p15);
 #else
-    unsigned int p10 = rng.x, p11 = rng.y, p12 = rng.z, p13 = rng.w;
+    unsigned int p10 = rng.x, p11 = rng.y, p12 = rng.z, p13 = rng.w, p14 = ph.pidx, p15 = __float_as_uint(ph.pval);
     optixTrace(gcfg.gashandle, ph.p0, ph.dir, tmin, tmax, 0.0f,
                OptixVisibilityMask(255), OPTIX_RAY_FLAG_DISABLE_ANYHIT, 0, 1, 0,
-               p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13);
+               p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13, p14, p15);
     rng = make_uint4(p10, p11, p12, p13);
+    ph.pidx = p14;
+    ph.pval = __uint_as_float(p15);
 #endif
     ph.p0 = make_float3(__uint_as_float(p0), __uint_as_float(p1), __uint_as_float(p2));
     ph.dir = make_float3(__uint_as_float(p3), __uint_as_float(p4), __uint_as_float(p5));
@@ -362,9 +410,13 @@ __device__ __forceinline__ float3 get_normal(int primid, float3 hit_pos, float4 
 
 #define FIXED_SCALE 4294967296.f
 
-/* add a deposit as an unsigned 64-bit fixed-point sum, see vkmmc_core.comp */
+/* add a deposit as an unsigned 64-bit fixed-point sum, or a float (--atomic float), see vkmmc_core.comp */
 __device__ __forceinline__ void atomic_add_out(unsigned int idx, float val) {
-    atomicAdd((unsigned long long*)gcfg.outputbuf + idx, (unsigned long long)(val * FIXED_SCALE + 0.5f));
+    if (gcfg.float_atomic) {
+        atomicAdd((float*)gcfg.outputbuf + idx, val);
+    } else {
+        atomicAdd((unsigned long long*)gcfg.outputbuf + idx, (unsigned long long)(val * FIXED_SCALE + 0.5f));
+    }
 }
 
 /* the photon's slot: its output field (multi-source) or its pattern pixel (shared patterns) */
@@ -383,9 +435,9 @@ __device__ __noinline__ void deposit_shared(unsigned int idx, float val) {
     }
 }
 
-/* a deposit of the current photon at element idx of its field(s); see deposit() in vkmmc_core.comp.
+/* a deposit of the current photon at element idx of its field(s); see deposit_now() in vkmmc_core.comp.
    The rare shared-pattern path is not inlined: it would cost the common path registers */
-__device__ __forceinline__ void deposit(unsigned int idx, float val) {
+__device__ __forceinline__ void deposit_now(unsigned int idx, float val) {
     if (gcfg.src_num > 1) {
         deposit_shared(idx, val);
     } else {
@@ -393,8 +445,27 @@ __device__ __forceinline__ void deposit(unsigned int idx, float val) {
     }
 }
 
+/* write the photon's pending deposit, see flush_deposit() in vkmmc_core.comp */
+__device__ __forceinline__ void flush_deposit(Photon& ph) {
+    if (ph.pidx != 0xFFFFFFFFu) {
+        deposit_now(ph.pidx, ph.pval);
+        ph.pidx = 0xFFFFFFFFu;
+    }
+}
+
+/* sum deposits while the photon stays in one voxel and gate, see deposit() in vkmmc_core.comp */
+__device__ __forceinline__ void deposit(Photon& ph, unsigned int idx, float val) {
+    if (idx != ph.pidx) {
+        flush_deposit(ph);
+        ph.pidx = idx;
+        ph.pval = val;
+    } else {
+        ph.pval += val;
+    }
+}
+
 /* exact voxel/gate traversal; see accumulate() in vkmmc_core.comp */
-__device__ void accumulate(const Photon& ph, const Medium& prop, float L) {
+__device__ void accumulate(Photon& ph, const Medium& prop, float L) {
     if (!(L > 0.f)) {
         return;
     }
@@ -420,7 +491,7 @@ __device__ void accumulate(const Photon& ph, const Medium& prop, float L) {
             if (gi >= 0.f && gi < (float)gcfg.maxgate) {
                 float x = prop.mua * L;
                 float frac = (x < 1e-3f) ? x * (1.f - 0.5f * x) : 1.f - expf(-x);
-                deposit((unsigned int)gi * gs.z + (unsigned int)iv.z * gs.y + (unsigned int)iv.y * gs.x + (unsigned int)iv.x,
+                deposit(ph, (unsigned int)gi * gs.z + (unsigned int)iv.z * gs.y + (unsigned int)iv.y * gs.x + (unsigned int)iv.x,
                         (gcfg.output_type == OUT_ENERGY) ? w * frac : w * ((x < 1e-3f) ? L * (1.f - 0.5f * x) : frac / prop.mua));
             }
 
@@ -451,7 +522,7 @@ __device__ void accumulate(const Photon& ph, const Medium& prop, float L) {
         if (gi >= 0.f) {
             float dep = (gcfg.output_type == OUT_ENERGY) ? w * frac
                         : w * ((x < 1e-3f) ? (te - t) * lscale * (1.f - 0.5f * x) : frac / prop.mua);
-            deposit((unsigned int)gi * gs.z + (unsigned int)iv.z * gs.y + (unsigned int)iv.y * gs.x + (unsigned int)iv.x, dep);
+            deposit(ph, (unsigned int)gi * gs.z + (unsigned int)iv.z * gs.y + (unsigned int)iv.y * gs.x + (unsigned int)iv.x, dep);
         }
 
         w *= 1.f - frac;
@@ -820,6 +891,8 @@ __device__ void launch_photon(Photon& ph, uint4& rng, float& w0) {
     ph.dir = gcfg.srcdir;
     ph.weight = 1.0f;
     ph.tof = 0;
+    ph.pidx = 0xFFFFFFFFu;
+    ph.pval = 0;
 #ifdef USE_CSG
     ph.mstate = make_uint2(0, 0);
     ph.pending = 0;
@@ -867,6 +940,8 @@ __device__ bool probe_ray(float3 o, float3 d, float tmin, uint4& rng, float& hd,
     pr.weight = 0;
     pr.tof = 0;
     pr.mid = MEDIUM_PROBE;
+    pr.pidx = 0xFFFFFFFFu;
+    pr.pval = 0;
 #ifdef USE_CSG
     pr.mstate = make_uint2(0, 0);
     pr.pending = 0;
@@ -1185,23 +1260,20 @@ __device__ void start_photon(Photon& ph, uint4& rng, float& w0, uint2& cache, bo
 /* ================================================================ */
 
 extern "C" __global__ void __raygen__rg() {
-    unsigned int tid = optixGetLaunchIndex().x;
-    uint4 rng = ((uint4*)gcfg.seedbuf)[tid];
+    uint4 rng;
     uint2 cache = make_uint2(0, 0);
     bool cached = false;
-
-    int done = 0;
-    int maxph = gcfg.threadphoton + (tid < (unsigned int)gcfg.oddphoton ? 1 : 0);
     float w0;
+
+    if (!next_photon(rng)) {
+        return;
+    }
 
     Photon ph;
     start_photon(ph, rng, w0, cache, cached);
+    tally_launch(w0);
 
-    if (maxph > 0) {
-        tally_launch(w0);
-    }
-
-    while (done < maxph) {
+    while (true) {
 #ifdef USE_CSG
 
         if (ph.pending) {
@@ -1214,15 +1286,16 @@ extern "C" __global__ void __raygen__rg() {
             float mus = gcfg.media[ph.mid].mus;
             traceRay(ph, rng, mus > 0.0f ? ph.slen / mus : std::numeric_limits<float>::max());
         } else {
-            start_photon(ph, rng, w0, cache, cached);
+            flush_deposit(ph);
 
-            if (++done < maxph) {
-                tally_launch(w0);
+            if (!next_photon(rng)) {
+                break;
             }
+
+            start_photon(ph, rng, w0, cache, cached);
+            tally_launch(w0);
         }
     }
-
-    ((uint4*)gcfg.seedbuf)[tid] = rng;
 }
 
 /* ================================================================ */

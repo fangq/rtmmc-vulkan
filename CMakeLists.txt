@@ -118,12 +118,14 @@ if(VKMMC_BUILD_VULKAN)
             set(defs -DUSE_CSG -DUSE_CURVATURE)
         endif()
 
-        foreach(atom "" "_i64")
+        foreach(atom "" "_i64" "_f32")
             set(spv ${GEN}/vkmmc_core_${v}${atom}.spv)
             set(extra "")
 
             if(atom STREQUAL "_i64")
                 set(extra -DUSE_ATOMIC_INT64)
+            elseif(atom STREQUAL "_f32")
+                set(extra -DUSE_ATOMIC_FLOAT)
             endif()
 
             add_custom_command(OUTPUT ${spv}

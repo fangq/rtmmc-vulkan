@@ -79,7 +79,7 @@ struct VKMMCParam {
     CUdeviceptr  facebuf;
     CUdeviceptr  curvbuf;
     CUdeviceptr  outputbuf;
-    CUdeviceptr  seedbuf;
+    CUdeviceptr  cntbuf;
     int     srctype;
     float3  srcpos, srcdir;
     float4  srcparam1, srcparam2;
@@ -95,7 +95,9 @@ struct VKMMCParam {
     uint32_t num_media;
     uint32_t do_csg;
     uint32_t has_curvature;
-    int     threadphoton, oddphoton;
+    uint32_t batch_photons;
+    uint32_t photon_base, photon_base_hi;
+    uint32_t rng_seed;
     float   minenergy;
     float   roulettesize;
     CUdeviceptr patternbuf, extrasrcbuf, slotbuf;
@@ -106,6 +108,7 @@ struct VKMMCParam {
     int     focus_mode;
     uint32_t do_tally;
     uint32_t do_specular;
+    uint32_t float_atomic;
     Medium_GPU media[MAX_PROP];
 };
 
@@ -244,6 +247,7 @@ static std::vector<OptixModuleCompileBoundValueEntry> source_bound_values(const 
     VKMMC_BIND(do_tally);
     VKMMC_BIND(do_specular);
     VKMMC_BIND(initial_medium);
+    VKMMC_BIND(float_atomic);
 #undef VKMMC_BIND
     return b;
 }
@@ -292,8 +296,8 @@ void setup_optix(OptixState& st, int gpuid, int variant, const std::string& ptxf
     st.pipeCompileOpts = {};
     st.pipeCompileOpts.usesMotionBlur = false;
     st.pipeCompileOpts.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
-    /* photon (10; CSG: +2 media state, +2 coplanar crossing) + 4 RNG words */
-    st.pipeCompileOpts.numPayloadValues = (variant == KV_MESH) ? 14 : 18;
+    /* photon (10; CSG: +2 media state, +2 coplanar crossing) + 4 RNG words + 2 pending deposit */
+    st.pipeCompileOpts.numPayloadValues = (variant == KV_MESH) ? 16 : 20;
     st.pipeCompileOpts.numAttributeValues = 2;
     st.pipeCompileOpts.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
     st.pipeCompileOpts.pipelineLaunchParamsVariableName = "gcfg";
@@ -482,6 +486,7 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
     VKMMCParam params;
     memset(&params, 0, sizeof(params));
     source_params(params, cfg);
+    params.float_atomic = ovr.floatatomic ? 1u : 0u;
 
     OptixState optix;
     setup_optix(optix, ovr.gpuid, st.variant, ovr.kernelfile, params);
@@ -520,12 +525,12 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
     CUDABuf curvBuf;
     curvBuf.alloc_upload(gpuCurv);
 
-    /* Output: one 64-bit fixed-point sum per voxel, gate and field, then the launched energy */
+    /* Output: one 64-bit fixed-point (--atomic float: float) sum per voxel, gate and field, then the launched energy */
     OutputGrid g = compute_grid(cfg);
-    size_t outSz = g.nout;
+    size_t outSz = g.nout, outBytes = outSz * (params.float_atomic ? sizeof(float) : sizeof(uint64_t));
     CUDABuf outBuf;
-    outBuf.alloc(outSz * sizeof(uint64_t));
-    CUDA_CHECK(cudaMemset(outBuf.ptr, 0, outSz * sizeof(uint64_t)));
+    outBuf.alloc(outBytes);
+    CUDA_CHECK(cudaMemset(outBuf.ptr, 0, outBytes));
     if (g.nfield > 1) {
         printf("Fields: %u (%s)\n", g.nfield, cfg.srcnum > 1 ? "patterns" : "sources");
     }
@@ -534,10 +539,9 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
            g.nx, g.ny, g.nz, g.maxgate, g.vs, g.vs * cfg.unitinmm, g.gmin[0], g.gmin[1], g.gmin[2]);
 
     uint32_t tt = thread_count(cfg, ovr);
-    uint32_t seed0 = base_seed(cfg);
-    std::vector<uint32_t> seeds;
-    CUDABuf seedBuf;
-    seedBuf.alloc((size_t)tt * 4 * sizeof(uint32_t));
+    params.rng_seed = base_seed(cfg);
+    CUDABuf cntBuf;
+    cntBuf.alloc(sizeof(uint32_t));
 
     /* source pattern, multi-source list and the per-thread photon slot */
     std::vector<float> pattern = kernel_pattern(cfg), extrasrc = kernel_extrasrc(cfg);
@@ -550,7 +554,7 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
     params.facebuf = faceBuf.d_ptr();
     params.curvbuf = curvBuf.d_ptr();
     params.outputbuf = outBuf.d_ptr();
-    params.seedbuf = seedBuf.d_ptr();
+    params.cntbuf = cntBuf.d_ptr();
     params.srcpos = make_float3(cfg.srcpos[0], cfg.srcpos[1], cfg.srcpos[2]);
     params.srcdir = make_float3(cfg.srcdir[0], cfg.srcdir[1], cfg.srcdir[2]);
     params.srcparam1 = make_float4(cfg.srcparam1[0], cfg.srcparam1[1], cfg.srcparam1[2], cfg.srcparam1[3]);
@@ -583,38 +587,40 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
     paramBuf.alloc(sizeof(VKMMCParam));
 
     /* Launch in batches */
-    uint64_t batchsz = batch_size(cfg, ovr), pdone = 0;
+    uint64_t bp = 0, pdone = 0;
+    double bms = 0;
     int batch = 0;
-    bool batch_readback = (outSz * sizeof(uint64_t) <= VKMMC_BATCH_READBACK_BYTES);
+    bool batch_readback = (outBytes <= VKMMC_BATCH_READBACK_BYTES);
     std::vector<double> acc;
     std::vector<uint64_t> raw(outSz);
-    printf("Threads: %u, batch: %llu photons\n", tt, (unsigned long long)batchsz);
+    printf("Threads: %u\n", tt);
 
     typedef std::chrono::high_resolution_clock Clk;
     double kms = 0;
     Clk::time_point t0 = Clk::now();
 
     while (pdone < cfg.nphoton) {
-        uint64_t rem = cfg.nphoton - pdone, bp = (rem < batchsz) ? rem : batchsz;
-        params.threadphoton = (int)(bp / tt);
-        params.oddphoton = (int)(bp - (uint64_t)params.threadphoton * tt);
-        make_seeds(seed0, pdone, tt, seeds);
-        seedBuf.upload(seeds.data(), seeds.size() * sizeof(uint32_t));
+        bp = next_batch(ovr, cfg.nphoton - pdone, tt, bp, bms);
+        params.batch_photons = (uint32_t)bp;
+        params.photon_base = (uint32_t)pdone;
+        params.photon_base_hi = (uint32_t)(pdone >> 32);
         paramBuf.upload(&params, sizeof(params));
+        CUDA_CHECK(cudaMemset(cntBuf.ptr, 0, sizeof(uint32_t)));
 
         Clk::time_point ks = Clk::now();
         OPTIX_CHECK(optixLaunch(optix.pipeline, 0, paramBuf.d_ptr(), sizeof(VKMMCParam), &optix.sbt, tt, 1, 1));
         CUDA_CHECK(cudaDeviceSynchronize());
-        kms += std::chrono::duration<double, std::milli>(Clk::now() - ks).count();
+        bms = std::chrono::duration<double, std::milli>(Clk::now() - ks).count();
+        kms += bms;
 
         pdone += bp;
         batch++;
 
         /* move the batch output into the double accumulator, clear the GPU buffer */
         if (batch_readback && pdone < cfg.nphoton) {
-            outBuf.download(raw.data(), outSz * sizeof(uint64_t));
-            accumulate_fixed(acc, raw.data(), g.nout);
-            CUDA_CHECK(cudaMemset(outBuf.ptr, 0, outSz * sizeof(uint64_t)));
+            outBuf.download(raw.data(), outBytes);
+            add_batch_output(acc, raw, g.nout, params.float_atomic != 0);
+            CUDA_CHECK(cudaMemset(outBuf.ptr, 0, outBytes));
         }
 
         printf("  batch %d: %llu photons (%llu/%llu)\n",
@@ -627,15 +633,15 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
            (double)cfg.nphoton / std::max(tms, 1e-6));
 
     /* Readback, normalization and output */
-    outBuf.download(raw.data(), outSz * sizeof(uint64_t));
-    accumulate_fixed(acc, raw.data(), g.nout);
+    outBuf.download(raw.data(), outBytes);
+    add_batch_output(acc, raw, g.nout, params.float_atomic != 0);
     std::vector<float> vol = finalize_output(cfg, g, acc);
     save_fluence(cfg, g, vol);
 
     faceBuf.free();
     curvBuf.free();
     outBuf.free();
-    seedBuf.free();
+    cntBuf.free();
     paramBuf.free();
     patBuf.free();
     srcBuf.free();
