@@ -1,0 +1,148 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------
+  # Makefile builds of the Vulkan backend, unit tests (plain and ASan)
+  # ---------------------------------------------------------------
+  make:
+    name: Make, unit tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential glslang-tools libvulkan-dev xxd libglfw3-dev zlib1g-dev python3
+      - name: Build vkmmc
+        run: make -C src -j$(nproc)
+      - name: Smoke test (no GPU)
+        run: bash .github/ci/smoke.sh bin/vkmmc
+      - name: Build with the viewer and the system zlib
+        run: |
+          make -C src clean
+          make -C src -j$(nproc) SHOW=1 HAVE_ZLIB=yes
+          bash .github/ci/smoke.sh bin/vkmmc
+      - name: Unit tests
+        run: make -C tests/unit run
+      - name: Unit tests with AddressSanitizer and UBSan
+        run: make -C tests/unit asan
+      - name: Unit test coverage
+        run: make -C tests/unit coverage
+
+  # ---------------------------------------------------------------
+  # CMake build and ctest (tests that need no GPU)
+  # ---------------------------------------------------------------
+  cmake:
+    name: CMake (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build glslang-tools libvulkan-dev libglfw3-dev python3
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DVKMMC_SHOW=ON -DVKMMC_BUILD_OPTIX=OFF
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build -LE gpu --output-on-failure
+
+  # ---------------------------------------------------------------
+  # The full functional suite on the CPU: Mesa's lavapipe implements
+  # Vulkan ray query (tested with Mesa 25.0 and 26.0; here Ubuntu 26.04)
+  # ---------------------------------------------------------------
+  vulkan-lavapipe:
+    name: Vulkan functional tests (lavapipe)
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y git build-essential cmake glslang-tools libvulkan-dev \
+              xxd python3 mesa-vulkan-drivers
+      - uses: actions/checkout@v4
+      - name: Build vkmmc
+        run: make -C src -j$(nproc)
+      - name: List the Vulkan devices
+        run: bin/vkmmc -L
+      - name: Functional tests
+        run: cd tests && ./test_vkmmc.sh ../bin/vkmmc
+      - name: CMake build and ctest including the GPU suite
+        run: |
+          cmake -S . -B build -DVKMMC_BUILD_OPTIX=OFF
+          cmake --build build -j$(nproc)
+          ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------
+  # OptiX backend: CUDA 11.7 redistributables and the optix-dev headers;
+  # the CUDA runtime is linked statically (no GPU on the runner)
+  # ---------------------------------------------------------------
+  optix:
+    name: OptiX build (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake xxd python3 curl xz-utils
+      - name: Fetch CUDA 11.7 and the OptiX 7.5 headers
+        run: bash .github/ci/fetch_cuda_optix.sh | tee -a "$GITHUB_ENV"
+      - name: Build vkmmc_optix (Makefile)
+        run: make -C optix STATIC=1 CUDA_DIR=$CUDA_DIR OPTIX_DIR=$OPTIX_DIR
+      - name: Check the run-time dependencies
+        run: bash .github/ci/check_deps.sh bin/vkmmc_optix libm.so libc.so libdl.so libpthread.so librt.so ld-linux
+      - name: Smoke test (no GPU)
+        run: bash .github/ci/smoke.sh bin/vkmmc_optix
+      - name: Build vkmmc_optix (CMake) and ctest
+        run: |
+          cmake -S . -B build -DVKMMC_BUILD_VULKAN=OFF -DVKMMC_BUILD_OPTIX=ON -DOPTIX_ROOT=$OPTIX_DIR \
+                -DCUDAToolkit_ROOT=$CUDA_DIR -DVKMMC_STATIC_RUNTIME=ON
+          cmake --build build -j$(nproc)
+          bash .github/ci/check_deps.sh build/bin/vkmmc_optix libm.so libc.so libdl.so libpthread.so librt.so ld-linux
+          ctest --test-dir build -LE gpu --output-on-failure
+      - name: Upload vkmmc_optix
+        uses: actions/upload-artifact@v4
+        with:
+          name: vkmmc_optix-linux-x86_64
+          path: bin/vkmmc_optix
+
+  # ---------------------------------------------------------------
+  # Fuzzing: replay past findings, then a short libFuzzer round and
+  # mutation fuzzing of the sanitized binary
+  # ---------------------------------------------------------------
+  fuzz:
+    name: Fuzzing
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang glslang-tools libvulkan-dev xxd python3
+      - name: Replay the regression corpus
+        run: make -C tests/fuzz regress
+      - name: libFuzzer (60 s per harness)
+        run: make -C tests/fuzz run T=60 JOBS=$(nproc)
+      - name: Mutation fuzzing of the sanitized front-end
+        run: |
+          make -C src asan -j$(nproc)
+          python3 tests/fuzz/fuzz_vkmmc.py bin/vkmmc_asan -n 500 --seed ${{ github.run_number }}
+      - name: Upload findings
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: |
+            tests/fuzz/findings*/

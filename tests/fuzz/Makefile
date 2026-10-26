@@ -61,7 +61,8 @@ run: all corpus_input
 	    grep -h "stat::number_of_executed_units\|ERROR\|SUMMARY" fuzz-*.log findings/$$f.log 2>/dev/null | sort | uniq -c | head -20; \
 	    rm -f fuzz-*.log; \
 	done
-	@ls findings | grep -v "\.log$$" || echo "no findings"
+	@if ls findings | grep -qv "\.log$$"; then echo "FINDINGS:"; ls findings | grep -v "\.log$$"; exit 1; \
+	 else echo "no findings"; fi
 
 regress: all
 	@for f in $(FUZZERS); do $(NOASLR) ./build/$$f -runs=1 regressions/* > build/regress_$$f.log 2>&1 \
