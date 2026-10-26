@@ -822,7 +822,7 @@ static ShapeMesh parse_shapes(const json& arr, float ext[6], int mesh_res = 24,
                       ctx + " must be an object with a single key, e.g. {\"Sphere\":{...}}");
 
         std::string key = shape.begin().key();
-        const json& obj = shape.begin().value();
+        const json& obj = shape.front();      /* the value of the single key */
         ctx += "." + key;
         size_t faces_before = m.faces.size();
         ShapeOrigin so = make_origin(0);
