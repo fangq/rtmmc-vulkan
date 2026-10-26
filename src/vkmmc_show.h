@@ -28,10 +28,10 @@
 #include <algorithm>
 
 #include <numeric>
-#include "vkmmc_show_vert_spv.h"
-#include "vkmmc_show_frag_spv.h"
-#include "vkmmc_show_vol_vert_spv.h"
-#include "vkmmc_show_vol_frag_spv.h"
+#include <vkmmc_show_vert_spv.h>
+#include <vkmmc_show_frag_spv.h>
+#include <vkmmc_show_vol_vert_spv.h>
+#include <vkmmc_show_vol_frag_spv.h>
 
 /* ================================================================ */
 /*                          Data structs                            */

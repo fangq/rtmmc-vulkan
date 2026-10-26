@@ -5,6 +5,7 @@
 #  make SHOW=1        also build the interactive --show viewer (needs GLFW)
 #  make HAVE_ZLIB=yes link the system zlib instead of the bundled miniz
 #  make DEBUG=1       debug build (-g -O0)
+#  make STATIC=1      link libstdc++/libgcc statically (for releases)
 #  make test          run the functional tests (needs a ray-query GPU)
 #  make unittest      build and run the host-side unit tests (no GPU needed)
 #  make fuzz          build the libFuzzer harnesses (needs clang)
@@ -42,6 +43,10 @@ ifeq ($(HAVE_ZLIB),yes)
 else
     ZMATFLAGS += -DNO_ZLIB -Izmat/miniz
     ZMATOBJS  += zmat/miniz/miniz.o
+endif
+
+ifdef STATIC
+    LDFLAGS += -static-libstdc++ -static-libgcc
 endif
 
 GLSLFLAGS := --target-env vulkan1.2 -e main
