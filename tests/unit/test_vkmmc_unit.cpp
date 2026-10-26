@@ -2583,14 +2583,14 @@ TEST(cmdline_defaults_and_options) {
     CHECK(o.nphoton == 0 && o.batch_size == UINT64_MAX && !o.has_seed && o.unitinmm == 0);
     CHECK(o.outputtype == -1 && o.isreflect == -1 && o.isspecular == -1 && o.isnormalize == -1);
     CHECK(o.meshres == 0 && o.docurv == -1 && o.debuglevel == -1 && o.maxjumpdebug == -1);
-    CHECK(!o.listgpu && !o.dumpjson && !o.dumpmesh && !o.debugcurv && !o.show);
+    CHECK(!o.listgpu && !o.dumpjson && !o.dumpmesh && !o.debugcurv && !o.show && !o.floatatomic);
     CHECK(o.kernelfile.empty() && o.json_str.empty() && o.session_id.empty());
 
     CmdOverrides a;
     CHECK(run_cmdline({"vkmmc", "-f", "x.json", "-n", "1e7", "-s", "sess", "-u", "0.5", "-E", "123", "-O", "l",
                        "-b", "0", "-V", "1", "-U", "0", "-t", "128", "-B", "1000", "-G", "2", "-j", "{\"a\":1}", "--dumpjson",
                        "--dumpmesh", "--debugcurv", "-m", "16", "-c", "1", "-D", "M", "--maxjumpdebug", "100",
-                       "kern.spv"
+                       "--atomic", "float", "kern.spv"
                       }, a));
     CHECK(a.inputfile == "x.json");
     CHECK(a.nphoton == 10000000ull);
@@ -2605,6 +2605,7 @@ TEST(cmdline_defaults_and_options) {
     CHECK(a.meshres == 16 && a.docurv == 1);
     CHECK(a.debuglevel == (int)VKMMC_DEBUG_TRAJ);
     CHECK(a.maxjumpdebug == 100);
+    CHECK(a.floatatomic);
     CHECK(a.kernelfile == "kern.spv");
 
     CmdOverrides l;
@@ -2622,6 +2623,9 @@ TEST(cmdline_defaults_and_options) {
     CmdOverrides d;
     CHECK(run_cmdline({"vkmmc", "in.json", "-D", "mx"}, d));
     CHECK(d.debuglevel == (int)((1u << 13) | (1u << 7)));
+    CmdOverrides fx;
+    CHECK(run_cmdline({"vkmmc", "in.json", "--atomic", "float", "--atomic", "fixed"}, fx));
+    CHECK(!fx.floatatomic);
     CmdOverrides g;
     CHECK(run_cmdline({"vkmmc", "-L"}, g));    /* listing GPUs needs no input */
     CHECK(g.listgpu && g.inputfile.empty());
@@ -2636,6 +2640,7 @@ TEST(cmdline_defaults_and_options) {
 #define CHECK_CMD_THROWS(substr, ...) do { CmdOverrides o_; CHECK_THROWS(run_cmdline(__VA_ARGS__, o_), substr); } while (0)
 
 TEST(cmdline_errors) {
+    CHECK_CMD_THROWS("option --atomic expects fixed or float", {"vkmmc", "in.json", "--atomic", "double"});
     CHECK_CMD_THROWS("option -n expects a number, got 'abc'", {"vkmmc", "in.json", "-n", "abc"});
     CHECK_CMD_THROWS("option -n expects a number, got '1e7x'", {"vkmmc", "in.json", "-n", "1e7x"});
     CHECK_CMD_THROWS("option -n expects a number", {"vkmmc", "in.json", "-n", ""});
@@ -2852,7 +2857,7 @@ TEST(kernel_parameters) {
 
     CmdOverrides o;
     c.nphoton = 1000000;
-    CHECK(thread_count(c, o) == 65536);
+    CHECK(thread_count(c, o) == 131072);
     o.totalthread = 100;
     CHECK(thread_count(c, o) == 128);
     o.totalthread = 64;
@@ -2864,56 +2869,31 @@ TEST(kernel_parameters) {
     CHECK(thread_count(c, o) == 64);
     c.nphoton = 100;
     CHECK(thread_count(c, o) == 128);
-    c.nphoton = 65537;
-    CHECK(thread_count(c, o) == 65536);
+    c.nphoton = 131073;
+    CHECK(thread_count(c, o) == 131072);
 
-    c.nphoton = 1234567;
+    /* auto batches: 4 photons per thread first, then sized from the speed, capped, no short last launch */
     CmdOverrides b;
-    CHECK(batch_size(c, b) == 500000);
+    CHECK(next_batch(b, 1234567, 1024, 0, 0) == 4096);
+    CHECK(next_batch(b, 100, 1024, 0, 0) == 100);
+    CHECK(next_batch(b, 1e9, 1024, 4096, 1.0) == 4096 * 8);                   /* grows at most 8x */
+    CHECK(next_batch(b, 1e9, 1024, 100000, 100.0) == 500000);                 /* 1000 photon/ms: 0.5 s */
+    CHECK(next_batch(b, 1e9, 1024, 1000, 1000.0) == 1024);                    /* at least one per thread */
+    CHECK(next_batch(b, 1e12, 1024, 1e8, 10.0) == VKMMC_BATCH_MAX);
+    CHECK(next_batch(b, 550000, 1024, 100000, 100.0) == 550000);              /* the rest, not 500000 + 50000 */
+    CHECK(next_batch(b, 700000, 1024, 100000, 100.0) == 500000);
     b.batch_size = 0;
-    CHECK(batch_size(c, b) == 1234567);
+    CHECK(next_batch(b, 1234567, 1024, 0, 0) == 1234567);
+    CHECK(next_batch(b, (uint64_t)1e10, 1024, 0, 0) == 0xFFFFFFFFu - 1024);   /* the 32-bit photon counter */
     b.batch_size = 1000;
-    CHECK(batch_size(c, b) == 1000);
+    CHECK(next_batch(b, 1234567, 1024, 0, 0) == 1000);
+    CHECK(next_batch(b, 1234567, 1024, 1000, 0.001) == 1000);
+    CHECK(next_batch(b, 10, 1024, 1000, 1.0) == 10);
 
     c.rng_seed = 77;
     CHECK(base_seed(c) == 77);
     c.rng_seed = 0;
     CHECK(base_seed(c) != 0);
-}
-
-TEST(make_seeds_properties) {
-    std::vector<uint32_t> s1, s2, s3, s4;
-    make_seeds(12345, 0, 256, s1);
-    make_seeds(12345, 0, 256, s2);
-    CHECK(s1.size() == 1024);
-    CHECK(s1 == s2);
-    bool nz = true;
-
-    for (size_t i = 0; i < s1.size(); i++) {
-        nz &= s1[i] != 0;
-    }
-
-    CHECK(nz);
-    CHECK(std::set<uint32_t>(s1.begin(), s1.end()).size() == s1.size());
-    make_seeds(12345, 500000, 256, s3);
-    make_seeds(12346, 0, 256, s4);
-    CHECK(s3 != s1 && s4 != s1);
-
-    /* per-thread 128-bit states never repeat across batches or threads */
-    std::set<std::array<uint32_t, 4> > states;
-    std::vector<uint32_t> s;
-
-    for (int batch = 0; batch < 8; batch++) {
-        make_seeds(29012391, (uint64_t)batch * 500000, 4096, s);
-
-        for (size_t t = 0; t < 4096; t++) {
-            states.insert({{s[4 * t], s[4 * t + 1], s[4 * t + 2], s[4 * t + 3]}});
-        }
-    }
-
-    CHECK(states.size() == 8 * 4096u);
-    make_seeds(1, 0, 0, s);
-    CHECK(s.empty());
 }
 
 // ============================================================================

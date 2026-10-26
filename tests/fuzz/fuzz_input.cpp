@@ -26,7 +26,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         float t0, t1, idt;
         kernel_time_gates(cfg, t0, t1, idt);
         uint32_t tt = thread_count(cfg, ovr);
-        (void)batch_size(cfg, ovr);
+        (void)next_batch(ovr, cfg.nphoton, tt, 0, 0);
         (void)st;
         (void)media;
         (void)tt;

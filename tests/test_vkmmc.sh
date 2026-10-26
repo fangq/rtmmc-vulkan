@@ -927,7 +927,7 @@ PYEOF
 fi
 
 # =============================================================================
-# TEST 32: Bit-reproducibility (fixed-point accumulation)
+# TEST 32: Bit-reproducibility (fixed-point accumulation, per-photon RNG seeds)
 # =============================================================================
 log_test "Bit-reproducible output"
 if run_sim t23.json t32a.log -E 11 -s t32a && run_sim t23.json t32b.log -E 11 -s t32b && run_sim t23.json t32c.log -E 12 -s t32c; then
@@ -935,20 +935,30 @@ if run_sim t23.json t32a.log -E 11 -s t32a && run_sim t23.json t32b.log -E 11 -s
     diff=$(python3 -c "import json; print(json.load(open('$TESTDIR/t32a.jdat'))['Fluence']!=json.load(open('$TESTDIR/t32c.jdat'))['Fluence'])")
     [ "$same" = True ] && log_pass "Same seed: identical volume" || log_fail "Same seed gave a different volume"
     [ "$diff" = True ] && log_pass "Different seed: different volume" || log_fail "Different seeds gave the same volume"
+    # each photon seeds its RNG from its index: batch size and thread count do not change the output
+    if run_sim t23.json t32d.log -E 11 -B 20000 -t 4096 -s t32d; then
+        same=$(python3 -c "import json; print(json.load(open('$TESTDIR/t32a.jdat'))['Fluence']==json.load(open('$TESTDIR/t32d.jdat'))['Fluence'])")
+        [ "$same" = True ] && log_pass "Same seed, -B 20000 -t 4096: identical volume" \
+            || log_fail "Batch size or thread count changed the volume"
+    else
+        log_fail "Execution failed (-B 20000 -t 4096)"
+    fi
 else
     log_fail "Execution failed"
 fi
 
 # =============================================================================
-# TEST 33: Statistical invariance to batch size, thread count, Russian roulette
+# TEST 33: Statistical invariance to batch size, thread count, Russian roulette, float sums
 # absorbed ~ 45.6%, per-photon sd ~ 0.35 -> standard error ~0.08% at 2e5
 # =============================================================================
-log_test "Batch size, thread count and Russian roulette do not bias the result"
+log_test "Batch size, thread count, Russian roulette and float sums do not bias the result"
 if run_sim t23.json t33a.log -E 21 -s t33a && run_sim t23.json t33b.log -E 22 -B 20000 -s t33b &&
         run_sim t23.json t33c.log -E 23 -t 4096 -s t33c; then
     ref=$(get_absorbed t33a.log)
     check_close "$(get_absorbed t33b.log)" "$ref" 0.35 "-B 20000"
     check_close "$(get_absorbed t33c.log)" "$ref" 0.35 "-t 4096"
+    run_sim t23.json t33f.log -E 25 --atomic float -s t33f && check_close "$(get_absorbed t33f.log)" "$ref" 0.35 "--atomic float" \
+        || log_fail "Execution failed (--atomic float)"
     mkcfg t33r.json '{"Session":{"RussianRoulette":0.01},"Domain":{"Media":[{"mua":0,"mus":0,"g":1,"n":1},{"mua":0.01,"mus":1,"g":0.9,"n":1}]},
                       "Optode":{"Source":{"Pos":[30,30,0.5]}},"Shapes":[{"Grid":{"Tag":1,"Size":[60,60,60]}}]}'
     run_sim t33r.json t33r.log -E 24 && check_close "$(get_absorbed t33r.log)" "$ref" 0.4 "Russian roulette threshold 0.01" \
