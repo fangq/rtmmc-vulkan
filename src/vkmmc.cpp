@@ -61,8 +61,9 @@ struct MCParams {
     uint32_t extra_src_len;                 // 204: sources in the multi-source list
     uint32_t num_field;                     // 208: output fields
     int      focus_mode;                    // 212: see kernel_focus_mode
+    uint32_t do_tally;                      // 216: see kernel_tallies_launch
 };
-// Total: 216 bytes, see the SimParams block in vkmmc_core.comp
+// Total: 220 bytes, see the SimParams block in vkmmc_core.comp
 
 /* ================================================================ */
 /*                       Vulkan helpers                             */
@@ -529,7 +530,18 @@ AccelStruct build_tlas(VulkanCtx& c, AccelStruct& blas) {
 /* ================================================================ */
 /*                       Compute pipeline                           */
 /* ================================================================ */
-ComputePipe create_pipeline(VulkanCtx& c, const uint32_t* code, size_t codesize) {
+/* the source specialization constants of vkmmc_core.comp (constant_id 0-5) */
+struct SourceSpec {
+    int32_t  src_type;
+    uint32_t src_num;
+    int32_t  src_id;
+    uint32_t extra_src_len;
+    int32_t  focus_mode;
+    uint32_t do_tally;
+};
+static_assert(sizeof(SourceSpec) == 24, "SourceSpec: six 4-byte constants");
+
+ComputePipe create_pipeline(VulkanCtx& c, const uint32_t* code, size_t codesize, const SourceSpec& spec) {
     ComputePipe cp;
     memset(&cp, 0, sizeof(cp));
     VkDescriptorSetLayoutBinding bn[10];
@@ -584,6 +596,16 @@ ComputePipe create_pipeline(VulkanCtx& c, const uint32_t* code, size_t codesize)
     st.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     st.module = mod;
     st.pName = "main";
+    VkSpecializationMapEntry sme[6];
+
+    for (uint32_t i = 0; i < 6; i++) {
+        sme[i].constantID = i;
+        sme[i].offset = i * 4;
+        sme[i].size = 4;
+    }
+
+    VkSpecializationInfo si = {6, sme, sizeof(spec), &spec};
+    st.pSpecializationInfo = &si;
     VkComputePipelineCreateInfo cp2 = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     cp2.stage = st;
     cp2.layout = cp.pipeLayout;
@@ -872,6 +894,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
     params.extra_src_len = (uint32_t)cfg.extrasrc.size();
     params.num_field = g.nfield;
     params.focus_mode = kernel_focus_mode(cfg.srcdir[3]);
+    params.do_tally = kernel_tallies_launch(cfg) ? 1u : 0u;
     params.srcdir[3] = (params.focus_mode == 1) ? cfg.srcdir[3] : 0.0f;
 
     Buffer paramBuf = create_device_buffer(ctx, sizeof(MCParams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -906,7 +929,8 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
         printf("Kernel: %s, %s atomics\n", kernel_variant_name(st.variant), ctx.atomic64 ? "64-bit" : "32-bit pair");
     }
 
-    ComputePipe cp = create_pipeline(ctx, code, codesize);
+    SourceSpec spec = {params.srctype, params.src_num, params.src_id, params.extra_src_len, params.focus_mode, params.do_tally};
+    ComputePipe cp = create_pipeline(ctx, code, codesize, spec);
     update_desc(ctx, cp, tlas.handle, faceBuf, mediaBuf, outBuf, paramBuf, seedBuf, curvBuf, trajBuf, patBuf, srcBuf);
 
     /* Batched dispatch */

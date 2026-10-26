@@ -466,6 +466,14 @@ static uint32_t kernel_initial_medium(const SimConfig& cfg) {
     return (cfg.extrasrc.empty() && !randdir) ? cfg.mediumid0 : 0xFFFFFFFFu;
 }
 
+/* the kernels tally the launched energy only for sources with varying launch
+   weights; for the others it is the photon count */
+static bool kernel_tallies_launch(const SimConfig& cfg) {
+    int t = cfg.srctype;
+    return cfg.srcnum > 1 || !cfg.extrasrc.empty() || t == SRC_PATTERN || t == SRC_PATTERN3D || t == SRC_FOURIER
+           || t == SRC_FOURIERX || t == SRC_FOURIERX2D;
+}
+
 /* the multi-source list as the kernels read it, 4 vec4 per source (a dummy if empty); a
    non-finite focal length is ignored there */
 static std::vector<float> kernel_extrasrc(const SimConfig& cfg) {
@@ -563,7 +571,8 @@ static void accumulate_fixed(std::vector<double>& acc, const uint64_t* raw, uint
 /*
  * Zero NaN/Inf, report the absorbed fraction and normalize the accumulated
  * output (acc: g.nelem values per field, then the launched energy of each
- * pattern; without the latter, every photon is taken to start with weight 1).
+ * pattern, tallied by the kernels for sources with varying launch weights;
+ * otherwise every photon is taken to start with weight 1).
  * Each field is normalized by the launched energy of its pattern; the fields
  * of a multi-source run share the total, as in MMC.
  *   energy (x):  1/mm^3 per unit of launched energy
@@ -578,7 +587,7 @@ static std::vector<float> finalize_output(const SimConfig& cfg, const OutputGrid
     double ltot = 0;
     size_t bad = 0;
 
-    if (acc.size() >= nvol + g.nlaunch) {
+    if (acc.size() >= nvol + g.nlaunch && kernel_tallies_launch(cfg)) {
         for (uint32_t k = 0; k < g.nlaunch; k++) {
             launched[k] = acc[nvol + k];
         }

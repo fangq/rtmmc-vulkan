@@ -104,6 +104,7 @@ struct VKMMCParam {
     uint32_t extra_src_len, num_field;
     float   focal;
     int     focus_mode;
+    uint32_t do_tally;
     Medium_GPU media[MAX_PROP];
 };
 
@@ -212,7 +213,38 @@ static std::string kernel_ptx(int variant, const std::string& ptxfile) {
     return std::string((const char*)ptx[variant], len[variant]);
 }
 
-void setup_optix(OptixState& st, int gpuid, int variant, const std::string& ptxfile) {
+/*
+ * The launch parameters that select the source code paths, bound as
+ * compile-time constants of the module: OptiX then compiles only the paths
+ * a run uses (e.g. no source sampler for a pencil beam), which keeps the
+ * register count of the transport loop as low as without them.
+ */
+static void source_params(VKMMCParam& p, const SimConfig& cfg) {
+    p.srctype = cfg.srctype;
+    p.src_num = (uint32_t)cfg.srcnum;
+    p.src_id = cfg.srcid;
+    p.extra_src_len = (uint32_t)cfg.extrasrc.size();
+    p.focus_mode = kernel_focus_mode(cfg.srcdir[3]);
+    p.focal = (p.focus_mode == 1) ? cfg.srcdir[3] : 0.0f;
+    p.do_tally = kernel_tallies_launch(cfg) ? 1u : 0u;
+}
+
+#if OPTIX_VERSION >= 70200
+static std::vector<OptixModuleCompileBoundValueEntry> source_bound_values(const VKMMCParam& p) {
+    std::vector<OptixModuleCompileBoundValueEntry> b;
+#define VKMMC_BIND(f) b.push_back({offsetof(VKMMCParam, f), sizeof(p.f), &p.f, #f})
+    VKMMC_BIND(srctype);
+    VKMMC_BIND(src_num);
+    VKMMC_BIND(src_id);
+    VKMMC_BIND(extra_src_len);
+    VKMMC_BIND(focus_mode);
+    VKMMC_BIND(do_tally);
+#undef VKMMC_BIND
+    return b;
+}
+#endif
+
+void setup_optix(OptixState& st, int gpuid, int variant, const std::string& ptxfile, const VKMMCParam& bound) {
     CUDA_CHECK(cudaSetDevice(gpuid));
     CUDA_CHECK(cudaFree(0));  /* init CUDA */
     OptixResult ires = optixInit();
@@ -243,6 +275,13 @@ void setup_optix(OptixState& st, int gpuid, int variant, const std::string& ptxf
 #else
     modOpts.optLevel = OPTIX_COMPILE_OPTIMIZATION_LEVEL_3;
     modOpts.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_NONE;
+#endif
+#if OPTIX_VERSION >= 70200
+    std::vector<OptixModuleCompileBoundValueEntry> bv = source_bound_values(bound);
+    modOpts.boundValues = bv.data();
+    modOpts.numBoundValues = (unsigned int)bv.size();
+#else
+    (void)bound;
 #endif
 
     st.pipeCompileOpts = {};
@@ -434,8 +473,13 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
         printf("WARNING: trajectory output (-D M) is only supported by the Vulkan backend\n");
     }
 
+    /* Launch params; the source fields are also bound into the module */
+    VKMMCParam params;
+    memset(&params, 0, sizeof(params));
+    source_params(params, cfg);
+
     OptixState optix;
-    setup_optix(optix, ovr.gpuid, st.variant, ovr.kernelfile);
+    setup_optix(optix, ovr.gpuid, st.variant, ovr.kernelfile, params);
     build_gas(optix, cfg.nodes, cfg.faces);
 
     /* Face buffer: interleaved [normal+media, vertex indices] */
@@ -497,15 +541,11 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
     srcBuf.alloc_upload(extrasrc);
     slotBuf.alloc((size_t)tt * sizeof(uint32_t));
 
-    /* Launch params */
-    VKMMCParam params;
-    memset(&params, 0, sizeof(params));
     params.gashandle = optix.gasHandle;
     params.facebuf = faceBuf.d_ptr();
     params.curvbuf = curvBuf.d_ptr();
     params.outputbuf = outBuf.d_ptr();
     params.seedbuf = seedBuf.d_ptr();
-    params.srctype = cfg.srctype;
     params.srcpos = make_float3(cfg.srcpos[0], cfg.srcpos[1], cfg.srcpos[2]);
     params.srcdir = make_float3(cfg.srcdir[0], cfg.srcdir[1], cfg.srcdir[2]);
     params.srcparam1 = make_float4(cfg.srcparam1[0], cfg.srcparam1[1], cfg.srcparam1[2], cfg.srcparam1[3]);
@@ -520,12 +560,7 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
     params.patternbuf = patBuf.d_ptr();
     params.extrasrcbuf = srcBuf.d_ptr();
     params.slotbuf = slotBuf.d_ptr();
-    params.src_num = (uint32_t)cfg.srcnum;
-    params.src_id = cfg.srcid;
-    params.extra_src_len = (uint32_t)cfg.extrasrc.size();
     params.num_field = g.nfield;
-    params.focus_mode = kernel_focus_mode(cfg.srcdir[3]);
-    params.focal = (params.focus_mode == 1) ? cfg.srcdir[3] : 0.0f;
     params.do_reflect = cfg.do_mismatch ? 1u : 0u;
     params.output_type = cfg.output_type;
     params.num_media = (uint32_t)cfg.media.size();

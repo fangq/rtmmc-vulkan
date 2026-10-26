@@ -59,6 +59,7 @@ struct VKMMCParam {
     unsigned int extra_src_len, num_field;
     float focal;                  /* focal length (focus_mode 1) */
     int focus_mode;               /* 0 none, 1 focused, 2 isotropic, 3 Lambertian */
+    unsigned int do_tally;        /* tally the launched energy (sources with varying weights) */
     Medium media[MAX_PROP];
 };
 
@@ -370,20 +371,24 @@ __device__ __forceinline__ unsigned int photon_slot() {
     return ((unsigned int*)gcfg.slotbuf)[optixGetLaunchIndex().x];
 }
 
-/* a deposit of the current photon at element idx of its field(s); see deposit() in vkmmc_core.comp */
+/* a deposit of a photon shared by src_num patterns: one per pattern field */
+__device__ __noinline__ void deposit_shared(unsigned int idx, float val) {
+    const float* pat = (const float*)gcfg.patternbuf + photon_slot() * gcfg.src_num;
+
+    for (unsigned int k = 0; k < gcfg.src_num; k++) {
+        if (pat[k] > 0.f) {
+            atomic_add_out(k * gcfg.grid_stride.w + idx, val * pat[k]);
+        }
+    }
+}
+
+/* a deposit of the current photon at element idx of its field(s); see deposit() in vkmmc_core.comp.
+   The rare shared-pattern path is not inlined: it would cost the common path registers */
 __device__ __forceinline__ void deposit(unsigned int idx, float val) {
     if (gcfg.src_num > 1) {
-        const float* pat = (const float*)gcfg.patternbuf + photon_slot() * gcfg.src_num;
-
-        for (unsigned int k = 0; k < gcfg.src_num; k++) {
-            if (pat[k] > 0.f) {
-                atomic_add_out(k * gcfg.grid_stride.w + idx, val * pat[k]);
-            }
-        }
-    } else if (gcfg.extra_src_len > 0 && gcfg.src_id < 0) {
-        atomic_add_out(photon_slot() * gcfg.grid_stride.w + idx, val);
+        deposit_shared(idx, val);
     } else {
-        atomic_add_out(idx, val);
+        atomic_add_out(((gcfg.extra_src_len > 0 && gcfg.src_id < 0) ? photon_slot() * gcfg.grid_stride.w : 0u) + idx, val);
     }
 }
 
@@ -799,8 +804,11 @@ __device__ void launch_photon(Photon& ph, uint4& rng, float& w0) {
     ph.pending = 0;
     ph.primid = 0;
 #endif
-    unsigned int slot;
-    sample_source(ph, rng, slot);
+    unsigned int slot = 0;
+
+    if (gcfg.srctype != SRC_PENCIL || gcfg.extra_src_len > 0 || gcfg.focus_mode != 0) {
+        sample_source(ph, rng, slot);
+    }
     w0 = ph.weight;
 
     if (gcfg.src_num > 1 || (gcfg.extra_src_len > 0 && gcfg.src_id < 0)) {
@@ -812,7 +820,11 @@ __device__ void launch_photon(Photon& ph, uint4& rng, float& w0) {
 }
 
 /* launched energy, see tally_launch() in vkmmc_core.comp */
-__device__ __forceinline__ void tally_launch(unsigned long long& lw, float w0) {
+__device__ __forceinline__ void tally_launch(float w0) {
+    if (!gcfg.do_tally) {
+        return;
+    }
+
     if (gcfg.src_num > 1) {
         const float* pat = (const float*)gcfg.patternbuf + photon_slot() * gcfg.src_num;
 
@@ -820,9 +832,10 @@ __device__ __forceinline__ void tally_launch(unsigned long long& lw, float w0) {
             atomic_add_out(gcfg.num_field * gcfg.grid_stride.w + k, pat[k]);
         }
     } else {
-        lw += (unsigned long long)(w0 * FIXED_SCALE + 0.5f);
+        atomic_add_out(gcfg.num_field * gcfg.grid_stride.w, w0);
     }
 }
+
 
 /* closest hit along a ray: distance, triangle and face orientation */
 __device__ bool probe_ray(float3 o, float3 d, float tmin, uint4& rng, float& hd, int& tid, bool& ff) {
@@ -1078,7 +1091,6 @@ extern "C" __global__ void __raygen__rg() {
 
     int done = 0;
     int maxph = gcfg.threadphoton + (tid < (unsigned int)gcfg.oddphoton ? 1 : 0);
-    unsigned long long lw = 0;
     float w0;
 
     Photon ph;
@@ -1086,7 +1098,7 @@ extern "C" __global__ void __raygen__rg() {
     initial_medium(ph, rng, cache, cached);
 
     if (maxph > 0) {
-        tally_launch(lw, w0);
+        tally_launch(w0);
     }
 
     while (done < maxph) {
@@ -1106,13 +1118,9 @@ extern "C" __global__ void __raygen__rg() {
             initial_medium(ph, rng, cache, cached);
 
             if (++done < maxph) {
-                tally_launch(lw, w0);
+                tally_launch(w0);
             }
         }
-    }
-
-    if (lw) {
-        atomicAdd((unsigned long long*)gcfg.outputbuf + gcfg.num_field * gcfg.grid_stride.w, lw);
     }
 
     ((uint4*)gcfg.seedbuf)[tid] = rng;

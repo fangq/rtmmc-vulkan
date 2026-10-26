@@ -2996,6 +2996,7 @@ TEST(finalize_output_fields) {
 
     /* sources of a multi-source run share the total */
     c.srcnum = 1;
+    c.extrasrc.resize(2);
     g.nlaunch = 1;
     g.nout = 2 * g.nelem + 1;
     acc = {1, 2, 3, 4, 20};
@@ -3012,8 +3013,14 @@ TEST(finalize_output_fields) {
     o = finalize_output(c, g, acc);
     CHECK(o[3] == 4);
 
-    /* a short accumulator: every photon of weight 1 */
+    /* a short accumulator, or a source of unit weights: the photon count */
+    acc = {1, 2, 3, 4, 20};
+    c.extrasrc.clear();
+    c.do_normalize = true;
+    o = finalize_output(c, g, acc, &absorbed);
+    CHECK_CLOSE(o[0], 0.01, 1e-7);
     acc = {1, 2, 3, 4};
+    c.extrasrc.resize(2);
     c.do_normalize = true;
     o = finalize_output(c, g, acc, &absorbed);
     CHECK_CLOSE(o[0], 0.01, 1e-7);

@@ -43,6 +43,8 @@ Key features of this release
 * two backends sharing all host code: `vkmmc` (Vulkan ray query) and `vkmmc_optix`
   (OptiX 7); every kernel variant is embedded in the binary and selected at run
   time from the input and the GPU features
+* all 18 MCX/MMC source types, shared patterns (photon sharing) and multiple
+  sources
 * two domain types: tetrahedral or triangular meshes (MMC/iso2mesh JSON input with
   JData-encoded arrays), and MCX-style CSG shape lists (Grid, Subgrid, Box, Sphere,
   Cylinder, X/Y/Z-Slabs and -Layers, Lens, Origin) triangulated on the fly
@@ -172,7 +174,11 @@ CMake options: `VKMMC_BUILD_VULKAN` (ON), `VKMMC_BUILD_OPTIX` (AUTO/ON/OFF),
 
 No build option selects the simulation mode: the mesh, CSG and
 CSG+curvature kernels are all compiled and embedded, and the one matching the
-input is used.
+input is used. The source settings (type, focus, patterns, multiple sources)
+are compile-time constants of the kernel, set when it is loaded (Vulkan
+specialization constants, OptiX bound values): the GPU driver compiles only
+the source code a run uses, so the many source types cost a pencil beam
+nothing.
 
 
 Running Simulations
