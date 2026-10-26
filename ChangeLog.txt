@@ -1,6 +1,31 @@
 Change Log
 
 == vkmmc 0.5.0 (Kylin, beta), Qianqian Fang <q.fang at neu.edu> ==
+ 2026-10-26 [5604903] [doc] README: the source types, patterns, multiple sources and the launched-energy normalization
+ 2026-10-26 [074a738] [test] unit, functional and fuzz tests for the source types
+ 2026-10-26 [16332d2] [feature] all 18 MCX/MMC source types, shared patterns and multiple sources
+ 2026-10-26 [cd08056] [ci] Windows lavapipe: native paths for python, strip CR from its output
+ 2026-10-26 [ac0959f] [feature] load MMC wide-field meshes: negative labels are the background
+ 2026-10-26 [5831a32] [ci] pass GITHUB_TOKEN to install-vulkan-sdk-action: unauthenticated API calls hit the rate limit
+ 2026-10-26 [be70296] [ci] Windows: Windows-style PATH entries; static libgcc only on Linux
+ 2026-10-26 [19715b2] [ci] find vkmmc.exe without ls: under pipefail a missing path ended the step
+ 2026-10-26 [fc265c7] [bug] cylinder curvature: detect nodes on the axis relative to R
+ 2026-10-26 [6605b05] [ci] build mcx/mmc-style packages and upload them to the download server
+ 2026-10-26 [8c46df0] [ci] Windows (MSVC), macOS 15 Intel and macOS 14 (arm64) jobs
+ 2026-10-26 [d1ae71e] [build] portability for Windows (MSVC) and macOS
+ 2026-10-25 [31e3336] [doc] README: lavapipe speed
+ 2026-10-25 [20eca7f] [clean] declare the face buffer as a struct with uint labels and vertex indices
+ 2026-10-25 [557d49e] [bug] tilt the sphere tessellation so no vertex lies on an axis through the center
+ 2026-10-25 [c1f8fa3] [doc] README: prebuilt manylinux2014 binaries and how to build them
+ 2026-10-25 [fb3af20] [ci] build the release binaries in manylinux2014 (glibc 2.17)
+ 2026-10-25 [963f6ee] [doc] README: build and run requirements, CMake, OptiX headers, CI
+ 2026-10-25 [6471ee6] [ci] GitHub Actions: build, unit, functional, OptiX and fuzz jobs
+ 2026-10-25 [d50a0bc] [clean] avoid a -Wdangling-reference warning of gcc 13 in parse_shapes
+ 2026-10-25 [9418335] [build] add a CMake build for both backends and the tests
+ 2026-10-25 [a269d1b] [optix] build with the OptiX headers only, link the CUDA runtime statically
+ 2026-10-25 [4aeca62] [release] set version to 0.5.0 (Kylin, beta), add citations
+ 2026-10-25 [2dee4a7] [test] test GPU selection and user-supplied SPIR-V kernels
+ 2026-10-25 [1c0dfea] [doc] add README, ChangeLog, AUTHORS; LICENSE -> LICENSE.txt with a header
  2026-10-25 [22138de] [test] libFuzzer harnesses and a JSON-aware mutation fuzzer
  2026-10-25 [48a3ad9] [bug] fix input-validation and performance bugs found by fuzzing
  2026-10-25 [677bbda] [test] host unit tests and an extended GPU functional test suite
