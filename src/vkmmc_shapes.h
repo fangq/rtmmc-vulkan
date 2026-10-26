@@ -141,26 +141,44 @@ static void gen_box(ShapeMesh& m, float ox, float oy, float oz,
 static void gen_sphere(ShapeMesh& m, float cx, float cy, float cz,
                        float R, uint32_t tag, int nlon = 24, int nlat = 16) {
     uint32_t b = (uint32_t)m.nodes.size();
-    const float PI = 3.14159265358979f;
+    const double PI = 3.14159265358979323846;
     Vec3 center = {cx, cy, cz};
 
+    /* The lat/lon frame is tilted (0.0731 rad, towards azimuth 0.4142) and its
+       rings are turned by 0.1234 rad, so that no pole or ring vertex lies on
+       a coordinate axis through the center: a pencil beam aimed at the center
+       of a sphere would otherwise hit a vertex exactly, where the triangle
+       the ray tracer reports, and with curvature normals the result, depends
+       on the GPU driver. */
+    const double tilt = 0.0731, tdir = 0.4142, az0 = 0.1234;
+    double a[3] = {std::sin(tilt) * std::cos(tdir), std::sin(tilt) * std::sin(tdir), std::cos(tilt)};
+    double e1[3] = {a[2], 0.0, -a[0]};    /* (0,1,0) x a, then normalized */
+    double l1 = std::sqrt(e1[0] * e1[0] + e1[2] * e1[2]);
+    e1[0] /= l1;
+    e1[2] /= l1;
+    double e2[3] = {a[1]* e1[2] - a[2]* e1[1], a[2]* e1[0] - a[0]* e1[2], a[0]* e1[1] - a[1]* e1[0]};
+    auto point = [&](double ct, double st, double theta) -> Vec3 {
+        double c = st * std::cos(theta + az0), s2 = st * std::sin(theta + az0);
+        return {(float)(cx + R * (c * e1[0] + s2 * e2[0] + ct * a[0])),
+                (float)(cy + R * (c * e1[1] + s2 * e2[1] + ct * a[1])),
+                (float)(cz + R * (c * e1[2] + s2 * e2[2] + ct * a[2]))};
+    };
+
     /* north pole */
-    m.nodes.push_back({cx, cy, cz + R});
+    m.nodes.push_back(point(1.0, 0.0, 0.0));
 
     /* latitude rings (1..nlat-1) */
     for (int i = 1; i < nlat; i++) {
-        float phi = PI * (float)i / (float)nlat;
-        float sp = std::sin(phi), cp = std::cos(phi);
+        double phi = PI * (double)i / (double)nlat;
 
         for (int j = 0; j < nlon; j++) {
-            float theta = 2.0f * PI * (float)j / (float)nlon;
-            m.nodes.push_back({cx + R* sp * std::cos(theta), cy + R* sp * std::sin(theta), cz + R * cp});
+            m.nodes.push_back(point(std::cos(phi), std::sin(phi), 2.0 * PI * (double)j / (double)nlon));
         }
     }
 
     /* south pole */
     uint32_t south_pole = (uint32_t)m.nodes.size();
-    m.nodes.push_back({cx, cy, cz - R});
+    m.nodes.push_back(point(-1.0, 0.0, 0.0));
 
     /* north cap: fan from pole to first ring */
     for (int j = 0; j < nlon; j++) {

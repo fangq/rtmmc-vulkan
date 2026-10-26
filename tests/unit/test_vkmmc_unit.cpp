@@ -1616,6 +1616,27 @@ static void check_cylinder(const char* label, Vec3 c0, Vec3 c1, float R, int res
     CHECK(rad);
 }
 
+TEST(shape_sphere_no_vertex_on_axes) {
+    /* Regression (fixed): an axis-aligned pencil beam through the center of a
+       sphere hit the pole vertex exactly; which of its triangles the ray
+       tracer reports is driver dependent, and with curvature normals so was
+       the result (lavapipe 11.46% vs NVIDIA/AMD 11.85% absorbed). No vertex
+       may lie on a coordinate axis through the center. */
+    for (int res : {4, 8, 12, 16, 24, 32, 48, 64, 96}) {
+        ShapeMesh m = shapes("[{\"Sphere\": {\"O\": [30, 30, 30], \"R\": 10, \"Tag\": 1}}]", res, 64, NULL);
+        double mind = 1e30;
+
+        for (size_t i = 0; i < m.nodes.size(); i++) {
+            double x = m.nodes[i].x - 30, y = m.nodes[i].y - 30, z = m.nodes[i].z - 30;
+            mind = std::min(mind, std::sqrt(x * x + y * y));     /* distance to the z axis */
+            mind = std::min(mind, std::sqrt(y * y + z * z));     /* x axis */
+            mind = std::min(mind, std::sqrt(x * x + z * z));     /* y axis */
+        }
+
+        CHECK(mind > 1e-3);
+    }
+}
+
 TEST(shape_cylinder) {
     check_cylinder("z", {30, 30, 10}, {30, 30, 50}, 5, 24);
     check_cylinder("x", {10, 30, 30}, {50, 30, 30}, 4, 16);
