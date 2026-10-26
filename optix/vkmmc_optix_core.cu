@@ -8,7 +8,7 @@
 
 #include <optix.h>
 #include <optix_device.h>
-#include <sutil/vec_math.h>
+#include "vkmmc_vec_math.h"
 #include <limits>
 #include <math.h>
 #include <stdint.h>
