@@ -1,0 +1,3 @@
+# Known bug outside vkmmc: the Ubuntu 22.04 Vulkan loader (libvulkan.so.1 1.3.204)
+# reads freed memory in a printf call inside vkCreateInstance
+interceptor_via_lib:libvulkan.so.1

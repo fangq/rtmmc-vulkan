@@ -8,6 +8,7 @@
 #  make test          run the functional tests (needs a ray-query GPU)
 #  make unittest      build and run the host-side unit tests (no GPU needed)
 #  make fuzz          build the libFuzzer harnesses (needs clang)
+#  make asan          build ../bin/vkmmc_asan with AddressSanitizer+UBSan
 #  make clean         remove build products
 #
 #  The kernel variants (mesh, CSG, CSG+curvature, each with native 64-bit
@@ -68,7 +69,7 @@ ifdef SHOW
     HEADERS   += vkmmc_show.h $(SHOW_DEPS)
 endif
 
-.PHONY: all clean test unittest fuzz listgpu help pretty
+.PHONY: all clean test unittest fuzz asan listgpu help pretty
 
 all: $(BINARY)
 
@@ -113,6 +114,17 @@ vkmmc_show_vol_frag.spv: vkmmc_show_vol.frag
 %_spv.h: %.spv
 	$(XXD) -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
 
+# sanitized build for tests/fuzz/fuzz_vkmmc.py (objects are rebuilt with the sanitizer)
+ASANFLAGS := -g -O1 -fno-omit-frame-pointer -fsanitize=address,undefined
+
+asan: $(SOURCES) $(HEADERS) $(SHADER_HEADER) zmat/zmatlib.c zmat/miniz/miniz.c
+	@mkdir -p $(BINDIR)
+	$(CC) $(ASANFLAGS) -Wall -Izmat $(ZMATFLAGS) -c -o zmat/zmatlib_asan.o zmat/zmatlib.c
+	$(CC) $(ASANFLAGS) -c -o zmat/miniz/miniz_asan.o zmat/miniz/miniz.c
+	$(CXX) $(filter-out -O3,$(CXXFLAGS)) $(ASANFLAGS) -o $(BINDIR)/vkmmc_asan $(SOURCES) \
+	    zmat/zmatlib_asan.o $(if $(filter yes,$(HAVE_ZLIB)),,zmat/miniz/miniz_asan.o) $(LDFLAGS)
+	@echo "Built: $(BINDIR)/vkmmc_asan"
+
 test: $(BINARY)
 	cd ../tests && ./test_vkmmc.sh ../bin/vkmmc
 
@@ -126,7 +138,7 @@ listgpu: $(BINARY)
 	$(BINARY) -L
 
 clean:
-	rm -f $(BINARY) $(SPVS) $(SHADER_HEADER) $(ZMATOBJS) .shader_flags *.jdat \
+	rm -f $(BINARY) $(BINDIR)/vkmmc_asan $(SPVS) $(SHADER_HEADER) $(ZMATOBJS) zmat/zmatlib_asan.o zmat/miniz/miniz_asan.o .shader_flags *.jdat \
 	    vkmmc_show_vert.spv vkmmc_show_frag.spv vkmmc_show_vert_spv.h vkmmc_show_frag_spv.h \
 	    vkmmc_show_vol_vert.spv vkmmc_show_vol_frag.spv \
 	    vkmmc_show_vol_vert_spv.h vkmmc_show_vol_frag_spv.h

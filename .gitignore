@@ -19,7 +19,7 @@ tests/unit/*.gcov
 # fuzzing builds, corpora and findings
 tests/fuzz/build/
 tests/fuzz/corpus_*/
-tests/fuzz/findings/
+tests/fuzz/findings*/
 
 # simulation outputs and scratch space
 *.jdat

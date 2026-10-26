@@ -1,0 +1,1 @@
+{"Session": {"ID": "sef"}, "Forward": {"T0": 0, "T1": 5e-42, "Dt": 2.5e-09}, "Domain": {"LengthUnit": 0.5, "MeshRes": 12, "Media": [{"mua": 0, "mus": 0, "g": 1, "n": 1}, {"mua": 0.01, "g": 1, "n": 1.5}]}, "Optode": {"Source": {"Type": "disk", "Pos": [15, 15, 0], "Dir": [0, 0, 1], "Param1": [3, 0, 0, 0]}}, "Shapes": [{"Sphere": {"Tag": 1, "O": [15, 15, 15], "R": 8}}]}
