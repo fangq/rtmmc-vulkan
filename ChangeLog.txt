@@ -1,0 +1,35 @@
+Change Log
+
+== vkmmc 1.0.0, Qianqian Fang <q.fang at neu.edu> ==
+ 2026-10-25 [22138de] [test] libFuzzer harnesses and a JSON-aware mutation fuzzer
+ 2026-10-25 [48a3ad9] [bug] fix input-validation and performance bugs found by fuzzing
+ 2026-10-25 [677bbda] [test] host unit tests and an extended GPU functional test suite
+ 2026-10-25 [eb0066a] [optix] port the OptiX backend to the shared host layer and kernel fixes
+ 2026-10-25 [3a17a82] [feat] shared validated host layer, runtime kernel selection, exact and faster Vulkan kernel
+ 2026-10-25 [b177b3f] [build] vendor zmat (zlib/gzip) with multi-threaded block deflate, add .gitignore
+ 2026-03-29 [4311b6a] [bug] fix disk source straight line
+ 2026-03-29 [4108dfb] [bug] reseed for each batch
+ 2026-03-29 [2857e89] [feat] add volume rendering shaders, allow 3D rotation
+ 2026-03-29 [4dbc873] [feat] allow to render MIP of the fluence distribution with --show
+ 2026-03-28 [da05431] [feat] support --show, rendering input and output, support lens
+ 2026-03-28 [08adebc] [feat] add --show
+ 2026-03-27 [f7dca18] [feat] use mmc flag names
+ 2026-03-27 [62d266f] [feat] support lens; export ray trajectories
+ 2026-03-27 [4e73f17] [feat] use xxd to build the compiled shader into the binary
+ 2026-02-10 [f853d37] [opt] optimizing vulkan kernel using USE_CSG and USE_CURVATURE macros
+ 2026-02-09 [3687a2e] [test] add initial unit tests
+ 2026-02-09 [1f24f20] [speed] use macro to improve speed on mesh input
+ 2026-02-09 [d0076b8] [optix] can build and run, works for both csg and mesh inputs
+ 2026-02-08 [5a5dbe0] [bug] fix surface normal orientation, fix csg normal error
+ 2026-02-08 [f32632e] [shape] forcing flat-face normal
+ 2026-02-08 [f3e2384] [optix] add optix port
+ 2026-02-07 [45463fe] [feat] add --debugcurv to debug curvature accuracy
+ 2026-02-07 [8b35674] [bug] flip curvature normal, obtain correct results
+ 2026-02-07 [bfc1407] [feat] add principal curvature computation unit
+ 2026-02-07 [3e257a7] [feat] support principal curvature, add -m for surface mesh density
+ 2026-02-07 [174935d] [feat] support shape based CSG ray-marching, use state tracking for overlaps
+ 2026-02-06 [efad585] [bug] flipping material front and back labels, fix nan in absorption
+ 2026-02-05 [5da2538] [kernel] kernel update with meaningful variable names
+ 2026-02-05 [f815771] [format] reformat code using astyle
+ 2026-02-05 [f6a5082] [init] initial import of vkmmc
+ 2026-02-05 [4f3d42e] Initial commit
