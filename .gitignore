@@ -1,6 +1,8 @@
 # build products
 bin/
 build/
+dist/
+.deps/
 *.o
 *.spv
 *.ptx

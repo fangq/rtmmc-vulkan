@@ -1,7 +1,8 @@
 #!/bin/bash
 # check_deps.sh binary allowed-lib... : fail if the binary needs a shared
 # library not in the allowed list (matched by prefix), and print the newest
-# glibc symbol version it needs
+# glibc symbol version it needs; with MAXGLIBC=2.17 also fail if it needs a
+# newer glibc than that
 set -e
 bin=$1
 shift
@@ -22,5 +23,12 @@ for lib in $(objdump -p "$bin" | awk '/NEEDED/ {print $2}'); do
     fi
 done
 
-echo "  newest glibc symbol: $(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)"
+newest=$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+echo "  newest glibc symbol: $newest"
+
+if [ -n "$MAXGLIBC" ] && [ "$(printf '%s\n%s\n' "GLIBC_$MAXGLIBC" "$newest" | sort -V | tail -1)" != "GLIBC_$MAXGLIBC" ]; then
+    echo "ERROR: $bin needs $newest, newer than GLIBC_$MAXGLIBC"
+    bad=1
+fi
+
 exit $bad
