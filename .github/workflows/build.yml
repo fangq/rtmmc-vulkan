@@ -99,7 +99,7 @@ jobs:
         run: |
           tag=$(echo "${{ runner.os }}-${{ runner.arch }}-github-latest" | tr '[:upper:]' '[:lower:]')
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
-          exe=$(ls build/bin/Release/vkmmc.exe build/bin/vkmmc 2>/dev/null | head -1)
+          for exe in build/bin/Release/vkmmc.exe build/bin/vkmmc; do [ -f "$exe" ] && break; done
           bash .github/ci/package.sh "$tag" "$exe"
       - name: Upload the package
         uses: actions/upload-artifact@v4
@@ -116,7 +116,7 @@ jobs:
           # the scripts call python3
           mkdir -p ~/bin && printf '#!/bin/sh\nexec python "$@"\n' > ~/bin/python3 && chmod +x ~/bin/python3
           export PATH=~/bin:$PATH
-          exe=$(ls build/bin/Release/vkmmc.exe build/bin/vkmmc.exe 2>/dev/null | head -1)
+          for exe in build/bin/Release/vkmmc.exe build/bin/vkmmc.exe; do [ -f "$exe" ] && break; done
           "$exe" -L
           cd tests && ./test_vkmmc.sh "../$exe"
 
