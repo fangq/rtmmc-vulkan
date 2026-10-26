@@ -87,6 +87,8 @@ struct SimConfig {
     uint64_t nphoton;
     uint32_t rng_seed;
     bool do_mismatch, do_normalize;
+    bool do_specular;                   /* Fresnel reflection where a photon from outside enters the domain */
+    bool wide_field;                    /* mesh with MMC's negative wide-field labels */
     int output_type;
     float t0, t1, dt;
     int maxgate;
@@ -116,7 +118,7 @@ struct SimConfig {
     uint32_t maxjumpdebug;  /* max trajectory events to record */
 
     SimConfig() : session_id("default"), nphoton(1000000), rng_seed(29012391), do_mismatch(true),
-        do_normalize(true), output_type(OT_ENERGY), t0(0), t1(5e-9f), dt(5e-9f),
+        do_normalize(true), do_specular(false), wide_field(false), output_type(OT_ENERGY), t0(0), t1(5e-9f), dt(5e-9f),
         maxgate(1), unitinmm(1.0f), srctype(SRC_PENCIL), srcnum(1), srcid(0), init_elem(-1),
         mediumid0(0xFFFFFFFFu), has_steps(false), is_csg(false), mesh_res(24), minenergy(1e-6f),
         roulettesize(10.0f), debuglevel(0), maxjumpdebug(10000000) {
@@ -1093,10 +1095,11 @@ static void load_nodes(const json& mn, SimConfig& cfg) {
 
 /*
  * Load elements (JData or inline) as int32 rows of ncols: node indices are
- * checked against 1..nn and the label (last column) against 0..maxlabel.
+ * checked against 1..nn and the label (last column) against 0..maxlabel;
+ * nneg_out (optional) returns the number of rows with a negative label.
  */
 static std::vector<int32_t> load_elems(const json& me, size_t nnodes, size_t nnode_cols, size_t maxlabel,
-                                       size_t& count, const std::string& ctx) {
+                                       size_t& count, const std::string& ctx, size_t* nneg_out = NULL) {
     size_t cols = 0;
     std::vector<double> d = load_table(me, nnode_cols + 1, count, cols, ctx);
     std::vector<int32_t> out(count * (nnode_cols + 1));
@@ -1132,6 +1135,10 @@ static std::vector<int32_t> load_elems(const json& me, size_t nnodes, size_t nno
 
     if (nneg) {
         printf("%s: %zu rows with a negative label are treated as the background (medium 0)\n", ctx.c_str(), nneg);
+    }
+
+    if (nneg_out) {
+        *nneg_out = nneg;
     }
 
     return out;
@@ -1290,11 +1297,15 @@ static void load_pattern(const json& v, SimConfig& cfg) {
 }
 
 /* parameter checks that keep the kernels' source sampling well defined */
-static void check_source(const SimConfig& cfg) {
-    const float* p1 = cfg.srcparam1, *p2 = cfg.srcparam2;
-    const std::string ctx = std::string("Optode.Source (") + srctype_name(cfg.srctype) + ")";
+/* the parameters of one source (row of a multi-source list) */
+static void check_source_params(const SimConfig& cfg, const float* p1, const float* p2, const std::string& row) {
+    const std::string ctx = std::string("Optode.Source") + row + " (" + srctype_name(cfg.srctype) + ")";
 
     switch (cfg.srctype) {
+        case SRC_PENCIL:
+            vkmmc_require(row.empty() || p1[0] >= 0, ctx + ": Param1[0] (the disk radius of a multi-source row) must be non-negative");
+            break;
+
         case SRC_CONE:
             vkmmc_require(p1[0] > 0, ctx + ": Param1[0] (the cone half angle) must be positive");
             break;
@@ -1346,6 +1357,20 @@ static void check_source(const SimConfig& cfg) {
 
         default:
             break;
+    }
+}
+
+static void check_source(const SimConfig& cfg) {
+    if (cfg.extrasrc.empty()) {
+        check_source_params(cfg, cfg.srcparam1, cfg.srcparam2, "");
+    }
+
+    for (size_t r = 0; r < cfg.extrasrc.size(); r++) {
+        check_source_params(cfg, cfg.extrasrc[r].param1, cfg.extrasrc[r].param2, "[" + std::to_string(r) + "]");
+        float f = cfg.extrasrc[r].dir[3], f0 = cfg.srcdir[3];
+        vkmmc_require((std::isnan(f) == std::isnan(f0)) && ((f < 0 && std::isinf(f)) == (f0 < 0 && std::isinf(f0))),
+                      "Optode.Source.Dir[" + std::to_string(r) + "][3]: an isotropic (\"_NaN_\") or Lambertian (\"-_Inf_\") "
+                      "launch must be set for all sources");
     }
 
     vkmmc_require(cfg.srcnum == 1 || cfg.srctype == SRC_PATTERN || cfg.srctype == SRC_PATTERN3D,
@@ -1419,7 +1444,6 @@ static void load_source(const json& src, SimConfig& cfg) {
             vkmmc_require(pos[r][3] >= 0 && pos[r][3] <= VKMMC_MAX_SRC_WEIGHT,
                           "Optode.Source.Pos[" + std::to_string(r) + "][3] (the source weight) must be in [0, "
                           + std::to_string((int)VKMMC_MAX_SRC_WEIGHT) + "]");
-            vkmmc_require(p1[r][0] >= 0, "Optode.Source.Param1[" + std::to_string(r) + "][0] (the disk radius) must be non-negative");
             memcpy(e.pos, pos[r].data(), sizeof(e.pos));
             memcpy(e.dir, dir[r].data(), sizeof(e.dir));
             memcpy(e.param1, p1[r].data(), sizeof(e.param1));
@@ -1445,6 +1469,26 @@ static void load_source(const json& src, SimConfig& cfg) {
     check_source(cfg);
 }
 
+static const char debugflag[] = {'S', 'C', 'B', 'W', 'D', 'I', 'O', 'X', 'A', 'T', 'R', 'P', 'E', 'M', '\0'};
+
+/* MCX debug flags as letters, bit k for debugflag[k] (M: trajectories); ctx names the option */
+static uint32_t parse_debugopt(const char* s, const std::string& ctx) {
+    uint32_t level = 0;
+
+    for (const char* c = s; *c; c++) {
+        char u = (*c >= 'a' && *c <= 'z') ? (*c - 'a' + 'A') : *c;
+        const char* p = strchr(debugflag, u);
+
+        if (!p || !*p) {
+            vkmmc_fail(ctx + ": unknown debug flag '" + std::string(1, *c) + "'");
+        }
+
+        level |= (1u << (uint32_t)(p - debugflag));
+    }
+
+    return level;
+}
+
 static SimConfig load_json_config(const json& j) {
     SimConfig cfg;
 
@@ -1460,11 +1504,14 @@ static SimConfig load_json_config(const json& j) {
         cfg.rng_seed = (uint32_t)(int64_t)json_num_range(s, "RNGSeed", 29012391, -2147483648.0, 4294967295.0, "Session");
         cfg.do_mismatch = json_bool(s, "DoMismatch", true, "Session");
         cfg.do_normalize = json_bool(s, "DoNormalize", true, "Session");
+        cfg.do_specular = json_bool(s, "DoSpecular", false, "Session");
         cfg.output_type = parse_outputtype(json_str(s, "OutputType", "x", "Session"));
         vkmmc_require(cfg.output_type >= 0, "Session.OutputType must be flux, fluence or energy (f/l/x)");
         cfg.minenergy = (float)json_num_range(s, "RussianRoulette", 1e-6, 0, 1, "Session");
         cfg.roulettesize = (float)json_num_range(s, "RussianRouletteSize", 10, 1, 1e6, "Session");
-        cfg.debuglevel = (uint32_t)json_num_range(s, "DebugFlag", 0, 0, 4294967295.0, "Session");
+        cfg.debuglevel = (s.contains("DebugFlag") && s["DebugFlag"].is_string())
+                         ? parse_debugopt(s["DebugFlag"].get<std::string>().c_str(), "Session.DebugFlag")
+                         : (uint32_t)json_num_range(s, "DebugFlag", 0, 0, 4294967295.0, "Session");
         cfg.maxjumpdebug = (uint32_t)json_num_range(s, "MaxJumpDebug", 1e7, 0, 1e9, "Session");
     }
 
@@ -1581,8 +1628,12 @@ static SimConfig load_json_config(const json& j) {
             load_mesh_surf(cfg.nodes, sd.data(), nf, cfg.faces, cfg.facedata);
         } else if (shapes.contains("MeshElem")) {
             vkmmc_require(!shapes.contains("MeshROI"), "Shapes.MeshROI (implicit MMC edges, nodes and faces) is not supported");
+            size_t nneg = 0;
             elem = load_elems(shapes["MeshElem"], cfg.nodes.size(), 4, max_label(cfg), elem_count,
-                              "Shapes.MeshElem");
+                              "Shapes.MeshElem", &nneg);
+
+            cfg.wide_field = (nneg > 0);
+
             printf("MeshElem: %zu tetrahedra\n", elem_count);
             extract_surface_from_tet(cfg.nodes, elem.data(), elem_count, cfg.faces, cfg.facedata);
         } else {

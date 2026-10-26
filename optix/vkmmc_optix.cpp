@@ -105,6 +105,7 @@ struct VKMMCParam {
     float   focal;
     int     focus_mode;
     uint32_t do_tally;
+    uint32_t do_specular;
     Medium_GPU media[MAX_PROP];
 };
 
@@ -227,6 +228,8 @@ static void source_params(VKMMCParam& p, const SimConfig& cfg) {
     p.focus_mode = kernel_focus_mode(cfg.srcdir[3]);
     p.focal = (p.focus_mode == 1) ? cfg.srcdir[3] : 0.0f;
     p.do_tally = kernel_tallies_launch(cfg) ? 1u : 0u;
+    p.do_specular = kernel_specular(cfg) ? 1u : 0u;
+    p.initial_medium = kernel_initial_medium(cfg);
 }
 
 #if OPTIX_VERSION >= 70200
@@ -239,6 +242,8 @@ static std::vector<OptixModuleCompileBoundValueEntry> source_bound_values(const 
     VKMMC_BIND(extra_src_len);
     VKMMC_BIND(focus_mode);
     VKMMC_BIND(do_tally);
+    VKMMC_BIND(do_specular);
+    VKMMC_BIND(initial_medium);
 #undef VKMMC_BIND
     return b;
 }
@@ -556,7 +561,6 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
     params.voxel_scale = 1.0f / g.vs;
     kernel_time_gates(cfg, params.tstart, params.tend, params.inv_timestep);
     params.maxgate = cfg.maxgate;
-    params.initial_medium = kernel_initial_medium(cfg);
     params.patternbuf = patBuf.d_ptr();
     params.extrasrcbuf = srcBuf.d_ptr();
     params.slotbuf = slotBuf.d_ptr();

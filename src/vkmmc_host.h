@@ -41,7 +41,7 @@ struct CmdOverrides {
     uint32_t rng_seed, totalthread;
     bool has_seed;
     float unitinmm;
-    int outputtype, isreflect, isnormalize, gpuid;
+    int outputtype, isreflect, isspecular, isnormalize, gpuid;
     bool listgpu, dumpjson, dumpmesh;
     int meshres;
     int docurv;         // -1 = auto (enable for CSG), 0 = off, 1 = on
@@ -53,7 +53,7 @@ struct CmdOverrides {
     std::string session_id, json_str, inputfile;
     std::string kernelfile; // optional .spv/.ptx kernel overriding the embedded one
     CmdOverrides(): nphoton(0), batch_size(UINT64_MAX), rng_seed(0), totalthread(0), has_seed(false), unitinmm(0),
-        outputtype(-1), isreflect(-1), isnormalize(-1), gpuid(-1), listgpu(false), dumpjson(false), dumpmesh(false),
+        outputtype(-1), isreflect(-1), isspecular(-1), isnormalize(-1), gpuid(-1), listgpu(false), dumpjson(false), dumpmesh(false),
         meshres(0), docurv(-1), debugcurv(false), debuglevel(-1), maxjumpdebug(-1), show(false) {}
 };
 
@@ -74,6 +74,7 @@ static void printhelp(const char* prog, const char* backend, int defgpu) {
            " -E/--seed   int     RNG seed (>0: reproducible; 0: from the clock)\n"
            " -O/--outputtype c   x: energy deposit, f: flux, l: fluence [x]\n"
            " -b/--reflect 0|1    refractive index mismatch at boundaries [1]\n"
+           " -V/--specular 0|1   Fresnel reflection where photons from outside enter [0]\n"
            " -U/--normalize 0|1  normalize the output [1]\n"
            " -t/--thread num     total GPU threads, a multiple of 64 [65536]\n"
            " -B/--batch  num     photons per kernel launch [500000, 0: all at once]\n"
@@ -120,25 +121,6 @@ static int parse_int_arg(const char* opt, const char* s, double lo, double hi) {
     return (int)v;
 }
 
-static const char debugflag[] = {'S', 'C', 'B', 'W', 'D', 'I', 'O', 'X', 'A', 'T', 'R', 'P', 'E', 'M', '\0'};
-
-static uint32_t parse_debugopt(const char* s) {
-    uint32_t level = 0;
-
-    for (const char* c = s; *c; c++) {
-        char u = (*c >= 'a' && *c <= 'z') ? (*c - 'a' + 'A') : *c;
-        const char* p = strchr(debugflag, u);
-
-        if (!p || !*p) {
-            vkmmc_fail(std::string("option -D: unknown debug flag '") + *c + "'");
-        }
-
-        level |= (1u << (uint32_t)(p - debugflag));
-    }
-
-    return level;
-}
-
 /*
  * Parse argv into ovr. Returns false when the program should exit without
  * running (help, version); throws on invalid arguments.
@@ -180,6 +162,8 @@ static bool parse_cmdline(int argc, char** argv, CmdOverrides& ovr, const char* 
             vkmmc_require(ovr.outputtype >= 0, "option -O expects x (energy), f (flux) or l (fluence)");
         } else if (a == "-b" || a == "--reflect") {
             ovr.isreflect = parse_int_arg(a.c_str(), val(), 0, 1);
+        } else if (a == "-V" || a == "--specular") {
+            ovr.isspecular = parse_int_arg(a.c_str(), val(), 0, 1);
         } else if (a == "-U" || a == "--normalize") {
             ovr.isnormalize = parse_int_arg(a.c_str(), val(), 0, 1);
         } else if (a == "-t" || a == "--thread") {
@@ -204,7 +188,7 @@ static bool parse_cmdline(int argc, char** argv, CmdOverrides& ovr, const char* 
             ovr.docurv = parse_int_arg(a.c_str(), val(), -1, 1);
         } else if (a == "-D" || a == "--debug") {
             const char* darg = val();
-            ovr.debuglevel = isalpha((unsigned char)darg[0]) ? (int)parse_debugopt(darg)
+            ovr.debuglevel = isalpha((unsigned char)darg[0]) ? (int)parse_debugopt(darg, "option -D")
                              : parse_int_arg("-D", darg, 0, INT_MAX);
         } else if (a == "--maxjumpdebug") {
             ovr.maxjumpdebug = (int64_t)parse_num_arg(a.c_str(), val(), 0, 1e9);
@@ -276,6 +260,10 @@ static void apply_overrides(SimConfig& cfg, const CmdOverrides& ovr) {
         cfg.do_mismatch = (ovr.isreflect != 0);
     }
 
+    if (ovr.isspecular >= 0) {
+        cfg.do_specular = (ovr.isspecular != 0);
+    }
+
     if (ovr.isnormalize >= 0) {
         cfg.do_normalize = (ovr.isnormalize != 0);
     }
@@ -307,6 +295,71 @@ struct SimSetup {
  * Build the surface mesh (CSG mode), compute curvature, and check that every
  * label and the initial medium address a defined medium.
  */
+#define VKMMC_SAFETY_DIST 0.001f   /* SAFETY_DIST of the kernels */
+
+static int kernel_focus_mode(float f);
+
+static void cross3(const double* a, const double* b, double* c) {
+    c[0] = a[1] * b[2] - a[2] * b[1];
+    c[1] = a[2] * b[0] - a[0] * b[2];
+    c[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+static double dot3(const double* a, const double* b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+/*
+ * A source on a face is inside the tissue there, as in MCX. The kernels move
+ * such photons off the face; a fixed pencil beam is moved here once instead:
+ * back before the face within VKMMC_SAFETY_DIST of Pos along Dir if the side
+ * behind it is a medium, else past it. Face normals point to the front medium.
+ */
+static void snap_pencil_source(SimConfig& cfg) {
+    if (cfg.srctype != SRC_PENCIL || !cfg.extrasrc.empty() || kernel_focus_mode(cfg.srcdir[3]) != 0) {
+        return;
+    }
+
+    const double d[3] = {cfg.srcdir[0], cfg.srcdir[1], cfg.srcdir[2]};
+    float tbest = 2 * VKMMC_SAFETY_DIST;
+    size_t best = 0;
+
+    for (size_t i = 0; i < cfg.faces.size(); i++) {   /* Moller-Trumbore, t in [-SAFETY_DIST, SAFETY_DIST] */
+        const Vec3& a = cfg.nodes[cfg.faces[i][0]], &b = cfg.nodes[cfg.faces[i][1]], &c = cfg.nodes[cfg.faces[i][2]];
+        double e1[3] = {b.x - a.x, b.y - a.y, b.z - a.z}, e2[3] = {c.x - a.x, c.y - a.y, c.z - a.z};
+        double tv[3] = {cfg.srcpos[0] - a.x, cfg.srcpos[1] - a.y, cfg.srcpos[2] - a.z}, pv[3], qv[3];
+        cross3(d, e2, pv);
+        double det = dot3(e1, pv);
+
+        if (std::fabs(det) < 1e-12) {
+            continue;
+        }
+
+        cross3(tv, e1, qv);
+        double u = dot3(tv, pv) / det, v = dot3(d, qv) / det, t = dot3(e2, qv) / det;
+
+        if (u >= 0 && v >= 0 && u + v <= 1 && std::fabs(t) <= VKMMC_SAFETY_DIST && t < tbest) {
+            tbest = (float)t;
+            best = i;
+        }
+    }
+
+    if (tbest > VKMMC_SAFETY_DIST) {
+        return;
+    }
+
+    const FaceData& f = cfg.facedata[best];
+    uint32_t front, back;
+    bool flat;
+    unpack_media(f.packed_media, front, back, flat);
+    bool ff = (f.nx * d[0] + f.ny * d[1] + f.nz * d[2]) < 0;   /* from the front side to the back side */
+    float s = tbest + (((ff ? front : back) != 0) ? -VKMMC_SAFETY_DIST : VKMMC_SAFETY_DIST);
+
+    for (int i = 0; i < 3; i++) {
+        cfg.srcpos[i] += s * d[i];
+    }
+}
+
 static SimSetup prepare_geometry(SimConfig& cfg, const CmdOverrides& ovr) {
     SimSetup st;
 
@@ -359,6 +412,7 @@ static SimSetup prepare_geometry(SimConfig& cfg, const CmdOverrides& ovr) {
     }
 
     vkmmc_require(cfg.faces.size() < (1u << 30), "the mesh has too many triangles");
+    snap_pencil_source(cfg);
     return st;
 }
 
@@ -464,6 +518,12 @@ static uint32_t kernel_initial_medium(const SimConfig& cfg) {
     bool randdir = cfg.srctype == SRC_ISOTROPIC || cfg.srctype == SRC_CONE || cfg.srctype == SRC_ARCSINE
                    || cfg.srctype == SRC_ZGAUSSIAN || cfg.srctype == SRC_LINE || fm == 2 || fm == 3;
     return (cfg.extrasrc.empty() && !randdir) ? cfg.mediumid0 : 0xFFFFFFFFu;
+}
+
+/* Fresnel reflection at the entry: DoSpecular, or for MMC's wide-field meshes,
+   whose sources are in the -1 domain, the tissue surface as any boundary */
+static bool kernel_specular(const SimConfig& cfg) {
+    return cfg.do_specular || (cfg.wide_field && cfg.do_mismatch);
 }
 
 /* the kernels tally the launched energy only for sources with varying launch
@@ -846,7 +906,7 @@ static json source_json(const SimConfig& cfg, bool with_pattern) {
 static void dump_config_json(const SimConfig& cfg, const SimSetup& st) {
     json d;
     d["Session"] = {{"ID", cfg.session_id}, {"Photons", cfg.nphoton}, {"RNGSeed", cfg.rng_seed},
-        {"DoMismatch", cfg.do_mismatch}, {"DoNormalize", cfg.do_normalize},
+        {"DoMismatch", cfg.do_mismatch}, {"DoSpecular", cfg.do_specular}, {"DoNormalize", cfg.do_normalize},
         {"OutputType", output_type_name(cfg.output_type)}, {"DebugFlag", cfg.debuglevel}
     };
     d["Forward"] = {{"T0", cfg.t0}, {"T1", cfg.t1}, {"Dt", cfg.dt}, {"Gates", cfg.maxgate}};
@@ -873,7 +933,9 @@ static void dump_mesh(const SimConfig& cfg) {
     vkmmc_require(nn > 0 && nf > 0, "no mesh to dump");
 
     json dump;
-    dump["Session"] = {{"ID", cfg.session_id}, {"Photons", cfg.nphoton}, {"DoMismatch", cfg.do_mismatch}};
+    dump["Session"] = {{"ID", cfg.session_id}, {"Photons", cfg.nphoton}, {"DoMismatch", cfg.do_mismatch},
+        {"DoSpecular", cfg.do_specular}
+    };
     dump["Forward"] = {{"T0", cfg.t0}, {"T1", cfg.t1}, {"Dt", cfg.dt}};
     dump["Domain"]["LengthUnit"] = cfg.unitinmm;
     dump["Domain"]["Media"] = json::array();

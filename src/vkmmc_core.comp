@@ -105,7 +105,7 @@ layout(std140, set = 0, binding = 4) uniform SimParams {
     uint  do_reflect;        // 140
 
     // offset 144: scalar row 2
-    uint  initial_medium;    // 144
+    uint  initial_medium_u;  // 144 — (the specialization constant initial_medium below)
     uint  total_threads;     // 148
     uint  num_media;         // 152
     uint  rng_seed;          // 156
@@ -143,6 +143,8 @@ layout(constant_id = 2) const int  src_id = 0;            // multi-source: -1 a 
 layout(constant_id = 3) const uint extra_src_len = 0u;    // sources in extra_src, 0: the single source above
 layout(constant_id = 4) const int  focus_mode = 0;        // 0 none, 1 focal length src_dir.w, 2 isotropic, 3 Lambertian
 layout(constant_id = 5) const uint do_tally = 0u;         // tally the launched energy (sources with varying weights)
+layout(constant_id = 6) const uint do_specular = 0u;      // Fresnel reflection where a photon from outside enters
+layout(constant_id = 7) const uint initial_medium = 0xFFFFFFFFu; // mesh mode: the medium of every photon, or probed
 
 layout(std430, set = 0, binding = 5) readonly buffer SeedBuffer { uvec4 thread_seeds[]; };
 
@@ -730,13 +732,17 @@ void coplanar_crossings(vec3 p, vec3 nfar, int mode, inout uvec2 ms, inout uvec2
  * is inside a shape exactly when the first crossing of that shape's tag along
  * the ray is an exit (back-face hit); overlapping shapes of the same tag are
  * thus counted once. The start point is perturbed perpendicular to d to avoid
- * degenerate ray-edge/vertex hits.
+ * degenerate ray-edge/vertex hits. hd0, tid0 and ff0 return the first hit
+ * (hd0 < 0: none).
  */
-uvec2 csg_enclosure(vec3 p, vec3 d) {
+uvec2 csg_enclosure(vec3 p, vec3 d, out float hd0, out int tid0, out bool ff0) {
     uvec2 seen = uvec2(0u, 0u), inside = uvec2(0u, 0u), ms = uvec2(0u, 0u);
     vec3 perp = (abs(d.z) < 0.999) ? normalize(cross(d, vec3(0.0, 0.0, 1.0)))
                 : normalize(cross(d, vec3(1.0, 0.0, 0.0)));
     vec3 wp = p + perp * 2e-4;
+    hd0 = -1.0;
+    tid0 = 0;
+    ff0 = false;
 
     for (int wk = 0; wk < 64; wk++) {
         float hd;
@@ -745,6 +751,12 @@ uvec2 csg_enclosure(vec3 p, vec3 d) {
 
         if (!trace_ray(wp, d, RAY_TMIN, FMAX, hd, tid, ff)) {
             break;
+        }
+
+        if (wk == 0) {
+            hd0 = hd;
+            tid0 = tid;
+            ff0 = ff;
         }
 
         Face fn = faces[tid];
@@ -816,9 +828,15 @@ vec3 focus_dir(vec3 p, vec3 d, vec3 origin, float f) {
  * sources: the pixel of the photon).
  */
 void sample_source(inout vec3 p, inout vec3 d, inout float w, inout uvec4 rng) {
+    vec3 spos = src_pos.xyz, sdir = src_dir.xyz;
+    vec4 sp1 = src_param1, sp2 = src_param2;
+    float focal = (focus_mode == 1) ? src_dir.w : 0.0, sw = 1.0;
+
     if (extra_src_len > 0u) {
         // multi-source: src_id < 0 picks a source at random for each photon,
-        // which deposits into the field of that source; src_id = k uses source k
+        // which deposits into the field of that source; src_id = k uses source k.
+        // Each source is of Optode.Source.Type with its own Pos (.w weight),
+        // Dir (.w focal length), Param1 and Param2
         uint slot = uint(max(src_id - 1, 0));
 
         if (src_id < 0) {
@@ -827,28 +845,35 @@ void sample_source(inout vec3 p, inout vec3 d, inout float w, inout uvec4 rng) {
         }
 
         vec4 sp = extra_src[slot * 4u], sd = extra_src[slot * 4u + 1u];
-        float radius = extra_src[slot * 4u + 2u].x;
-        p = sp.xyz;
-        d = sd.xyz;
-        w = sp.w;
+        spos = sp.xyz;
+        sdir = sd.xyz;
+        sp1 = extra_src[slot * 4u + 2u];
+        sp2 = extra_src[slot * 4u + 3u];
+        focal = sd.w;
+        sw = sp.w;
+        p = spos;
+        d = sdir;
 
-        // a disk of radius Param1[0] perpendicular to the source direction
-        if (radius > 0.0) {
-            float phi = TWO_PI * rand01(rng);
-            p += disk_offset(d, sqrt(rand01(rng)) * radius, cos(phi), sin(phi));
+        // a pencil beam, on a disk of radius Param1[0] perpendicular to Dir (as mmc-optix)
+        if (src_type == SRC_PENCIL) {
+            w = sw;
+
+            if (sp1.x > 0.0) {
+                float phi = TWO_PI * rand01(rng);
+                p += disk_offset(d, sqrt(rand01(rng)) * sp1.x, cos(phi), sin(phi));
+            }
+
+            if (focal != 0.0) {
+                d = focus_dir(p, d, spos, focal);
+            }
+
+            return;
         }
-
-        if (sd.w != 0.0) {
-            d = focus_dir(p, d, sp.xyz, sd.w);
-        }
-
-        return;
     }
 
     vec3 origin = p;     // the focal reference point of a wide-field source
-    vec3 v1 = src_param1.xyz, v2 = src_param2.xyz;
+    vec3 v1 = sp1.xyz, v2 = sp2.xyz;
     bool canfocus = true;
-    float focal = (focus_mode == 1) ? src_dir.w : 0.0;
 
     if (src_type == SRC_PLANAR || src_type == SRC_PATTERN || src_type == SRC_FOURIER
             || src_type == SRC_PENCILARRAY || src_type == SRC_PATTERN3D) {
@@ -856,29 +881,29 @@ void sample_source(inout vec3 p, inout vec3 d, inout float w, inout uvec4 rng) {
 
         if (src_type == SRC_PATTERN3D) {
             float rz = rand01(rng);
-            ivec3 n = ivec3(src_param1.xyz);
-            p = src_pos.xyz + vec3(rx, ry, rz) * src_param1.xyz;
+            ivec3 n = ivec3(sp1.xyz);
+            p = spos + vec3(rx, ry, rz) * sp1.xyz;
             ph_pixel = uint((min(int(rz * float(n.z)), n.z - 1) * n.y + min(int(ry * float(n.y)), n.y - 1)) * n.x
                             + min(int(rx * float(n.x)), n.x - 1));
             w = (src_num > 1u) ? 1.0 : src_pattern[ph_pixel];
-            origin += 0.5 * src_param1.xyz;
+            origin += 0.5 * sp1.xyz;
         } else {
             if (src_type == SRC_PENCILARRAY) {
                 // a Param1[3] x Param2[3] array of pencil beams spanning v1 and v2
-                float ax = (src_param1.w > 1.0) ? floor(rx * src_param1.w) / (src_param1.w - 1.0) : 0.0;
-                float ay = (src_param2.w > 1.0) ? floor(ry * src_param2.w) / (src_param2.w - 1.0) : 0.0;
-                p = src_pos.xyz + ax * v1 + ay * v2;
+                float ax = (sp1.w > 1.0) ? floor(rx * sp1.w) / (sp1.w - 1.0) : 0.0;
+                float ay = (sp2.w > 1.0) ? floor(ry * sp2.w) / (sp2.w - 1.0) : 0.0;
+                p = spos + ax * v1 + ay * v2;
             } else {
-                p = src_pos.xyz + rx * v1 + ry * v2;
+                p = spos + rx * v1 + ry * v2;
             }
 
             if (src_type == SRC_PATTERN) {
-                int xs = int(src_param1.w), ys = int(src_param2.w);
+                int xs = int(sp1.w), ys = int(sp2.w);
                 ph_pixel = uint(min(int(ry * float(ys)), ys - 1) * xs + min(int(rx * float(xs)), xs - 1));
                 w = (src_num > 1u) ? 1.0 : src_pattern[ph_pixel];
             } else if (src_type == SRC_FOURIER) {
-                w = (cos((floor(src_param1.w) * rx + floor(src_param2.w) * ry + src_param1.w - floor(src_param1.w)) * TWO_PI)
-                     * (1.0 - src_param2.w + floor(src_param2.w)) + 1.0) * 0.5;
+                w = (cos((floor(sp1.w) * rx + floor(sp2.w) * ry + sp1.w - floor(sp1.w)) * TWO_PI)
+                     * (1.0 - sp2.w + floor(sp2.w)) + 1.0) * 0.5;
             }
 
             origin += 0.5 * (v1 + v2);
@@ -886,46 +911,46 @@ void sample_source(inout vec3 p, inout vec3 d, inout float w, inout uvec4 rng) {
     } else if (src_type == SRC_FOURIERX || src_type == SRC_FOURIERX2D) {
         // Param1: [v1, |v2|] with v2 along Dir x v1; Param2: [kx, ky, phi0, M] or [kx, ky, phix, phiy]
         float rx = rand01(rng), ry = rand01(rng);
-        vec3 v2x = src_param1.w * inversesqrt(dot(v1, v1)) * cross(src_dir.xyz, v1);
-        p = src_pos.xyz + rx * v1 + ry * v2x;
+        vec3 v2x = sp1.w * inversesqrt(dot(v1, v1)) * cross(sdir, v1);
+        p = spos + rx * v1 + ry * v2x;
 
         if (src_type == SRC_FOURIERX2D) {
-            w = (sin((src_param2.x * rx + src_param2.z) * TWO_PI) * sin((src_param2.y * ry + src_param2.w) * TWO_PI) + 1.0) * 0.5;
+            w = (sin((sp2.x * rx + sp2.z) * TWO_PI) * sin((sp2.y * ry + sp2.w) * TWO_PI) + 1.0) * 0.5;
         } else {
-            w = (cos((src_param2.x * rx + src_param2.y * ry + src_param2.z) * TWO_PI) * (1.0 - src_param2.w) + 1.0) * 0.5;
+            w = (cos((sp2.x * rx + sp2.y * ry + sp2.z) * TWO_PI) * (1.0 - sp2.w) + 1.0) * 0.5;
         }
 
         origin += 0.5 * (v1 + v2x);
     } else if (src_type == SRC_DISK || src_type == SRC_RING || src_type == SRC_GAUSSIAN) {
         float phi, r0;
 
-        if (src_type == SRC_RING && (src_param1.z > 0.0 || src_param1.w > 0.0)) {
-            phi = abs(src_param1.z - src_param1.w) * rand01(rng) + min(src_param1.z, src_param1.w);
+        if (src_type == SRC_RING && (sp1.z > 0.0 || sp1.w > 0.0)) {
+            phi = abs(sp1.z - sp1.w) * rand01(rng) + min(sp1.z, sp1.w);
         } else {
             phi = TWO_PI * rand01(rng);
         }
 
         if (src_type != SRC_GAUSSIAN) {
             // a disk of radius Param1[0], or a ring between the radii Param1[0] and Param1[1]
-            r0 = sqrt(rand01(rng) * abs(src_param1.x * src_param1.x - src_param1.y * src_param1.y) + src_param1.y * src_param1.y);
-        } else if (abs(focal) < 1e-5 || abs(src_param1.y) < 1e-5) {
-            r0 = sqrt(rand_scatlen(rng)) * src_param1.x;
+            r0 = sqrt(rand01(rng) * abs(sp1.x * sp1.x - sp1.y * sp1.y) + sp1.y * sp1.y);
+        } else if (abs(focal) < 1e-5 || abs(sp1.y) < 1e-5) {
+            r0 = sqrt(rand_scatlen(rng)) * sp1.x;
         } else {
-            float z0 = src_param1.x * src_param1.x * ONE_PI / src_param1.y;   // Rayleigh range
-            r0 = sqrt(rand_scatlen(rng) * (1.0 + focal * focal / (z0 * z0))) * src_param1.x;
+            float z0 = sp1.x * sp1.x * ONE_PI / sp1.y;   // Rayleigh range
+            r0 = sqrt(rand_scatlen(rng) * (1.0 + focal * focal / (z0 * z0))) * sp1.x;
         }
 
-        p = src_pos.xyz + disk_offset(src_dir.xyz, r0, cos(phi), sin(phi));
+        p = spos + disk_offset(sdir, r0, cos(phi), sin(phi));
     } else if (src_type == SRC_CONE || src_type == SRC_ISOTROPIC || src_type == SRC_ARCSINE) {
         float phi = TWO_PI * rand01(rng), ct;
 
         if (src_type == SRC_CONE) {
             // half angle Param1[0]: uniform in solid angle, or uniform in angle if Param1[1] > 0;
             // sampled directly instead of by rejection, with the same distribution
-            if (src_param1.y > 0.0) {
-                ct = cos(rand01(rng) * min(src_param1.x, TWO_PI));
+            if (sp1.y > 0.0) {
+                ct = cos(rand01(rng) * min(sp1.x, TWO_PI));
             } else {
-                ct = 1.0 - rand01(rng) * (1.0 - cos(min(src_param1.x, ONE_PI)));
+                ct = 1.0 - rand01(rng) * (1.0 - cos(min(sp1.x, ONE_PI)));
             }
         } else if (src_type == SRC_ISOTROPIC) {
             ct = 2.0 * rand01(rng) - 1.0;
@@ -937,26 +962,26 @@ void sample_source(inout vec3 p, inout vec3 d, inout float w, inout uvec4 rng) {
         canfocus = false;
     } else if (src_type == SRC_ZGAUSSIAN) {
         float phi = TWO_PI * rand01(rng);
-        float ang = sqrt(2.0 * rand_scatlen(rng)) * (1.0 - 2.0 * rand01(rng)) * src_param1.x;
+        float ang = sqrt(2.0 * rand_scatlen(rng)) * (1.0 - 2.0 * rand01(rng)) * sp1.x;
         d = rotate_dir(d, vec2(sin(ang), cos(ang)), vec2(sin(phi), cos(phi)));
         canfocus = false;
     } else if (src_type == SRC_HYPERBOLOID) {
         // Param1: waist radius, distance from Pos to the waist, Rayleigh range
         float phi = TWO_PI * rand01(rng), sphi = sin(phi), cphi = cos(phi);
-        float r0 = sqrt(0.5 * rand_scatlen(rng)) * src_param1.x;
-        float tilt = (src_param1.z > 0.0) ? (-src_param1.y / src_param1.z) : 0.0;
-        vec3 bdir = normalize(vec3(-r0 * sphi, r0 * cphi, src_param1.z));
+        float r0 = sqrt(0.5 * rand_scatlen(rng)) * sp1.x;
+        float tilt = (sp1.z > 0.0) ? (-sp1.y / sp1.z) : 0.0;
+        vec3 bdir = normalize(vec3(-r0 * sphi, r0 * cphi, sp1.z));
         float dpx = r0 * (cphi - tilt * sphi), dpy = r0 * (sphi + tilt * cphi);
-        vec3 sd = src_dir.xyz;
+        vec3 sd = sdir;
 
         if (sd.z > -1.0 + FEPS && sd.z < 1.0 - FEPS) {
             float st = sqrt(1.0 - sd.z * sd.z), cb = sd.x / st, sb = sd.y / st;
-            p = src_pos.xyz + vec3(dpx * cb * sd.z - dpy * sb, dpx * sb * sd.z + dpy * cb, -dpx * st);
+            p = spos + vec3(dpx * cb * sd.z - dpy * sb, dpx * sb * sd.z + dpy * cb, -dpx * st);
             d = vec3(bdir.x * cb * sd.z - bdir.y * sb + bdir.z * cb * st,
                      bdir.x * sb * sd.z + bdir.y * cb + bdir.z * sb * st,
                      -bdir.x * st + bdir.z * sd.z);
         } else {
-            p = src_pos.xyz + vec3(dpx, dpy, 0.0);
+            p = spos + vec3(dpx, dpy, 0.0);
             d = vec3(bdir.x, bdir.y, (sd.z > 0.0) ? bdir.z : -bdir.z);
         }
 
@@ -973,18 +998,18 @@ void sample_source(inout vec3 p, inout vec3 d, inout float w, inout uvec4 rng) {
         if (src_type == SRC_LINE) {
             vec3 dp = d - dot(d, axis) * axis;
 
-            if (src_param2.x > 0.0 && dot(dp, dp) > 1e-12) {
-                float phi = src_param2.x * (2.0 * rand01(rng) - 1.0);
+            if (sp2.x > 0.0 && dot(dp, dp) > 1e-12) {
+                float phi = sp2.x * (2.0 * rand01(rng) - 1.0);
                 dp = normalize(dp);
                 d = dp * cos(phi) + cross(axis, dp) * sin(phi);
             } else {
                 float phi = TWO_PI * rand01(rng);
                 d = rotate_dir(axis, vec2(1.0, 0.0), vec2(sin(phi), cos(phi)));
             }
-        } else if (src_param2.x > 0.0 || src_param2.y > 0.0) {
+        } else if (sp2.x > 0.0 || sp2.y > 0.0) {
             float phi = TWO_PI * rand01(rng), r = sqrt(2.0 * rand_scatlen(rng));
             vec3 across = cross(v1, d);
-            d += (cos(phi) * src_param2.x * r) * normalize(across) + (sin(phi) * src_param2.y * r) * axis;
+            d += (cos(phi) * sp2.x * r) * normalize(across) + (sin(phi) * sp2.y * r) * axis;
             d = normalize(d);
         }
 
@@ -993,30 +1018,45 @@ void sample_source(inout vec3 p, inout vec3 d, inout float w, inout uvec4 rng) {
     }
 
     // a focused (Dir[3] = focal length), isotropic ("_NaN_") or Lambertian ("-_Inf_") beam
-    if (canfocus && focus_mode != 0) {
+    if (canfocus) {
         if (focus_mode == 2) {
             float phi = TWO_PI * rand01(rng), ct = 2.0 * rand01(rng) - 1.0;
             d = rotate_dir(d, vec2(sqrt(max(1.0 - ct * ct, 0.0)), ct), vec2(sin(phi), cos(phi)));
         } else if (focus_mode == 3) {
             float phi = TWO_PI * rand01(rng), st = sqrt(rand01(rng));
             d = rotate_dir(d, vec2(st, sqrt(1.0 - st * st)), vec2(sin(phi), cos(phi)));
-        } else {
+        } else if (focal != 0.0) {
             d = focus_dir(p, d, origin, focal);
         }
     }
+
+    w *= sw;
 }
 
 // ==================== Photon Launch ====================
 
-/**
- * Launch a new photon from the source.
- * Determines the initial medium by either:
- *   - CSG parity walk (counting boundary crossings to determine enclosure)
- *   - Mesh mode (single ray probe to find enclosing element)
+/*
+ * A photon from outside enters the domain at the hit point hp: the time of
+ * flight to it is added, and with DoSpecular the Fresnel reflection there
+ * (a reflected photon is lost). Returns false if the photon was reflected.
  */
-void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
-                   inout float tof, inout uint mid, inout uvec2 mstate, inout uvec4 rng,
-                   out vec3 launch_pos, inout uvec2 csg_cache, inout bool csg_cached) {
+bool enter_domain(vec3 hp, float hd, int tid, uint mid, inout vec3 p, inout vec3 d, inout float tof, inout uvec4 rng) {
+    p = hp + d * SAFETY_DIST;
+    tof += hd * INV_C0 * media[0].n;
+
+    return !(do_specular > 0u && mid < num_media && media[0].n != media[mid].n
+             && do_reflection(get_normal(tid, hp), faces[tid].normal, media[0].n, media[mid].n, rng, hp, p, d));
+}
+
+/**
+ * Launch a new photon from the source and find its initial medium:
+ *   - CSG: an enclosure walk along the launch direction
+ *   - Mesh: the given initial medium (InitElem), or a ray probe
+ * Returns false if the photon misses the domain.
+ */
+bool launch_photon_once(inout vec3 p, inout vec3 d, inout float w, inout float slen,
+                        inout float tof, inout uint mid, inout uvec2 mstate, inout uvec4 rng,
+                        out vec3 launch_pos, inout uvec2 csg_cache, inout bool csg_cached) {
     p = src_pos.xyz;
     d = src_dir.xyz;
     w = 1.0;
@@ -1032,22 +1072,61 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
 
     // ---- Determine initial medium ----
 
+    // A source on a surface is inside the tissue there, as in MCX: the medium
+    // is found by a ray from SAFETY_DIST behind the source, and a face within
+    // 2 SAFETY_DIST is the one the source sits on. The photon is then moved
+    // off the face, back to the side behind it, or forward if that side is
+    // the background; the transport meets the face as any other boundary.
+    vec3 o = p - d * SAFETY_DIST;
+    float hd;
+    int tid;
+    bool ff;
+    uint fm, bm;
+
 #ifdef USE_CSG
 
-    if (do_csg > 0u) {
+    {
+        // the CSG kernels run shape inputs only (do_csg = 1)
         // Enclosure walk: cast a ray forward through all surfaces. The source
         // is inside a shape exactly when the first crossing of that shape's
         // tag along the ray is an exit (back-face hit); overlapping shapes of
-        // the same tag are thus counted once. The start point is perturbed
-        // perpendicular to d to avoid degenerate ray-edge/vertex hits.
-        // A pencil source launches every photon from the same point, so the
+        // the same tag are thus counted once. A pencil source launches every
+        // photon from the same point (moved off a face by the host), so the
         // walk is done once per thread and cached in csg_cache.
-        uvec2 inside = csg_cache;
+        uvec2 inside;
 
-        if (src_type != SRC_PENCIL || extra_src_len > 0u || !csg_cached) {
-            inside = csg_enclosure(p, d);
-            csg_cache = inside;
-            csg_cached = true;
+        if (src_type == SRC_PENCIL && extra_src_len == 0u && focus_mode == 0) {
+            if (!csg_cached) {
+                csg_cache = csg_enclosure(p, d, hd, tid, ff);
+                csg_cached = true;
+            }
+
+            inside = csg_cache;
+            hd = -1.0;
+        } else {
+            inside = csg_enclosure(o, d, hd, tid, ff);
+
+            if (hd >= 0.0 && hd < 2.0 * SAFETY_DIST) {
+                vec3 hp = o + d * hd;
+
+                if (any(notEqual(inside, uvec2(0u, 0u)))) {
+                    p = hp - d * SAFETY_DIST;   // in a shape behind the face: stay there
+                } else {
+                    // in the background: into the shape it enters (re-derived past a coplanar face)
+                    p = hp + d * SAFETY_DIST;
+                    unpack_media(faces[tid].media, fm, bm);
+
+                    if (is_coplanar_triangle(faces[tid].media)) {
+                        inside = csg_enclosure(p, d, hd, tid, ff);
+                    } else if (ff && bm >= 1u && bm <= 64u) {
+                        inside = tagset_add(inside, bm);
+                    }
+                }
+
+                hd = -1.0;
+            } else if (hd >= 0.0) {
+                hd -= SAFETY_DIST;   // the distance from p
+            }
         }
 
         mstate = csg_state(inside);
@@ -1055,63 +1134,89 @@ void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
 
         // If the source is outside all shapes, enter the first shape it points at
         if (mid == 0u) {
-            float hd;
-            int tid;
-            bool ff;
-
-            if (trace_ray(p, d, 0.0, FMAX, hd, tid, ff) && ff) {
-                uint fm, bm;
-                unpack_media(faces[tid].media, fm, bm);
-                vec3 hp = p + d * hd;
-                p = hp + d * SAFETY_DIST;
-                mstate = ms_enter(mstate, bm);
-                mid = ms_get(mstate, 0);
-
-                // Fresnel reflection at the entry boundary
-                if (do_reflect > 0u && mid < num_media && media[0].n != media[mid].n
-                        && do_reflection(get_normal(tid, hp), faces[tid].normal, media[0].n, media[mid].n, rng, hp, p, d)) {
-                    mstate = uvec2(0u, 0u);
-                    mid = MEDIUM_DEAD;
-                    w = 0.0;
-                }
-            } else {
+            if (hd < 0.0 && !trace_ray(p, d, 0.0, FMAX, hd, tid, ff)) {
                 mid = MEDIUM_DEAD;
+                return false;
+            }
+
+            if (!ff) {
+                mid = MEDIUM_DEAD;
+                return false;
+            }
+
+            unpack_media(faces[tid].media, fm, bm);
+            mstate = ms_enter(mstate, bm);
+            mid = ms_get(mstate, 0);
+
+            if (!enter_domain(p + d * hd, hd, tid, mid, p, d, tof, rng)) {
+                mstate = uvec2(0u, 0u);
+                mid = MEDIUM_DEAD;
+                w = 0.0;
             }
         }
-    } else
-#endif
-    {
-        // Mesh mode: initial medium is pre-determined (InitElem) or probed
-        mid = initial_medium;
 
-        if (mid == MEDIUM_UNKNOWN) {
-            float hd;
-            int tid;
-            bool ff;
+        return true;
+    }
 
-            if (trace_ray(p, d, 0.0, FMAX, hd, tid, ff)) {
-                uint fm, bm;
-                unpack_media(faces[tid].media, fm, bm);
-                mid = ff ? fm : bm;
+#else
+    // Mesh mode: initial medium is pre-determined (InitElem) or probed
+    mid = initial_medium;
 
-                // Source outside the mesh, pointing at it: enter through the hit face
-                if (mid == MEDIUM_AMBIENT && ff) {
-                    vec3 hp = p + d * hd;
-                    p = hp + d * SAFETY_DIST;
-                    mid = bm;
+    if (mid == MEDIUM_UNKNOWN) {
+        if (!trace_ray(o, d, 0.0, FMAX, hd, tid, ff)) {
+            mid = MEDIUM_DEAD;
+            return false;
+        }
 
-                    if (do_reflect > 0u && media[0].n != media[mid].n
-                            && do_reflection(get_normal(tid, hp), faces[tid].normal, media[0].n, media[mid].n, rng, hp, p, d)) {
-                        mid = MEDIUM_DEAD;
-                        w = 0.0;
-                    }
-                } else if (!ff && fm == MEDIUM_AMBIENT && hd < SAFETY_DIST) {
-                    // a source on the mesh surface, pointing out of it
-                    mid = MEDIUM_DEAD;
-                }
-            } else {
-                mid = MEDIUM_DEAD;
+        unpack_media(faces[tid].media, fm, bm);
+        vec3 hp = o + d * hd;
+
+        if (hd < 2.0 * SAFETY_DIST) {
+            // on the face: the photon goes from 'near' to 'far' (ff: front to back)
+            uint near = ff ? fm : bm, far = ff ? bm : fm;
+            p = (near != MEDIUM_AMBIENT) ? hp - d * SAFETY_DIST : hp + d * SAFETY_DIST;
+            mid = (near != MEDIUM_AMBIENT) ? near : far;
+            return mid != MEDIUM_AMBIENT;
+        }
+
+        mid = ff ? fm : bm;
+
+        // Source outside the mesh, pointing at it: enter through the hit face
+        if (mid == MEDIUM_AMBIENT) {
+            if (!ff) {
+                return false;
             }
+
+            mid = bm;
+
+            if (!enter_domain(hp, hd - SAFETY_DIST, tid, mid, p, d, tof, rng)) {
+                mid = MEDIUM_DEAD;
+                w = 0.0;
+            }
+        }
+    }
+
+    return true;
+#endif
+}
+
+/*
+ * Launch a photon. As in MCX, a photon that misses the domain is launched
+ * again (up to 1000 times), so the launched energy counts the photons that
+ * enter; a fixed pencil beam that misses always misses, and a photon with a
+ * given initial medium cannot miss.
+ */
+void launch_photon(inout vec3 p, inout vec3 d, inout float w, inout float slen,
+                   inout float tof, inout uint mid, inout uvec2 mstate, inout uvec4 rng,
+                   out vec3 launch_pos, inout uvec2 csg_cache, inout bool csg_cached) {
+    if ((src_type == SRC_PENCIL && extra_src_len == 0u && focus_mode == 0) || initial_medium != MEDIUM_UNKNOWN) {
+        launch_photon_once(p, d, w, slen, tof, mid, mstate, rng, launch_pos, csg_cache, csg_cached);
+        return;
+    }
+
+    for (int k = 0; k < 1000; k++) {
+        if (launch_photon_once(p, d, w, slen, tof, mid, mstate, rng, launch_pos, csg_cache, csg_cached)) {
+            break;
         }
     }
 }

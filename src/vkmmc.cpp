@@ -530,7 +530,7 @@ AccelStruct build_tlas(VulkanCtx& c, AccelStruct& blas) {
 /* ================================================================ */
 /*                       Compute pipeline                           */
 /* ================================================================ */
-/* the source specialization constants of vkmmc_core.comp (constant_id 0-5) */
+/* the source specialization constants of vkmmc_core.comp (constant_id 0-7) */
 struct SourceSpec {
     int32_t  src_type;
     uint32_t src_num;
@@ -538,8 +538,10 @@ struct SourceSpec {
     uint32_t extra_src_len;
     int32_t  focus_mode;
     uint32_t do_tally;
+    uint32_t do_specular;
+    uint32_t initial_medium;
 };
-static_assert(sizeof(SourceSpec) == 24, "SourceSpec: six 4-byte constants");
+static_assert(sizeof(SourceSpec) == 32, "SourceSpec: eight 4-byte constants");
 
 ComputePipe create_pipeline(VulkanCtx& c, const uint32_t* code, size_t codesize, const SourceSpec& spec) {
     ComputePipe cp;
@@ -596,15 +598,15 @@ ComputePipe create_pipeline(VulkanCtx& c, const uint32_t* code, size_t codesize,
     st.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     st.module = mod;
     st.pName = "main";
-    VkSpecializationMapEntry sme[6];
+    VkSpecializationMapEntry sme[8];
 
-    for (uint32_t i = 0; i < 6; i++) {
+    for (uint32_t i = 0; i < 8; i++) {
         sme[i].constantID = i;
         sme[i].offset = i * 4;
         sme[i].size = 4;
     }
 
-    VkSpecializationInfo si = {6, sme, sizeof(spec), &spec};
+    VkSpecializationInfo si = {8, sme, sizeof(spec), &spec};
     st.pSpecializationInfo = &si;
     VkComputePipelineCreateInfo cp2 = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     cp2.stage = st;
@@ -836,6 +838,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
         vkCmdFillBuffer(cmd, outBuf.buf, 0, outBytes, 0);
         end_submit(ctx, cmd);
     }
+
     if (g.nfield > 1) {
         printf("Fields: %u (%s)\n", g.nfield, cfg.srcnum > 1 ? "patterns" : "sources");
     }
@@ -929,7 +932,9 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
         printf("Kernel: %s, %s atomics\n", kernel_variant_name(st.variant), ctx.atomic64 ? "64-bit" : "32-bit pair");
     }
 
-    SourceSpec spec = {params.srctype, params.src_num, params.src_id, params.extra_src_len, params.focus_mode, params.do_tally};
+    SourceSpec spec = {params.srctype, params.src_num, params.src_id, params.extra_src_len, params.focus_mode, params.do_tally,
+                       kernel_specular(cfg) ? 1u : 0u, params.mediumid0
+                      };
     ComputePipe cp = create_pipeline(ctx, code, codesize, spec);
     update_desc(ctx, cp, tlas.handle, faceBuf, mediaBuf, outBuf, paramBuf, seedBuf, curvBuf, trajBuf, patBuf, srcBuf);
 

@@ -60,6 +60,7 @@ struct VKMMCParam {
     float focal;                  /* focal length (focus_mode 1) */
     int focus_mode;               /* 0 none, 1 focused, 2 isotropic, 3 Lambertian */
     unsigned int do_tally;        /* tally the launched energy (sources with varying weights) */
+    unsigned int do_specular;     /* Fresnel reflection where a photon from outside enters */
     Medium media[MAX_PROP];
 };
 
@@ -612,40 +613,54 @@ __device__ __forceinline__ float3 focus_dir(float3 p, float3 d, float3 origin, f
 
 /* sample the position, direction and weight of a photon; see sample_source() in vkmmc_core.comp */
 __device__ void sample_source(Photon& ph, uint4& rng, unsigned int& slot) {
-    const float4 p1 = gcfg.srcparam1, p2 = gcfg.srcparam2;
-    float3 v1 = make_float3(p1.x, p1.y, p1.z), v2 = make_float3(p2.x, p2.y, p2.z);
+    float3 spos = gcfg.srcpos, sdir = gcfg.srcdir;
+    float4 p1 = gcfg.srcparam1, p2 = gcfg.srcparam2;
+    float focal = (gcfg.focus_mode == 1) ? gcfg.focal : 0.f, sw = 1.f;
+    unsigned int field = 0;
     slot = 0;
 
     if (gcfg.extra_src_len > 0) {
+        /* each source is of Optode.Source.Type with its own Pos (.w weight), Dir (.w focal length), Param1, Param2 */
         unsigned int k = (unsigned int)max(gcfg.src_id - 1, 0);
 
         if (gcfg.src_id < 0) {
             k = min((unsigned int)(rand01(rng) * gcfg.extra_src_len), gcfg.extra_src_len - 1);
-            slot = k;
+            field = k;
         }
 
         const float4* es = (const float4*)gcfg.extrasrcbuf + k * 4;
         float4 sp = es[0], sd = es[1];
-        ph.p0 = make_float3(sp.x, sp.y, sp.z);
-        ph.dir = make_float3(sd.x, sd.y, sd.z);
-        ph.weight = sp.w;
+        spos = make_float3(sp.x, sp.y, sp.z);
+        sdir = make_float3(sd.x, sd.y, sd.z);
+        p1 = es[2];
+        p2 = es[3];
+        focal = sd.w;
+        sw = sp.w;
+        ph.p0 = spos;
+        ph.dir = sdir;
 
-        if (es[2].x > 0) {
-            float phi = TWO_PI * rand01(rng);
-            ph.p0 += disk_offset(ph.dir, sqrtf(rand01(rng)) * es[2].x, phi);
+        /* a pencil beam, on a disk of radius Param1[0] perpendicular to Dir (as mmc-optix) */
+        if (gcfg.srctype == SRC_PENCIL) {
+            ph.weight = sw;
+            slot = field;
+
+            if (p1.x > 0) {
+                float phi = TWO_PI * rand01(rng);
+                ph.p0 += disk_offset(ph.dir, sqrtf(rand01(rng)) * p1.x, phi);
+            }
+
+            if (focal != 0) {
+                ph.dir = focus_dir(ph.p0, ph.dir, spos, focal);
+            }
+
+            return;
         }
-
-        if (sd.w != 0) {
-            ph.dir = focus_dir(ph.p0, ph.dir, make_float3(sp.x, sp.y, sp.z), sd.w);
-        }
-
-        return;
     }
 
+    float3 v1 = make_float3(p1.x, p1.y, p1.z), v2 = make_float3(p2.x, p2.y, p2.z);
     const int st = gcfg.srctype;
     float3 origin = ph.p0;
     bool canfocus = true;
-    float focal = (gcfg.focus_mode == 1) ? gcfg.focal : 0.f;
 
     if (st == SRC_PLANAR || st == SRC_PATTERN || st == SRC_FOURIER || st == SRC_PENCILARRAY || st == SRC_PATTERN3D) {
         float rx = rand01(rng), ry = rand01(rng);
@@ -653,7 +668,7 @@ __device__ void sample_source(Photon& ph, uint4& rng, unsigned int& slot) {
         if (st == SRC_PATTERN3D) {
             float rz = rand01(rng);
             int nx = (int)p1.x, ny = (int)p1.y, nz = (int)p1.z;
-            ph.p0 = gcfg.srcpos + make_float3(rx * p1.x, ry * p1.y, rz * p1.z);
+            ph.p0 = spos + make_float3(rx * p1.x, ry * p1.y, rz * p1.z);
             slot = (unsigned int)((min((int)(rz * nz), nz - 1) * ny + min((int)(ry * ny), ny - 1)) * nx + min((int)(rx * nx), nx - 1));
             ph.weight = (gcfg.src_num > 1) ? 1.f : ((const float*)gcfg.patternbuf)[slot];
             origin += 0.5f * v1;
@@ -661,9 +676,9 @@ __device__ void sample_source(Photon& ph, uint4& rng, unsigned int& slot) {
             if (st == SRC_PENCILARRAY) {
                 float ax = (p1.w > 1) ? floorf(rx * p1.w) / (p1.w - 1) : 0.f;
                 float ay = (p2.w > 1) ? floorf(ry * p2.w) / (p2.w - 1) : 0.f;
-                ph.p0 = gcfg.srcpos + ax * v1 + ay * v2;
+                ph.p0 = spos + ax * v1 + ay * v2;
             } else {
-                ph.p0 = gcfg.srcpos + rx * v1 + ry * v2;
+                ph.p0 = spos + rx * v1 + ry * v2;
             }
 
             if (st == SRC_PATTERN) {
@@ -679,8 +694,8 @@ __device__ void sample_source(Photon& ph, uint4& rng, unsigned int& slot) {
         }
     } else if (st == SRC_FOURIERX || st == SRC_FOURIERX2D) {
         float rx = rand01(rng), ry = rand01(rng);
-        float3 v2x = p1.w * rsqrtf(dot(v1, v1)) * cross(gcfg.srcdir, v1);
-        ph.p0 = gcfg.srcpos + rx * v1 + ry * v2x;
+        float3 v2x = p1.w * rsqrtf(dot(v1, v1)) * cross(sdir, v1);
+        ph.p0 = spos + rx * v1 + ry * v2x;
 
         if (st == SRC_FOURIERX2D) {
             ph.weight = (sinf((p2.x * rx + p2.z) * TWO_PI) * sinf((p2.y * ry + p2.w) * TWO_PI) + 1.f) * 0.5f;
@@ -707,7 +722,7 @@ __device__ void sample_source(Photon& ph, uint4& rng, unsigned int& slot) {
             r0 = sqrtf(rand_scatlen(rng) * (1.f + focal * focal / (z0 * z0))) * p1.x;
         }
 
-        ph.p0 = gcfg.srcpos + disk_offset(gcfg.srcdir, r0, phi);
+        ph.p0 = spos + disk_offset(sdir, r0, phi);
     } else if (st == SRC_CONE || st == SRC_ISOTROPIC || st == SRC_ARCSINE) {
         float phi = TWO_PI * rand01(rng), ct;
 
@@ -734,16 +749,16 @@ __device__ void sample_source(Photon& ph, uint4& rng, unsigned int& slot) {
         float tilt = (p1.z > 0) ? (-p1.y / p1.z) : 0.f;
         float3 bdir = normalize(make_float3(-r0 * sphi, r0 * cphi, p1.z));
         float dpx = r0 * (cphi - tilt * sphi), dpy = r0 * (sphi + tilt * cphi);
-        float3 sd = gcfg.srcdir;
+        float3 sd = sdir;
 
         if (sd.z > -1 + FEPS && sd.z < 1 - FEPS) {
             float stt = sqrtf(1 - sd.z * sd.z), cb = sd.x / stt, sb = sd.y / stt;
-            ph.p0 = gcfg.srcpos + make_float3(dpx * cb * sd.z - dpy * sb, dpx * sb * sd.z + dpy * cb, -dpx * stt);
+            ph.p0 = spos + make_float3(dpx * cb * sd.z - dpy * sb, dpx * sb * sd.z + dpy * cb, -dpx * stt);
             ph.dir = make_float3(bdir.x * cb * sd.z - bdir.y * sb + bdir.z * cb * stt,
                                  bdir.x * sb * sd.z + bdir.y * cb + bdir.z * sb * stt,
                                  -bdir.x * stt + bdir.z * sd.z);
         } else {
-            ph.p0 = gcfg.srcpos + make_float3(dpx, dpy, 0);
+            ph.p0 = spos + make_float3(dpx, dpy, 0);
             ph.dir = make_float3(bdir.x, bdir.y, (sd.z > 0) ? bdir.z : -bdir.z);
         }
 
@@ -777,16 +792,22 @@ __device__ void sample_source(Photon& ph, uint4& rng, unsigned int& slot) {
         canfocus = (st == SRC_SLIT);
     }
 
-    if (canfocus && gcfg.focus_mode != 0) {
+    if (canfocus) {
         if (gcfg.focus_mode == 2) {
             float phi = TWO_PI * rand01(rng);
             ph.dir = rotate_ct(ph.dir, 2.f * rand01(rng) - 1.f, phi);
         } else if (gcfg.focus_mode == 3) {
             float phi = TWO_PI * rand01(rng), s = sqrtf(rand01(rng));
             ph.dir = rotate_ct(ph.dir, sqrtf(1.f - s * s), phi);
-        } else {
+        } else if (focal != 0) {
             ph.dir = focus_dir(ph.p0, ph.dir, origin, focal);
         }
+    }
+
+    ph.weight *= sw;
+
+    if (gcfg.extra_src_len > 0) {
+        slot = field;
     }
 }
 
@@ -917,8 +938,8 @@ __device__ void coplanar_crossings(float3 p, float3 nfar, int mode, uint2& ms, u
     }
 }
 
-/* tags enclosing p (bit t-1 for tag t), see csg_enclosure() in vkmmc_core.comp */
-__device__ uint2 csg_enclosure(float3 p, float3 d, uint4& rng) {
+/* tags enclosing p (bit t-1 for tag t) and the first hit, see csg_enclosure() in vkmmc_core.comp */
+__device__ uint2 csg_enclosure(float3 p, float3 d, uint4& rng, float& hd0, int& tid0, bool& ff0) {
     float4* fb = (float4*)gcfg.facebuf;
     uint2 seen = make_uint2(0, 0), inside = make_uint2(0, 0), ms = make_uint2(0, 0);
     float3 perp = (fabsf(d.z) < 0.999f) ? normalize(cross(d, make_float3(0, 0, 1)))
@@ -929,9 +950,19 @@ __device__ uint2 csg_enclosure(float3 p, float3 d, uint4& rng) {
     bool ff;
     unsigned int fm, bm;
 
+    hd0 = -1.0f;
+    tid0 = 0;
+    ff0 = false;
+
     for (int wk = 0; wk < 64; wk++) {
         if (!probe_ray(wp, d, RAY_TMIN, rng, hd, tid, ff)) {
             break;
+        }
+
+        if (wk == 0) {
+            hd0 = hd;
+            tid0 = tid;
+            ff0 = ff;
         }
 
         float4 fn = fb[tid * 2];
@@ -1000,29 +1031,73 @@ __device__ void finish_coplanar_crossing(Photon& ph, uint4& rng) {
 }
 #endif
 
+/* a photon from outside enters at hp, see enter_domain() in vkmmc_core.comp; false if reflected */
+__device__ bool enter_domain(Photon& ph, uint4& rng, float3 hp, float hd, int tid) {
+    float4* fb = (float4*)gcfg.facebuf;
+    ph.p0 = hp + ph.dir * SAFETY_DIST;
+    ph.tof += hd * INV_C0 * gcfg.media[0].n;
+
+    return !(gcfg.do_specular && ph.mid < gcfg.num_media && gcfg.media[0].n != gcfg.media[ph.mid].n
+             && do_reflection(get_normal(tid, hp, fb[tid * 2]), make_float3(fb[tid * 2]), gcfg.media[0].n,
+                              gcfg.media[ph.mid].n, rng, hp, ph));
+}
+
 /*
  * Find the medium enclosing the source (same algorithm as vkmmc_core.comp).
  * CSG: a forward walk through all surfaces; the source is inside a shape when
  * the first crossing of its tag is an exit. A pencil source launches from one
- * point, so the walk is cached per thread. A source outside everything enters
- * the first surface it points at, with Fresnel reflection.
+ * point (moved off a face by the host), so the walk is cached per thread. A
+ * source outside everything enters the first surface it points at. A source
+ * on a face is inside the tissue there: the rays start SAFETY_DIST behind the
+ * source and a face within 2 SAFETY_DIST is the one it sits on; the photon
+ * stays on the side behind it, or moves forward if that is the background.
+ * Returns false if the photon misses the domain.
  */
-__device__ void initial_medium(Photon& ph, uint4& rng, uint2& cache, bool& cached) {
+__device__ bool initial_medium(Photon& ph, uint4& rng, uint2& cache, bool& cached) {
     float4* fb = (float4*)gcfg.facebuf;
     float hd;
     int tid;
     bool ff;
     unsigned int fm, bm;
+    float3 o = ph.p0 - ph.dir * SAFETY_DIST;
 
 #ifdef USE_CSG
 
     if (gcfg.do_csg) {
-        uint2 inside = cache;
+        uint2 inside;
+        bool fixed_beam = (gcfg.srctype == SRC_PENCIL && gcfg.extra_src_len == 0 && gcfg.focus_mode == 0);
 
-        if (gcfg.srctype != SRC_PENCIL || gcfg.extra_src_len > 0 || !cached) {
-            inside = csg_enclosure(ph.p0, ph.dir, rng);
-            cache = inside;
-            cached = true;
+        if (fixed_beam) {   /* already moved off a face by the host */
+            if (!cached) {
+                cache = csg_enclosure(ph.p0, ph.dir, rng, hd, tid, ff);
+                cached = true;
+            }
+
+            inside = cache;
+            hd = -1.0f;
+        } else {
+            inside = csg_enclosure(o, ph.dir, rng, hd, tid, ff);
+
+            if (hd >= 0 && hd < 2.0f * SAFETY_DIST) {
+                float3 hp = o + ph.dir * hd;
+
+                if (inside.x || inside.y) {
+                    ph.p0 = hp - ph.dir * SAFETY_DIST;
+                } else {
+                    ph.p0 = hp + ph.dir * SAFETY_DIST;
+                    unpack_media(fb[tid * 2].w, fm, bm);
+
+                    if (is_coplanar(fb[tid * 2].w)) {
+                        inside = csg_enclosure(ph.p0, ph.dir, rng, hd, tid, ff);
+                    } else if (ff && bm >= 1 && bm <= 64) {
+                        inside = tagset_add(inside, bm);
+                    }
+                }
+
+                hd = -1.0f;
+            } else if (hd >= 0) {
+                hd -= SAFETY_DIST;
+            }
         }
 
         ph.mstate = csg_state(inside);
@@ -1030,52 +1105,78 @@ __device__ void initial_medium(Photon& ph, uint4& rng, uint2& cache, bool& cache
         ph.mid = ms_get(ph.mstate, 0);
 
         if (ph.mid == 0) {
-            if (probe_ray(ph.p0, ph.dir, 0.0f, rng, hd, tid, ff) && ff) {
-                unpack_media(fb[tid * 2].w, fm, bm);
-                float3 hp = ph.p0 + ph.dir * hd;
-                ph.p0 = hp + ph.dir * SAFETY_DIST;
-                ph.mstate = ms_enter(ph.mstate, bm);
-                ph.mid = ms_get(ph.mstate, 0);
+            if ((hd < 0 && !probe_ray(ph.p0, ph.dir, 0.0f, rng, hd, tid, ff)) || !ff) {
+                ph.mid = MEDIUM_DEAD;
+                return false;
+            }
 
-                if (gcfg.do_reflect && ph.mid < gcfg.num_media && gcfg.media[0].n != gcfg.media[ph.mid].n
-                        && do_reflection(get_normal(tid, hp, fb[tid * 2]), make_float3(fb[tid * 2]), gcfg.media[0].n, gcfg.media[ph.mid].n, rng, hp, ph)) {
-                    ph.mstate = make_uint2(0, 0);
-                    ph.mid = MEDIUM_DEAD;
-                }
-            } else {
+            unpack_media(fb[tid * 2].w, fm, bm);
+            ph.mstate = ms_enter(ph.mstate, bm);
+            ph.mid = ms_get(ph.mstate, 0);
+
+            if (!enter_domain(ph, rng, ph.p0 + ph.dir * hd, hd, tid)) {
+                ph.mstate = make_uint2(0, 0);
                 ph.mid = MEDIUM_DEAD;
             }
         }
 
-        return;
+        return true;
     }
 
 #endif
 
     if (ph.mid != MEDIUM_UNKNOWN) {
-        return;
+        return true;
     }
 
-    if (!probe_ray(ph.p0, ph.dir, 0.0f, rng, hd, tid, ff)) {
+    if (!probe_ray(o, ph.dir, 0.0f, rng, hd, tid, ff)) {
         ph.mid = MEDIUM_DEAD;
-        return;
+        return false;
     }
 
     unpack_media(fb[tid * 2].w, fm, bm);
+    float3 hp = o + ph.dir * hd;
+
+    if (hd < 2.0f * SAFETY_DIST) {
+        /* on the face: the photon goes from near to far (ff: front to back) */
+        unsigned int near = ff ? fm : bm, far = ff ? bm : fm;
+        ph.p0 = (near != MEDIUM_AMBIENT) ? hp - ph.dir * SAFETY_DIST : hp + ph.dir * SAFETY_DIST;
+        ph.mid = (near != MEDIUM_AMBIENT) ? near : far;
+        return ph.mid != MEDIUM_AMBIENT;
+    }
+
     ph.mid = ff ? fm : bm;
 
     /* source outside the mesh, pointing at it: enter through the hit face */
-    if (ph.mid == MEDIUM_AMBIENT && ff) {
-        float3 hp = ph.p0 + ph.dir * hd;
-        ph.p0 = hp + ph.dir * SAFETY_DIST;
+    if (ph.mid == MEDIUM_AMBIENT) {
+        if (!ff) {
+            return false;
+        }
+
         ph.mid = bm;
 
-        if (gcfg.do_reflect && gcfg.media[0].n != gcfg.media[bm].n
-                && do_reflection(get_normal(tid, hp, fb[tid * 2]), make_float3(fb[tid * 2]), gcfg.media[0].n, gcfg.media[bm].n, rng, hp, ph)) {
+        if (!enter_domain(ph, rng, hp, hd - SAFETY_DIST, tid)) {
             ph.mid = MEDIUM_DEAD;
         }
-    } else if (!ff && fm == MEDIUM_AMBIENT && hd < SAFETY_DIST) {
-        ph.mid = MEDIUM_DEAD;   /* a source on the mesh surface, pointing out of it */
+    }
+
+    return true;
+}
+
+/* launch a photon and find its medium; a photon missing the domain is launched again, see vkmmc_core.comp */
+__device__ void start_photon(Photon& ph, uint4& rng, float& w0, uint2& cache, bool& cached) {
+    if ((gcfg.srctype == SRC_PENCIL && gcfg.extra_src_len == 0 && gcfg.focus_mode == 0) || gcfg.initial_medium != MEDIUM_UNKNOWN) {
+        launch_photon(ph, rng, w0);
+        initial_medium(ph, rng, cache, cached);
+        return;
+    }
+
+    for (int k = 0; k < 1000; k++) {
+        launch_photon(ph, rng, w0);
+
+        if (initial_medium(ph, rng, cache, cached)) {
+            break;
+        }
     }
 }
 
@@ -1094,8 +1195,7 @@ extern "C" __global__ void __raygen__rg() {
     float w0;
 
     Photon ph;
-    launch_photon(ph, rng, w0);
-    initial_medium(ph, rng, cache, cached);
+    start_photon(ph, rng, w0, cache, cached);
 
     if (maxph > 0) {
         tally_launch(w0);
@@ -1114,8 +1214,7 @@ extern "C" __global__ void __raygen__rg() {
             float mus = gcfg.media[ph.mid].mus;
             traceRay(ph, rng, mus > 0.0f ? ph.slen / mus : std::numeric_limits<float>::max());
         } else {
-            launch_photon(ph, rng, w0);
-            initial_medium(ph, rng, cache, cached);
+            start_photon(ph, rng, w0, cache, cached);
 
             if (++done < maxph) {
                 tally_launch(w0);
