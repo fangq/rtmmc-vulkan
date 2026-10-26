@@ -5,6 +5,7 @@
 "\"RNGSeed\""
 "\"DoMismatch\""
 "\"DoNormalize\""
+"\"DoSpecular\""
 "\"OutputType\""
 "\"RussianRoulette\""
 "\"RussianRouletteSize\""

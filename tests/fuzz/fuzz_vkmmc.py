@@ -36,7 +36,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..'))
 import jdat  # noqa: E402
 
-KEYS = ['Session', 'ID', 'Photons', 'RNGSeed', 'DoMismatch', 'DoNormalize', 'OutputType', 'RussianRoulette',
+KEYS = ['Session', 'ID', 'Photons', 'RNGSeed', 'DoMismatch', 'DoSpecular', 'DoNormalize', 'OutputType', 'RussianRoulette',
         'Forward', 'T0', 'T1', 'Dt', 'Domain', 'LengthUnit', 'Media', 'mua', 'mus', 'g', 'n', 'Step', 'MeshRes',
         'Optode', 'Source', 'Type', 'Pos', 'Dir', 'Param1', 'Param2', 'Pattern', 'SrcNum', 'Nx', 'Ny', 'Nz',
         'Data', 'Shapes', 'Tag', 'O', 'R', 'Size', 'C0', 'C1',
@@ -49,7 +49,7 @@ NUMBERS = [0, -0.0, 1, -1, 0.5, 2, 3, 7, 64, 65, 255, 256, 1e-300, 1e-45, 1e-7, 
 STRINGS = ['', 'pencil', 'disk', 'planar', 'cone', 'isotropic', 'pattern', 'pattern3d', 'fourierx', 'line', 'slit',
            'ring', 'hyperboloid', '_NaN_', '_Inf_', '-_Inf_', 'x', 'f', 'l', 'fluence', 'zlib', 'gzip', 'c', 'r', 'single',
            'double', 'uint8', 'bogus', 'A' * 300, '../../etc/passwd', 'é中']
-OPTIONS = [['-n', '100'], ['-n', '1e18'], ['-n', '0'], ['-E', '-1'], ['-E', '0'], ['-b', '0'], ['-b', '1'],
+OPTIONS = [['-n', '100'], ['-n', '1e18'], ['-n', '0'], ['-E', '-1'], ['-E', '0'], ['-b', '0'], ['-b', '1'], ['-V', '1'], ['-V', '2'],
            ['-U', '0'], ['-O', 'f'], ['-O', 'l'], ['-O', 'q'], ['-t', '64'], ['-t', '65'], ['-t', '16777216'],
            ['-B', '0'], ['-B', '1'], ['-m', '1'], ['-m', '4'], ['-m', '2048'], ['-m', '5000'], ['-c', '0'],
            ['-c', '1'], ['-c', '2'], ['-u', '0.001'], ['-u', '1e7'], ['-D', 'M'], ['-D', 'Q'], ['-D', '8192'],

@@ -63,12 +63,14 @@ SOURCES = [
     {"Type": "disk", "Pos": [[10, 10, 0, 1], [20, 20, 0, 0.5]], "Dir": [[0, 0, 1, 0], [0, 0.6, 0.8, -5]],
      "Param1": [[2, 0, 0, 0], [0, 0, 0, 0]], "ID": 0},
     {"Type": "pencil", "Pos": [[10, 10, 0], [20, 20, 0]], "Dir": [0, 0, 1], "ID": 2},
+    {"Type": "planar", "Pos": [[20, 5, -1, 1], [5, 20, -1, 2]], "Dir": [[0, 0, 1, 20], [0, 0, 1, 0]],
+     "Param1": [[-8, 3, 0], [3, 8, 0]], "Param2": [[0, 0, 5], [0, 0, -5]], "ID": 0},
 ]
 
 
 def base(i):
     return {"Session": {"ID": "seed%d" % i, "Photons": 1000, "RNGSeed": i + 1, "DoMismatch": bool(i % 2),
-                        "OutputType": "xfl"[i % 3]},
+                        "DoSpecular": bool(i % 3 == 1), "DebugFlag": ["M", 0, "pm"][i % 3], "OutputType": "xfl"[i % 3]},
             "Forward": {"T0": 0, "T1": 5e-9, "Dt": 5e-9 / (1 + i % 3)},
             "Domain": {"LengthUnit": [1, 0.5, 2][i % 3], "MeshRes": [8, 12, 24][i % 3], "Media": MEDIA},
             "Optode": {"Source": SOURCES[i % len(SOURCES)]}}
@@ -107,7 +109,7 @@ def main():
     cmds = ["in.json", "in.json\n-n\n1e5\n-E\n7", "-f\nin.json\n-b\n0\n-U\n1\n-O\nl", "in.json\n-m\n12\n-c\n1\n-D\nM",
             "in.json\n--maxjumpdebug\n1000\n-t\n4096\n-B\n0", "in.json\n-u\n0.5\n-s\nabc\n-G\n1", "-L", "-v", "-h",
             "in.json\n-j\n{\"Session\":{\"Photons\":10}}", "in.json\n--dumpjson\n--dumpmesh", "in.json\nk.spv",
-            "in.json\n-D\n8192\n-O\nflux", "in.json\n-E\n-5\n-n\n9e18"]
+            "in.json\n-D\n8192\n-O\nflux", "in.json\n-E\n-5\n-n\n9e18", "in.json\n-V\n1\n-b\n1"]
     for i, c in enumerate(cmds):
         open(os.path.join(ccl, "cl%02d" % i), "wb").write(c.encode())
     print("seeds: %d inputs, 64 jdata, %d command lines" % (n + k + 1, len(cmds)))

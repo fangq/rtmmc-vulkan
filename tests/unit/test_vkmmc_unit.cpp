@@ -1053,7 +1053,7 @@ TEST(config_session_forward_domain) {
     CHECK(c.session_id == "abc");
     CHECK(c.nphoton == 10000000ull);
     CHECK(c.rng_seed == 7);
-    CHECK(!c.do_mismatch && !c.do_normalize);
+    CHECK(!c.do_mismatch && !c.do_normalize && !c.do_specular);
     CHECK(c.output_type == OT_FLUENCE);
     CHECK_CLOSE(c.minenergy, 0.01, 1e-8);
     CHECK_CLOSE(c.roulettesize, 20, 0);
@@ -1072,8 +1072,13 @@ TEST(config_session_forward_domain) {
     c = load_json_config(patched(base_csg(), R"({"Session": {"OutputType": "f"}, "Forward": {"T1": 1e-8, "Dt": 3e-9}})"));
     CHECK(c.output_type == OT_FLUX);
     CHECK(c.maxgate == 3);    /* round((T1-T0)/Dt) */
-    c = load_json_config(patched(base_csg(), R"({"Session": {"OutputType": "x", "DoMismatch": true}})"));
-    CHECK(c.output_type == OT_ENERGY && c.do_mismatch);
+    c = load_json_config(patched(base_csg(), R"({"Session": {"OutputType": "x", "DoMismatch": true, "DoSpecular": 1}})"));
+    CHECK(c.output_type == OT_ENERGY && c.do_mismatch && c.do_specular);
+
+    /* MCX debug flags given as letters */
+    c = load_json_config(patched(base_csg(), R"({"Session": {"DebugFlag": "pM"}})"));
+    CHECK(c.debuglevel == ((1u << 11) | VKMMC_DEBUG_TRAJ));
+    CHECK_THROWS(load_json_config(patched(base_csg(), R"({"Session": {"DebugFlag": "Q"}})")), "Session.DebugFlag: unknown debug flag 'Q'");
 }
 
 TEST(config_media_forms) {
@@ -1326,7 +1331,16 @@ TEST(config_multi_source) {
     CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3, -1]]}}})", "Optode.Source.Pos[0][3] (the source weight)");
     CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3], [4, 5]]}}})", "Optode.Source.Pos[1] needs at least 3 numbers");
     CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3]], "Dir": [[0, 0, 0]]}}})", "Optode.Source.Dir must be a non-zero vector");
-    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3]], "Param1": [[-1]]}}})", "(the disk radius) must be non-negative");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Pos": [[1, 2, 3]], "Param1": [[-1]]}}})", "(the disk radius of a multi-source row) must be non-negative");
+
+    /* rows of other types: each row is a source of that type, checked as such */
+    c = load_json_config(patched(b, R"({"Optode": {"Source": {"Type": "planar", "Pos": [[1, 2, 3], [4, 5, 6, 2]],
+        "Param1": [[-8, 3, 0], [3, 8, 0]], "Param2": [[0, 0, 5], [0, 0, -5]]}}})"));
+    CHECK(c.extrasrc.size() == 2 && c.extrasrc[0].param1[0] == -8 && c.extrasrc[1].param2[2] == -5 && c.extrasrc[1].pos[3] == 2);
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "disk", "Pos": [[1, 2, 3], [4, 5, 6]], "Param1": [[1], [-2]]}}})",
+                     "Optode.Source[1] (disk): Param1[0..1] (radii) must be non-negative");
+    CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "disk", "Pos": [[1, 2, 3], [4, 5, 6]], "Param1": [5],
+        "Dir": [[0, 0, 1, "_NaN_"], [0, 0, 1, 2]]}}})", "launch must be set for all sources");
     CHECK_CFG_THROWS(b, R"({"Optode": {"Source": {"Type": "pattern", "SrcNum": 2, "Pos": [[1, 2, 3]], "Param1": [1, 0, 0, 1],
         "Param2": [0, 1, 0, 1], "Pattern": {"Nx": 1, "Ny": 1, "Data": [1, 1]}}}})", "cannot be combined");
 }
@@ -1415,12 +1429,17 @@ TEST(config_pattern) {
 TEST(source_json_round_trip) {
     json b = base_csg();
     SimConfig c = load_json_config(patched(b, R"({"Optode": {"Source": {"Type": "disk",
-        "Pos": [[1, 2, 3, 0.5], [4, 5, 6, 1]], "Dir": [[0, 0, 1, "_NaN_"], [0, 0, 1, -3]], "Param1": [[2], [3]], "ID": 2}}})"));
+        "Pos": [[1, 2, 3, 0.5], [4, 5, 6, 1]], "Dir": [[0, 0, 1, 2], [0, 0, 1, -3]], "Param1": [[2], [3]], "ID": 2}}})"));
     json r = b;
     r["Optode"]["Source"] = source_json(c, true);
     SimConfig c2 = load_json_config(r);
-    CHECK(c2.extrasrc.size() == 2 && c2.srcid == 2 && c2.extrasrc[1].dir[3] == -3 && std::isnan(c2.extrasrc[0].dir[3]));
+    CHECK(c2.extrasrc.size() == 2 && c2.srcid == 2 && c2.extrasrc[1].dir[3] == -3 && c2.extrasrc[0].dir[3] == 2);
     CHECK(c2.extrasrc[0].pos[3] == 0.5f && c2.extrasrc[1].param1[0] == 3);
+    c = load_json_config(patched(b, R"({"Optode": {"Source": {"Type": "disk", "Pos": [[1, 2, 3], [4, 5, 6]],
+        "Dir": [[0, 0, 1, "_NaN_"], [0, 0, 1, "_NaN_"]], "Param1": [2]}}})"));
+    r["Optode"]["Source"] = source_json(c, true);
+    c2 = load_json_config(r);
+    CHECK(std::isnan(c2.extrasrc[0].dir[3]) && std::isnan(c2.extrasrc[1].dir[3]) && kernel_focus_mode(c2.srcdir[3]) == 2);
     c = load_json_config(patched(b, R"({"Optode": {"Source": {"Type": "ring", "Dir": [0, 0, 1, "-_Inf_"], "Param1": [5, 2, 1, 2]}}})"));
     r["Optode"]["Source"] = source_json(c, false);
     CHECK(r["Optode"]["Source"]["Dir"][3] == "-_Inf_");
@@ -1514,6 +1533,9 @@ TEST(config_mesh_errors) {
     bad["Shapes"]["MeshElem"][1][4] = 0;
     SimConfig zero = load_json_config(bad);
     CHECK(neg.faces.size() == zero.faces.size() && neg.faces == zero.faces);
+    CHECK(kernel_specular(neg) && !kernel_specular(zero));   /* MMC's wide-field entry: a boundary */
+    neg.do_mismatch = false;
+    CHECK(!kernel_specular(neg));
     bad["Shapes"]["MeshElem"][1][4] = -1;
     bad["Shapes"]["InitElem"] = 2;          /* source in the background: probed like no InitElem */
     CHECK(load_json_config(bad).mediumid0 == 0xFFFFFFFFu);
@@ -2559,14 +2581,14 @@ TEST(cmdline_defaults_and_options) {
     CHECK(o.inputfile == "in.json");
     CHECK(o.gpuid == 3);
     CHECK(o.nphoton == 0 && o.batch_size == UINT64_MAX && !o.has_seed && o.unitinmm == 0);
-    CHECK(o.outputtype == -1 && o.isreflect == -1 && o.isnormalize == -1);
+    CHECK(o.outputtype == -1 && o.isreflect == -1 && o.isspecular == -1 && o.isnormalize == -1);
     CHECK(o.meshres == 0 && o.docurv == -1 && o.debuglevel == -1 && o.maxjumpdebug == -1);
     CHECK(!o.listgpu && !o.dumpjson && !o.dumpmesh && !o.debugcurv && !o.show);
     CHECK(o.kernelfile.empty() && o.json_str.empty() && o.session_id.empty());
 
     CmdOverrides a;
     CHECK(run_cmdline({"vkmmc", "-f", "x.json", "-n", "1e7", "-s", "sess", "-u", "0.5", "-E", "123", "-O", "l",
-                       "-b", "0", "-U", "0", "-t", "128", "-B", "1000", "-G", "2", "-j", "{\"a\":1}", "--dumpjson",
+                       "-b", "0", "-V", "1", "-U", "0", "-t", "128", "-B", "1000", "-G", "2", "-j", "{\"a\":1}", "--dumpjson",
                        "--dumpmesh", "--debugcurv", "-m", "16", "-c", "1", "-D", "M", "--maxjumpdebug", "100",
                        "kern.spv"
                       }, a));
@@ -2576,7 +2598,7 @@ TEST(cmdline_defaults_and_options) {
     CHECK(a.unitinmm == 0.5f);
     CHECK(a.rng_seed == 123 && a.has_seed);
     CHECK(a.outputtype == OT_FLUENCE);
-    CHECK(a.isreflect == 0 && a.isnormalize == 0);
+    CHECK(a.isreflect == 0 && a.isspecular == 1 && a.isnormalize == 0);
     CHECK(a.totalthread == 128 && a.batch_size == 1000 && a.gpuid == 2);
     CHECK(a.json_str == "{\"a\":1}");
     CHECK(a.dumpjson && a.dumpmesh && a.debugcurv);
@@ -2668,9 +2690,9 @@ TEST(apply_overrides_fields) {
     CHECK(c.mesh_res == 12);
     CHECK(c.debuglevel == 0 && c.maxjumpdebug == 0);
     CmdOverrides on;
-    CHECK(run_cmdline({"vkmmc", "in.json", "-b", "1", "-U", "1"}, on));
+    CHECK(run_cmdline({"vkmmc", "in.json", "-b", "1", "-U", "1", "--specular", "1"}, on));
     apply_overrides(c, on);
-    CHECK(c.do_mismatch && c.do_normalize);
+    CHECK(c.do_mismatch && c.do_normalize && c.do_specular);
 }
 
 // ============================================================================
@@ -2705,6 +2727,20 @@ TEST(prepare_geometry_variants) {
     c = load_json_config(jb);
     st = prepare_geometry(c, on);
     CHECK(st.variant == KV_CSG_CURV && st.curv.size() == 8);
+
+    /* a pencil beam on a face is moved into the tissue, pointing in or out */
+    c = load_json_config(jb);
+    prepare_geometry(c, o);
+    CHECK_CLOSE(c.srcpos[2], 0.001, 1e-6);
+    c = load_json_config(patched(jb, R"({"Optode": {"Source": {"Pos": [30, 30, 0.0005], "Dir": [0, 0, -1]}}})"));
+    prepare_geometry(c, o);
+    CHECK_CLOSE(c.srcpos[2], 0.001, 1e-6);
+    c = load_json_config(patched(jb, R"({"Optode": {"Source": {"Pos": [30, 30, -5]}}})"));
+    prepare_geometry(c, o);
+    CHECK(c.srcpos[2] == -5);
+    c = load_json_config(patched(jb, R"({"Optode": {"Source": {"Type": "disk", "Param1": [2]}}})"));
+    prepare_geometry(c, o);
+    CHECK(c.srcpos[2] == 0);   /* other sources are moved per photon by the kernels */
 
     /* mesh input */
     c = load_json_config(cube_mesh_json());

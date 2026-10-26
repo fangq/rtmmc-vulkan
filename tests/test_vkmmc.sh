@@ -685,14 +685,16 @@ fi
 
 # =============================================================================
 # TEST 18: Fresnel reflection at normal incidence
-# n=1.5 slab, mua*L = 40: everything transmitted is absorbed, so
-# absorbed = 1 - R, R = ((n-1)/(n+1))^2 = 4%; standard error 0.044%
+# n=1.5 slab, mua*L = 40: everything transmitted is absorbed, so with
+# DoSpecular absorbed = 1 - R, R = ((n-1)/(n+1))^2 = 4%; standard error 0.044%.
+# Without it (the default, as MCX/MMC) the entry is not reflected.
 # =============================================================================
 log_test "Fresnel: specular reflection at normal incidence"
-mkcfg t18.json '{"Session":{"DoMismatch":true},"Domain":{"Media":[{"mua":0,"mus":0,"g":1,"n":1},{"mua":1,"mus":0,"g":1,"n":1.5}]},
+mkcfg t18.json '{"Session":{"DoMismatch":true,"DoSpecular":true},"Domain":{"Media":[{"mua":0,"mus":0,"g":1,"n":1},{"mua":1,"mus":0,"g":1,"n":1.5}]},
                  "Shapes":[{"Box":{"Tag":1,"O":[0,0,10],"Size":[60,60,40]}}]}'
-if run_sim t18.json t18.log -E 1; then
-    check_close "$(get_absorbed t18.log)" 96.0 0.2 "1 - R"
+if run_sim t18.json t18.log -E 1 && run_sim t18.json t18b.log -E 1 -V 0; then
+    check_close "$(get_absorbed t18.log)" 96.0 0.2 "DoSpecular: 1 - R"
+    check_close "$(get_absorbed t18b.log)" 100.0 0.001 "-V 0: no reflection at the entry"
 else
     log_fail "Execution failed"
 fi
@@ -1183,6 +1185,50 @@ if run_sim t42c.json t42c.log -E 5 -s t42c; then
     check_close "$p1" "$WREF" 0.01 "Pattern 1 field normalized by its launched energy"
     check_close "$p2" "$WREF" 0.01 "Pattern 2 field normalized by its launched energy"
     [ "$(jdat dims t42c.jdat | cut -dx -f4-)" = "1x2" ] && log_pass "Output [nx,ny,nz,1,2]" || log_fail "dims $(jdat dims t42c.jdat)"
+else
+    log_fail "Execution failed"
+fi
+
+# =============================================================================
+# TEST 43: Sources outside or on the surface, as in MCX: the time of flight
+# through the air counts; photons missing the domain are launched again; a
+# source on a face is inside the tissue; multi-source rows of other types
+# =============================================================================
+log_test "Sources outside the domain, on a surface, multi-source rows"
+# T1 = 0.06 ns = 17.99 mm of light path, 10 mm of it in the air: 7.99 mm in the slab
+mkcfg t43a.json '{"Session":{"Photons":20000},"Forward":{"T1":6e-11,"Dt":6e-11}}'
+if run_sim t43a.json t43a.log -E 1; then
+    check_close "$(get_absorbed t43a.log)" "$(pyval '100*(1-math.exp(-0.05*(0.06e-9*299792458e3-10)))')" 0.05 "Time of flight through the air"
+else
+    log_fail "Execution failed"
+fi
+# a disk of radius 30 over the 40x40 face: 43% of the photons miss the box and are launched again
+mkcfg t43b.json '{"Session":{"Photons":50000},"Optode":{"Source":{"Type":"disk","Param1":[30]}}}'
+if run_sim t43b.json t43b.log -E 1; then
+    check_close "$(get_absorbed t43b.log)" "$WREF" 0.01 "Photons missing the domain are launched again"
+else
+    log_fail "Execution failed"
+fi
+# an isotropic source on the face of an n=1.5 box (mua*L >= 20): the inward half is absorbed,
+# the outward half is reflected back with the hemisphere average of the Fresnel coefficient;
+# the same 0.002 below the face, where little is absorbed before the face
+RISO=$(pyval '50+50*sum((lambda c: 1.0 if 1-2.25*(1-c*c) <= 0 else (lambda t: 0.5*(((1.5*c-t)/(1.5*c+t))**2+((c-1.5*t)/(c+1.5*t))**2))(math.sqrt(1-2.25*(1-c*c))))((k+0.5)/20000) for k in range(20000))/20000')
+for z in 10 10.002; do
+    mkcfg t43c$z.json '{"Session":{"DoMismatch":true},"Domain":{"Media":[{"mua":0,"mus":0,"g":1,"n":1},{"mua":1,"mus":0,"g":1,"n":1.5}]},
+                       "Optode":{"Source":{"Type":"isotropic","Pos":[30,30,'$z']}}}'
+    if run_sim t43c$z.json t43c$z.log -E 1; then
+        check_close "$(get_absorbed t43c$z.log)" "$RISO" 0.4 "Isotropic source at z=$z (face at z=10)"
+    else
+        log_fail "Execution failed"
+    fi
+done
+# planar rows with their own (negative) edge vectors and weights
+mkcfg t43d.json '{"Session":{"Photons":40000},"Optode":{"Source":{"Type":"planar","Pos":[[15,15,0,1],[45,45,0,2]],"Dir":[0,0,1],
+                  "Param1":[[10,0,0],[-10,0,0]],"Param2":[[0,10,0],[0,-10,0]],"ID":0}}}'
+if run_sim t43d.json t43d.log -E 1; then
+    check_close "$(get_absorbed t43d.log)" "$WREF" 0.01 "Planar multi-source: total absorbed"
+    s1=$(grep -oP 'source 1: absorbed:\s*\K[0-9.]+' "$TESTDIR/t43d.log"); s2=$(grep -oP 'source 2: absorbed:\s*\K[0-9.]+' "$TESTDIR/t43d.log")
+    check_close "$(pyval "$s1/$s2")" 0.5 0.05 "Weights 1 and 2: source fields $s1% / $s2%"
 else
     log_fail "Execution failed"
 fi
