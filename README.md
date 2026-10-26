@@ -120,7 +120,21 @@ Running:
 Download and Compile
 --------------------
 
-With make:
+Prebuilt Linux binaries (`vkmmc-<version>-linux-x86_64.tar.gz`, both
+backends) are attached to the GitHub releases and to every CI run. They are
+built in the manylinux2014 image (CentOS 7), link libstdc++, libgcc and the
+CUDA runtime statically, and run on any x86-64 Linux with glibc 2.17 or newer
+(tested on CentOS 7, Ubuntu 16.04 and 22.04); `vkmmc` also needs the
+distribution's Vulkan loader (`libvulkan1` or `vulkan-loader`). To build them
+locally:
+
+```
+make -C src vkmmc_core_spv.h      # SPIR-V needs a recent glslang, on the host
+docker run --rm -e HOST_UID=$(id -u) -v $PWD:/src -w /src \
+    quay.io/pypa/manylinux2014_x86_64 bash .github/ci/manylinux_build.sh
+```
+
+To build from source with make:
 
 ```
 git clone https://github.com/fangq/rtmmc-vulkan.git
@@ -356,7 +370,8 @@ The GitHub Actions workflow (`.github/workflows/build.yml`) builds both
 backends with make and CMake on Ubuntu 22.04 and 24.04, runs the unit tests
 (also under ASan/UBSan), runs the complete functional suite on the CPU with
 Mesa's lavapipe Vulkan driver, builds the OptiX backend against the CUDA 11.7
-redistributables and the optix-dev headers, and replays and runs the fuzzers.
+redistributables and the optix-dev headers, replays and runs the fuzzers, and
+builds the release package in manylinux2014.
 
 
 Known issues and limitations
