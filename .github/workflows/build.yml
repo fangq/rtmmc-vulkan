@@ -85,10 +85,12 @@ jobs:
       - name: Put the Vulkan loader and glslangValidator on PATH (Windows)
         if: runner.os == 'Windows'
         run: |
-          echo "$(cygpath -u "$VULKAN_SDK")/Bin" >> "$GITHUB_PATH"
-          dll=$(find "$(cygpath -u "$VULKAN_SDK")/.." /c/VulkanSDK -name vulkan-1.dll 2>/dev/null | head -1)
+          # GITHUB_PATH needs Windows paths for the native programs ctest starts
+          cygpath -w "$(cygpath -u "$VULKAN_SDK")/Bin" >> "$GITHUB_PATH"
+          dll=$(find "$(cygpath -u "$VULKAN_SDK")" /c/VulkanSDK -name vulkan-1.dll 2>/dev/null | head -1)
           echo "vulkan-1.dll: $dll"
-          [ -n "$dll" ] && dirname "$dll" >> "$GITHUB_PATH"
+          [ -n "$dll" ] || { echo "vulkan-1.dll not found"; exit 1; }
+          cygpath -w "$(cd "$(dirname "$dll")" && pwd)" | tee -a "$GITHUB_PATH"
       - name: Configure
         run: cmake -S . -B build -DVKMMC_BUILD_OPTIX=OFF -DCMAKE_BUILD_TYPE=Release -DVKMMC_STATIC_RUNTIME=ON
       - name: Build

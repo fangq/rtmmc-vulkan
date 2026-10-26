@@ -14,7 +14,7 @@
 #                                   clone of https://github.com/NVIDIA/optix-dev
 #    -DVKMMC_SHOW=ON                the --show viewer (needs GLFW 3)
 #    -DVKMMC_USE_SYSTEM_ZLIB=ON     link zlib instead of the bundled miniz
-#    -DVKMMC_STATIC_RUNTIME=ON      link libstdc++/libgcc (MSVC: the CRT) statically
+#    -DVKMMC_STATIC_RUNTIME=ON      link libstdc++/libgcc (Linux) or the CRT (MSVC) statically
 #    -DVKMMC_BUILD_TESTS=OFF        skip the unit tests
 #
 #  The Makefiles in src/ and optix/ build the same binaries.
@@ -90,7 +90,8 @@ target_include_directories(vkmmc_host INTERFACE ${SRC})
 target_link_libraries(vkmmc_host INTERFACE vkmmc_zmat)
 
 function(vkmmc_static_runtime target)
-    if(VKMMC_STATIC_RUNTIME AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # Linux only: macOS has no static libgcc, MSVC uses CMAKE_MSVC_RUNTIME_LIBRARY
+    if(VKMMC_STATIC_RUNTIME AND NOT APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_link_options(${target} PRIVATE -static-libstdc++ -static-libgcc)
     endif()
 endfunction()
