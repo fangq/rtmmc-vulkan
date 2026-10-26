@@ -3,7 +3,7 @@ Ray-Tracing Mesh-based Monte Carlo (RT-MMC) - Vulkan and OptiX
 
 -   Author: Qianqian Fang (q.fang at neu.edu)
 -   License: GNU General Public License version 3 (GPL v3), see LICENSE.txt
--   Version: 1.0.0
+-   Version: 0.5.0 (Kylin, beta)
 -   URL: <https://github.com/fangq/rtmmc-vulkan>
 
 Table of Content:
@@ -30,7 +30,7 @@ Table of Content:
 What's New
 ----------
 
-vkmmc 1.0.0 is the first release of the ray-tracing (RT) accelerated mesh-based
+vkmmc 0.5.0 (Kylin) is the first, beta release of the ray-tracing (RT) accelerated mesh-based
 Monte Carlo (MMC) photon transport simulator. It brings the RT-MMC algorithm,
 previously available in MMC through NVIDIA OptiX, to any GPU that supports the
 Vulkan ray-query extension (NVIDIA RTX, AMD RDNA2 and newer, Intel Arc), and
@@ -351,5 +351,15 @@ Reference
 ---------
 
 * [Fang2010] Qianqian Fang, "Mesh-based Monte Carlo method using fast
-  ray-tracing in Plücker coordinates," Biomed. Opt. Express 1(1), 165-175 (2010)
-* RT-MMC (OptiX-based ray-tracing MMC): *reference to be added*
+  ray-tracing in Plücker coordinates," Biomed. Opt. Express 1(1), 165-175 (2010),
+  https://opg.optica.org/boe/abstract.cfm?uri=boe-1-1-165
+* [Fang2026] Qianqian Fang, Fan-Yu Yen, "How 'vibe-coding' helps build a
+  new-generation Monte Carlo simulator over a weekend," Finnish-French
+  Workshop on Biomedical Optical Tomography, Mar. 2026, Kuopio, Finland
+* [Yan2020] Shijie Yan and Qianqian Fang, "Hybrid mesh and voxel based Monte
+  Carlo algorithm for accurate and efficient photon transport modeling in
+  complex bio-tissues," Biomed. Opt. Express 11(11), 6262-6270 (2020),
+  https://opg.optica.org/boe/abstract.cfm?uri=boe-11-11-6262
+
+If you use vkmmc in your research, please cite [Fang2026], [Yan2020] and
+[Fang2010].

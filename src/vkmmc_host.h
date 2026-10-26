@@ -18,7 +18,8 @@
 #include <climits>
 #include <ctime>
 
-#define VKMMC_VERSION    "1.0.0"
+#define VKMMC_VERSION    "0.5.0"
+#define VKMMC_CODENAME   "Kylin"
 #define VKMMC_URL        "https://github.com/fangq/rtmmc-vulkan"
 
 #define VKMMC_DEBUG_TRAJ 8192u      /* -D M: save photon trajectories */
@@ -57,7 +58,8 @@ struct CmdOverrides {
 };
 
 static void print_version(const char* prog, const char* backend) {
-    printf("%s %s (%s backend) - ray-tracing accelerated mesh/shape-based Monte Carlo\n", prog, VKMMC_VERSION, backend);
+    printf("%s %s (%s, beta), %s backend - ray-tracing accelerated mesh/shape-based Monte Carlo\n", prog,
+           VKMMC_VERSION, VKMMC_CODENAME, backend);
 }
 
 static void printhelp(const char* prog, const char* backend, int defgpu) {

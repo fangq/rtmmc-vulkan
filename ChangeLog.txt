@@ -1,6 +1,6 @@
 Change Log
 
-== vkmmc 1.0.0, Qianqian Fang <q.fang at neu.edu> ==
+== vkmmc 0.5.0 (Kylin, beta), Qianqian Fang <q.fang at neu.edu> ==
  2026-10-25 [22138de] [test] libFuzzer harnesses and a JSON-aware mutation fuzzer
  2026-10-25 [48a3ad9] [bug] fix input-validation and performance bugs found by fuzzing
  2026-10-25 [677bbda] [test] host unit tests and an extended GPU functional test suite
