@@ -38,6 +38,12 @@ ISOPTIX=0
 TESTDIR=$(mktemp -d /tmp/vkmmc_test.XXXXXX)
 trap "rm -rf $TESTDIR" EXIT
 
+# MSYS2/Cygwin: paths embedded in python code must be native (C:/...)
+if command -v cygpath >/dev/null 2>&1; then
+    TESTDIR=$(cygpath -m "$TESTDIR")
+    SCRIPT_DIR=$(cygpath -m "$SCRIPT_DIR")
+fi
+
 PASS=0 FAIL=0 SKIP=0 TOTAL=0
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 
