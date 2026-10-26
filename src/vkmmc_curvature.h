@@ -107,7 +107,9 @@ static bool compute_node_curvature_for_shape(
            Even rim nodes (at cap boundaries) get radial curvature here.
            The flat-flag on cap triangles ensures the shader won't use
            curvature data when the hit triangle is a cap face. */
-        if (rl > 1e-10f) {
+        /* relative to R: with fused multiply-adds (e.g. clang on arm64) a node on
+           the axis can be a few ulps off it */
+        if (rl > 1e-4f * so.R) {
             float nx = rx / rl, ny = ry / rl, nz = rz / rl;
             /* circumferential direction = cross(axis, radial_normal) */
             float cx2 = so.ay * nz - so.az * ny;
