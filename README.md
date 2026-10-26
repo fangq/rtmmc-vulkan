@@ -54,7 +54,10 @@ Key features of this release
 * exact energy deposition: paths are traversed voxel by voxel and split at
   time-gate boundaries, and sums are accumulated as 64-bit fixed-point integers,
   so results do not lose precision with the photon count and runs are
-  bit-reproducible for a given seed and GPU
+  bit-reproducible for a given seed and GPU, whatever the thread count and
+  batch size (`--atomic float` trades this for speed)
+* dynamic load balancing: GPU threads claim photons from a shared counter, and
+  kernel launches are sized automatically
 * time-resolved energy, fluence and flux output, saved as JData (`.jdat`) files
   compressed with multi-threaded zlib (zmat)
 * photon trajectories (`-D M`, Vulkan backend) and an interactive Vulkan viewer
@@ -220,8 +223,9 @@ The run prints the absorbed fraction and the speed, and saves the volume to
 | `-b/--reflect 0\|1` | Fresnel reflection at refractive index mismatches | `Session.DoMismatch` |
 | `-V/--specular 0\|1` | Fresnel reflection where photons from outside enter the domain | `Session.DoSpecular` |
 | `-U/--normalize 0\|1` | normalize the output | `Session.DoNormalize` |
-| `-t/--thread num` | total GPU threads, rounded up to a multiple of 64 | 65536 |
-| `-B/--batch num` | photons per kernel launch (0: all at once) | 500000 |
+| `-t/--thread num` | total GPU threads, rounded up to a multiple of 64 | 131072 |
+| `-B/--batch num` | photons per kernel launch (0: all at once) | auto |
+| `--atomic fixed\|float` | output sums: exact 64-bit fixed point, or float (faster on large grids, not bit-reproducible) | fixed |
 | `-G/--gpuid id` | Vulkan: 1-based index among usable devices (0: auto, prefers a discrete GPU); OptiX: CUDA device | 0 |
 | `-m/--meshres num` | tessellation of curved shapes, 4-2048 | `Domain.MeshRes`, 24 |
 | `-c/--curv -1\|0\|1` | curvature-corrected normals (-1: on for curved shapes) | -1 |
@@ -233,6 +237,15 @@ The run prints the absorbed fraction and the speed, and saves the volume to
 | `--show [file.jdat]` | interactive viewer (built with `SHOW=1`) | |
 | `-L/--listgpu` | list GPUs | |
 | `-v/--version`, `-h/--help` | version, help | |
+
+The threads claim the photons of a launch one by one from a shared counter,
+so threads whose photons end early take more (dynamic load balancing). By
+default the first launch runs 4 photons per thread and each later launch is
+sized from the measured speed to take about 0.5 s (at most 2^24 photons),
+within the watchdog limit of GPUs that drive a display; the output is read back
+and cleared between launches. Each photon seeds its random number generator
+from the run seed and its photon index, so `-t` and `-B` do not change the
+result.
 
 A trailing `.spv` (vkmmc) or `.ptx` (vkmmc_optix) argument replaces the
 embedded kernel, for kernel development. The environment variable
@@ -407,9 +420,19 @@ Accuracy and reproducibility
 * energy is conserved exactly: the deposited energy equals the weight lost by
   the photons (checked against the trajectory weights in the test suite)
 * the output is accumulated as 64-bit fixed-point integers (2^-32 per unit
-  weight), so the result does not depend on the order of the atomic additions:
-  the same seed on the same GPU gives a bit-identical output, and the native
-  and portable atomic kernels give identical results
+  weight), so the result does not depend on the order of the atomic additions,
+  and a photon's random numbers depend only on the seed and its index: the same
+  seed on the same GPU gives a bit-identical output for any thread count and
+  batch size, and the native and portable atomic kernels give identical results
+* deposits are summed in registers while a photon stays in one voxel and time
+  gate and written when it leaves, which saves most atomic additions in
+  scattering media with voxels larger than the scattering length
+* `--atomic float` accumulates float sums instead (as MCX does): half the
+  memory traffic, up to 2-3 times faster on grids that do not fit in the GPU
+  cache, but the order of the additions changes the last digits from run to
+  run. The Vulkan backend needs `VK_EXT_shader_atomic_float`
+  (`shaderBufferFloat32AtomicAdd`, shown by `-L`) and otherwise falls back to
+  fixed point with a warning
 * straight-path absorption, Fresnel transmission and time of flight agree
   with the analytic values to within the float precision of the geometry
 * the Vulkan and OptiX backends use the same algorithms and agree within the
