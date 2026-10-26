@@ -56,8 +56,13 @@ struct MCParams {
     float    minenergy, roulettesize;       // 176: 2 floats
     uint32_t do_traj, max_traj;             // 184: trajectory flags
     uint32_t photon_base;                   // 192: global photon index offset for this batch
+    uint32_t src_num;                       // 196: patterns sharing the photons
+    int      src_id;                        // 200: multi-source mode
+    uint32_t extra_src_len;                 // 204: sources in the multi-source list
+    uint32_t num_field;                     // 208: output fields
+    int      focus_mode;                    // 212: see kernel_focus_mode
 };
-// Total: 196 bytes, see the SimParams block in vkmmc_core.comp
+// Total: 216 bytes, see the SimParams block in vkmmc_core.comp
 
 /* ================================================================ */
 /*                       Vulkan helpers                             */
@@ -527,7 +532,7 @@ AccelStruct build_tlas(VulkanCtx& c, AccelStruct& blas) {
 ComputePipe create_pipeline(VulkanCtx& c, const uint32_t* code, size_t codesize) {
     ComputePipe cp;
     memset(&cp, 0, sizeof(cp));
-    VkDescriptorSetLayoutBinding bn[8];
+    VkDescriptorSetLayoutBinding bn[10];
     memset(bn, 0, sizeof(bn));
     bn[0].binding = 0;
     bn[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
@@ -553,12 +558,16 @@ ComputePipe create_pipeline(VulkanCtx& c, const uint32_t* code, size_t codesize)
     bn[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bn[6].descriptorCount = 1;
     bn[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    bn[7].binding = 7;
-    bn[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bn[7].descriptorCount = 1;
-    bn[7].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    for (int i = 7; i <= 9; i++) {
+        bn[i].binding = (uint32_t)i;
+        bn[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bn[i].descriptorCount = 1;
+        bn[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+
     VkDescriptorSetLayoutCreateInfo dl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dl.bindingCount = 8;
+    dl.bindingCount = 10;
     dl.pBindings = bn;
     VK_CHECK(vkCreateDescriptorSetLayout(c.device, &dl, NULL, &cp.descLayout));
     VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -582,7 +591,7 @@ ComputePipe create_pipeline(VulkanCtx& c, const uint32_t* code, size_t codesize)
     vkDestroyShaderModule(c.device, mod, NULL);
     VkDescriptorPoolSize ps[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}
     };
     VkDescriptorPoolCreateInfo dp = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -599,15 +608,17 @@ ComputePipe create_pipeline(VulkanCtx& c, const uint32_t* code, size_t codesize)
 }
 
 void update_desc(VulkanCtx& c, ComputePipe& cp, VkAccelerationStructureKHR tlas,
-                 Buffer& fb, Buffer& mb, Buffer& ob, Buffer& pb, Buffer& sb, Buffer& cb, Buffer& tb) {
+                 Buffer& fb, Buffer& mb, Buffer& ob, Buffer& pb, Buffer& sb, Buffer& cb, Buffer& tb,
+                 Buffer& patb, Buffer& eb) {
     VkWriteDescriptorSetAccelerationStructureKHR aw = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
     aw.accelerationStructureCount = 1;
     aw.pAccelerationStructures = &tlas;
     VkDescriptorBufferInfo fi = {fb.buf, 0, VK_WHOLE_SIZE}, mi = {mb.buf, 0, VK_WHOLE_SIZE},
                            oi = {ob.buf, 0, VK_WHOLE_SIZE}, pi = {pb.buf, 0, VK_WHOLE_SIZE},
                            si = {sb.buf, 0, VK_WHOLE_SIZE}, ci = {cb.buf, 0, VK_WHOLE_SIZE},
-                           ti = {tb.buf, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet w[8];
+                           ti = {tb.buf, 0, VK_WHOLE_SIZE}, pti = {patb.buf, 0, VK_WHOLE_SIZE},
+                           ei = {eb.buf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w[10];
     memset(w, 0, sizeof(w));
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w[0].pNext = &aw;
@@ -616,7 +627,7 @@ void update_desc(VulkanCtx& c, ComputePipe& cp, VkAccelerationStructureKHR tlas,
     w[0].descriptorCount = 1;
     w[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 
-    for (int i = 1; i <= 7; i++) {
+    for (int i = 1; i <= 9; i++) {
         w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[i].dstSet = cp.descSet;
         w[i].dstBinding = (uint32_t)i;
@@ -631,7 +642,9 @@ void update_desc(VulkanCtx& c, ComputePipe& cp, VkAccelerationStructureKHR tlas,
     w[5].pBufferInfo = &si;
     w[6].pBufferInfo = &ci;
     w[7].pBufferInfo = &ti;
-    vkUpdateDescriptorSets(c.device, 8, w, 0, NULL);
+    w[8].pBufferInfo = &pti;
+    w[9].pBufferInfo = &ei;
+    vkUpdateDescriptorSets(c.device, 10, w, 0, NULL);
 }
 
 /* ================================================================ */
@@ -785,15 +798,26 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
     Buffer mediaBuf = create_device_buffer(ctx, media.size() * sizeof(Medium), ssbo);
     upload_to_device(ctx, mediaBuf, media.data(), media.size() * sizeof(Medium));
 
-    /* Output grid: one 64-bit fixed-point sum per voxel and gate */
+    /* Source pattern and multi-source list */
+    std::vector<float> pattern = kernel_pattern(cfg), extrasrc = kernel_extrasrc(cfg);
+    Buffer patBuf = create_device_buffer(ctx, pattern.size() * sizeof(float), ssbo);
+    upload_to_device(ctx, patBuf, pattern.data(), pattern.size() * sizeof(float));
+    Buffer srcBuf = create_device_buffer(ctx, extrasrc.size() * sizeof(float), ssbo);
+    upload_to_device(ctx, srcBuf, extrasrc.data(), extrasrc.size() * sizeof(float));
+
+    /* Output: one 64-bit fixed-point sum per voxel, gate and field, then the launched energy */
     OutputGrid g = compute_grid(cfg);
-    VkDeviceSize outBytes = g.nelem * sizeof(uint64_t);
+    VkDeviceSize outBytes = g.nout * sizeof(uint64_t);
     Buffer outBuf = create_device_buffer(ctx, outBytes, ssbo);
     {
         VkCommandBuffer cmd = begin_cmd(ctx);
         vkCmdFillBuffer(cmd, outBuf.buf, 0, outBytes, 0);
         end_submit(ctx, cmd);
     }
+    if (g.nfield > 1) {
+        printf("Fields: %u (%s)\n", g.nfield, cfg.srcnum > 1 ? "patterns" : "sources");
+    }
+
     printf("Grid: %ux%ux%u x %d gates, voxel=%.3f (%.4f mm), origin=[%.2f,%.2f,%.2f]\n",
            g.nx, g.ny, g.nz, g.maxgate, g.vs, g.vs * cfg.unitinmm, g.gmin[0], g.gmin[1], g.gmin[2]);
 
@@ -832,7 +856,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
     params.maxgate   = cfg.maxgate;
     params.outputtype = cfg.output_type;
     params.isreflect = cfg.do_mismatch ? 1u : 0u;
-    params.mediumid0    = cfg.mediumid0;
+    params.mediumid0    = kernel_initial_medium(cfg);
     params.total_threads = tt;
     params.num_media    = (uint32_t)media.size();
     params.seed         = cfg.rng_seed;
@@ -843,6 +867,12 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
     bool do_traj = (cfg.debuglevel & VKMMC_DEBUG_TRAJ) != 0u && cfg.maxjumpdebug > 0;
     params.do_traj  = do_traj ? 1u : 0u;
     params.max_traj = do_traj ? cfg.maxjumpdebug : 0u;
+    params.src_num = (uint32_t)cfg.srcnum;
+    params.src_id = cfg.srcid;
+    params.extra_src_len = (uint32_t)cfg.extrasrc.size();
+    params.num_field = g.nfield;
+    params.focus_mode = kernel_focus_mode(cfg.srcdir[3]);
+    params.srcdir[3] = (params.focus_mode == 1) ? cfg.srcdir[3] : 0.0f;
 
     Buffer paramBuf = create_device_buffer(ctx, sizeof(MCParams), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
@@ -877,14 +907,14 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
     }
 
     ComputePipe cp = create_pipeline(ctx, code, codesize);
-    update_desc(ctx, cp, tlas.handle, faceBuf, mediaBuf, outBuf, paramBuf, seedBuf, curvBuf, trajBuf);
+    update_desc(ctx, cp, tlas.handle, faceBuf, mediaBuf, outBuf, paramBuf, seedBuf, curvBuf, trajBuf, patBuf, srcBuf);
 
     /* Batched dispatch */
     uint64_t batchsz = batch_size(cfg, ovr), pdone = 0;
     int batch = 0;
     bool batch_readback = (outBytes <= VKMMC_BATCH_READBACK_BYTES);
     std::vector<double> acc;
-    std::vector<uint64_t> raw(g.nelem);
+    std::vector<uint64_t> raw(g.nout);
     printf("Threads: %u (%u x 64), batch: %llu photons\n", tt, wg, (unsigned long long)batchsz);
 
     typedef std::chrono::high_resolution_clock Clk;
@@ -912,7 +942,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
         /* move the batch output into the double accumulator, clear the GPU buffer */
         if (batch_readback && pdone < cfg.nphoton) {
             download_from_device(ctx, outBuf, raw.data(), outBytes);
-            accumulate_fixed(acc, raw.data(), g.nelem);
+            accumulate_fixed(acc, raw.data(), g.nout);
             VkCommandBuffer zcmd = begin_cmd(ctx);
             vkCmdFillBuffer(zcmd, outBuf.buf, 0, outBytes, 0);
             end_submit(ctx, zcmd);
@@ -928,7 +958,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
 
     /* Readback, normalization and output */
     download_from_device(ctx, outBuf, raw.data(), outBytes);
-    accumulate_fixed(acc, raw.data(), g.nelem);
+    accumulate_fixed(acc, raw.data(), g.nout);
     std::vector<float> vol = finalize_output(cfg, g, acc);
     save_fluence(cfg, g, vol);
 
@@ -958,6 +988,8 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
     destroy_buf(ctx, seedBuf);
     destroy_buf(ctx, curvBuf);
     destroy_buf(ctx, trajBuf);
+    destroy_buf(ctx, patBuf);
+    destroy_buf(ctx, srcBuf);
     vkDestroyPipeline(ctx.device, cp.pipeline, NULL);
     vkDestroyPipelineLayout(ctx.device, cp.pipeLayout, NULL);
     vkDestroyDescriptorPool(ctx.device, cp.descPool, NULL);

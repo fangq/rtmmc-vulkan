@@ -371,7 +371,10 @@ struct OutputGrid {
     float vs;             /* voxel size in length units */
     float gmin[3], gmax[3];
     uint64_t nvox;        /* nx*ny*nz */
-    uint64_t nelem;       /* nvox*maxgate */
+    uint64_t nelem;       /* nvox*maxgate: one field */
+    uint32_t nfield;      /* fields: patterns of a shared pattern source or sources of a multi-source run */
+    uint32_t nlaunch;     /* launched-energy sums after the fields: one per pattern */
+    uint64_t nout;        /* kernel output elements: nelem*nfield + nlaunch */
 };
 
 /* voxel grid covering the mesh bounding box, half a voxel of margin per side */
@@ -397,11 +400,19 @@ static OutputGrid compute_grid(const SimConfig& cfg) {
     g.nz = (uint32_t)n[2];
     g.nvox = (uint64_t)g.nx * g.ny * g.nz;
     g.nelem = g.nvox * (uint64_t)g.maxgate;
+    g.nfield = src_fields(cfg);
+    g.nlaunch = (uint32_t)cfg.srcnum;
+    g.nout = g.nelem * g.nfield + g.nlaunch;
 
-    if (g.nelem > VKMMC_MAX_VOXELS) {
+    if (g.nelem * g.nfield > VKMMC_MAX_VOXELS) {
         std::ostringstream ss;
-        ss << "the output grid " << g.nx << "x" << g.ny << "x" << g.nz << "x" << g.maxgate
-           << " exceeds " << VKMMC_MAX_VOXELS << " elements; increase Domain.Step or Forward.Dt";
+        ss << "the output grid " << g.nx << "x" << g.ny << "x" << g.nz << "x" << g.maxgate;
+
+        if (g.nfield > 1) {
+            ss << "x" << g.nfield;
+        }
+
+        ss << " exceeds " << VKMMC_MAX_VOXELS << " elements; increase Domain.Step or Forward.Dt";
         vkmmc_fail(ss.str());
     }
 
@@ -426,6 +437,54 @@ static void kernel_time_gates(const SimConfig& cfg, float& tstart, float& tend, 
     tstart = (float)(cfg.t0 * s);
     tend = (float)(cfg.t1 * s);
     inv_dt = (float)(1.0 / (cfg.dt * s));
+}
+
+/* the kernels' focus mode of a focal length: 0 none (0 or +Inf), 1 focused, 2 isotropic (NaN), 3 Lambertian (-Inf) */
+static int kernel_focus_mode(float f) {
+    if (std::isnan(f)) {
+        return 2;
+    }
+
+    if (std::isinf(f)) {
+        return (f < 0) ? 3 : 0;
+    }
+
+    return (f != 0) ? 1 : 0;
+}
+
+/*
+ * The initial medium the kernels start every photon in, or 0xFFFFFFFF to
+ * find it per photon by a ray probe along the launch direction. InitElem
+ * applies to a single source; with random launch directions the probe is
+ * used, as a source on the surface (e.g. an isotropic one) must lose the
+ * photons pointing out of the mesh.
+ */
+static uint32_t kernel_initial_medium(const SimConfig& cfg) {
+    int fm = kernel_focus_mode(cfg.srcdir[3]);
+    bool randdir = cfg.srctype == SRC_ISOTROPIC || cfg.srctype == SRC_CONE || cfg.srctype == SRC_ARCSINE
+                   || cfg.srctype == SRC_ZGAUSSIAN || cfg.srctype == SRC_LINE || fm == 2 || fm == 3;
+    return (cfg.extrasrc.empty() && !randdir) ? cfg.mediumid0 : 0xFFFFFFFFu;
+}
+
+/* the multi-source list as the kernels read it, 4 vec4 per source (a dummy if empty); a
+   non-finite focal length is ignored there */
+static std::vector<float> kernel_extrasrc(const SimConfig& cfg) {
+    std::vector<float> v(std::max<size_t>(cfg.extrasrc.size(), 1) * 16, 0.0f);
+
+    for (size_t i = 0; i < cfg.extrasrc.size(); i++) {
+        memcpy(&v[i * 16], &cfg.extrasrc[i], 16 * sizeof(float));
+
+        if (!std::isfinite(v[i * 16 + 7])) {
+            v[i * 16 + 7] = 0;
+        }
+    }
+
+    return v;
+}
+
+/* the pattern intensities as the kernels read them (a dummy if none) */
+static std::vector<float> kernel_pattern(const SimConfig& cfg) {
+    return cfg.srcpattern.empty() ? std::vector<float>(1, 0.0f) : cfg.srcpattern;
 }
 
 /* GPU thread count: a multiple of 64, at most one photon per thread for small runs */
@@ -503,57 +562,97 @@ static void accumulate_fixed(std::vector<double>& acc, const uint64_t* raw, uint
 
 /*
  * Zero NaN/Inf, report the absorbed fraction and normalize the accumulated
- * output (acc, nelem values).
- *   energy (x):  1/mm^3 per photon
- *   fluence (l): 1/mm^2 per photon, integrated over each time gate
- *   flux (f):    1/(mm^2 s) per photon, fluence divided by the gate width
+ * output (acc: g.nelem values per field, then the launched energy of each
+ * pattern; without the latter, every photon is taken to start with weight 1).
+ * Each field is normalized by the launched energy of its pattern; the fields
+ * of a multi-source run share the total, as in MMC.
+ *   energy (x):  1/mm^3 per unit of launched energy
+ *   fluence (l): 1/mm^2 per unit, integrated over each time gate
+ *   flux (f):    1/(mm^2 s) per unit, fluence divided by the gate width
  */
 static std::vector<float> finalize_output(const SimConfig& cfg, const OutputGrid& g, const std::vector<double>& acc,
         double* absorbed_out = NULL) {
-    std::vector<float> out(g.nelem);
-    double total = 0;
+    uint64_t nvol = g.nelem * g.nfield;
+    std::vector<float> out(nvol);
+    std::vector<double> launched(g.nlaunch, (double)cfg.nphoton / g.nlaunch), fieldsum(g.nfield, 0.0);
+    double ltot = 0;
     size_t bad = 0;
 
-    double scale = 1.0;
-
-    if (cfg.do_normalize) {
-        double vmm = (double)g.vs * cfg.unitinmm;
-        scale = 1.0 / ((double)cfg.nphoton * vmm * vmm * vmm);
-
-        if (cfg.output_type != OT_ENERGY) {
-            scale *= cfg.unitinmm;    /* path length: length units -> mm */
-        }
-
-        if (cfg.output_type == OT_FLUX) {
-            scale /= cfg.dt;
+    if (acc.size() >= nvol + g.nlaunch) {
+        for (uint32_t k = 0; k < g.nlaunch; k++) {
+            launched[k] = acc[nvol + k];
         }
     }
 
-    for (uint64_t i = 0; i < g.nelem; i++) {
-        double v = (i < acc.size()) ? acc[i] : 0.0;
+    for (uint32_t k = 0; k < g.nlaunch; k++) {
+        ltot += launched[k];
+    }
 
-        if (!std::isfinite(v)) {
-            bad++;
-            v = 0;
+    double unit = 1.0;
+
+    if (cfg.do_normalize) {
+        double vmm = (double)g.vs * cfg.unitinmm;
+        unit = 1.0 / (vmm * vmm * vmm);
+
+        if (cfg.output_type != OT_ENERGY) {
+            unit *= cfg.unitinmm;    /* path length: length units -> mm */
         }
 
-        total += v;
-        out[i] = (float)(v * scale);
+        if (cfg.output_type == OT_FLUX) {
+            unit /= cfg.dt;
+        }
+    }
+
+    for (uint32_t f = 0; f < g.nfield; f++) {
+        double e = (g.nlaunch > 1) ? launched[f] : ltot, scale = unit;
+
+        if (cfg.do_normalize) {
+            scale = (e > 0) ? unit / e : 0.0;
+        }
+
+        for (uint64_t i = f * g.nelem; i < (f + 1) * g.nelem; i++) {
+            double v = (i < acc.size()) ? acc[i] : 0.0;
+
+            if (!std::isfinite(v)) {
+                bad++;
+                v = 0;
+            }
+
+            fieldsum[f] += v;
+            out[i] = (float)(v * scale);
+        }
+    }
+
+    double total = 0;
+
+    for (uint32_t f = 0; f < g.nfield; f++) {
+        total += fieldsum[f];
     }
 
     if (bad) {
         printf("WARNING: %zu NaN/Inf voxels zeroed\n", bad);
     }
 
+    double absorbed = (ltot > 0) ? total / ltot : 0.0;
+
     if (cfg.output_type == OT_ENERGY) {
-        printf("simulated %llu photons, absorbed: %.5f%%\n", (unsigned long long)cfg.nphoton,
-               total / (double)cfg.nphoton * 100.0);
+        printf("simulated %llu photons, absorbed: %.5f%%\n", (unsigned long long)cfg.nphoton, absorbed * 100.0);
+
+        if (ltot != (double)cfg.nphoton) {
+            printf("  launched energy: %.6g\n", ltot);
+        }
+
+        for (uint32_t f = 0; g.nfield > 1 && f < g.nfield; f++) {
+            double e = (g.nlaunch > 1) ? launched[f] : ltot;
+            printf("  %s %u: absorbed: %.5f%%\n", (g.nlaunch > 1) ? "pattern" : "source", f + 1,
+                   (e > 0) ? fieldsum[f] / e * 100.0 : 0.0);
+        }
     } else {
         printf("simulated %llu photons\n", (unsigned long long)cfg.nphoton);
     }
 
     if (absorbed_out) {
-        *absorbed_out = (cfg.output_type == OT_ENERGY) ? total / (double)cfg.nphoton : -1;
+        *absorbed_out = (cfg.output_type == OT_ENERGY) ? absorbed : -1;
     }
 
     return out;
@@ -574,8 +673,12 @@ static void write_json_file(const std::string& fname, const json& root, int inde
 static void save_fluence(const SimConfig& cfg, const OutputGrid& g, const std::vector<float>& vol) {
     std::vector<size_t> dims = {g.nx, g.ny, g.nz};
 
-    if (g.maxgate > 1) {
+    if (g.maxgate > 1 || g.nfield > 1) {
         dims.push_back((size_t)g.maxgate);
+    }
+
+    if (g.nfield > 1) {
+        dims.push_back((size_t)g.nfield);   /* one volume per pattern or source, as MMC saves them */
     }
 
     json root;
@@ -591,8 +694,8 @@ static void save_fluence(const SimConfig& cfg, const OutputGrid& g, const std::v
     write_json_file(outname, root, 2);
     printf("Output: %s (%ux%ux%u", outname.c_str(), g.nx, g.ny, g.nz);
 
-    if (g.maxgate > 1) {
-        printf("x%d", g.maxgate);
+    for (size_t i = 3; i < dims.size(); i++) {
+        printf("x%zu", dims[i]);
     }
 
     printf(")\n");
@@ -660,6 +763,77 @@ static inline TrajData unpack_trajectory(const uint32_t* rec, uint32_t n) {
 // ============================================================================
 // --dumpjson / --dumpmesh / --debugcurv
 // ============================================================================
+
+/* a focal length; NaN and Inf as the JData strings the input accepts */
+static json focal_json(float f) {
+    if (std::isnan(f)) {
+        return "_NaN_";
+    }
+
+    if (std::isinf(f)) {
+        return (f > 0) ? "_Inf_" : "-_Inf_";
+    }
+
+    return f;
+}
+
+/* Optode.Source as an input file has it; with_pattern adds the pattern data, else its size */
+static json source_json(const SimConfig& cfg, bool with_pattern) {
+    json o;
+    o["Type"] = srctype_name(cfg.srctype);
+
+    if (cfg.extrasrc.empty()) {
+        o["Pos"] = {cfg.srcpos[0], cfg.srcpos[1], cfg.srcpos[2]};
+        o["Dir"] = {cfg.srcdir[0], cfg.srcdir[1], cfg.srcdir[2], focal_json(cfg.srcdir[3])};
+        o["Param1"] = {cfg.srcparam1[0], cfg.srcparam1[1], cfg.srcparam1[2], cfg.srcparam1[3]};
+        o["Param2"] = {cfg.srcparam2[0], cfg.srcparam2[1], cfg.srcparam2[2], cfg.srcparam2[3]};
+    } else {
+        const char* key[4] = {"Pos", "Dir", "Param1", "Param2"};
+
+        for (int k = 0; k < 4; k++) {
+            o[key[k]] = json::array();
+        }
+
+        for (size_t i = 0; i < cfg.extrasrc.size(); i++) {
+            const ExtraSrc& e = cfg.extrasrc[i];
+            o["Pos"].push_back({e.pos[0], e.pos[1], e.pos[2], e.pos[3]});
+            o["Dir"].push_back({e.dir[0], e.dir[1], e.dir[2], focal_json(e.dir[3])});
+            o["Param1"].push_back({e.param1[0], e.param1[1], e.param1[2], e.param1[3]});
+            o["Param2"].push_back({e.param2[0], e.param2[1], e.param2[2], e.param2[3]});
+        }
+
+        o["ID"] = cfg.srcid < 0 ? 0 : cfg.srcid;
+    }
+
+    o["SrcNum"] = cfg.srcnum;
+
+    if (!cfg.srcpattern.empty()) {
+        std::vector<size_t> dims;
+
+        if (cfg.srcnum > 1) {
+            dims.push_back((size_t)cfg.srcnum);
+        }
+
+        if (cfg.srctype == SRC_PATTERN) {
+            dims.push_back((size_t)cfg.srcparam1[3]);
+            dims.push_back((size_t)cfg.srcparam2[3]);
+        } else {
+            for (int i = 0; i < 3; i++) {
+                dims.push_back((size_t)cfg.srcparam1[i]);
+            }
+        }
+
+        if (with_pattern) {
+            /* stored with the first index fastest */
+            o["Pattern"] = jdata_encode("single", dims, cfg.srcpattern.data(), cfg.srcpattern.size() * sizeof(float), false);
+        } else {
+            o["PatternSize"] = dims;
+        }
+    }
+
+    return o;
+}
+
 static void dump_config_json(const SimConfig& cfg, const SimSetup& st) {
     json d;
     d["Session"] = {{"ID", cfg.session_id}, {"Photons", cfg.nphoton}, {"RNGSeed", cfg.rng_seed},
@@ -676,11 +850,7 @@ static void dump_config_json(const SimConfig& cfg, const SimSetup& st) {
         });
     }
 
-    d["Optode"]["Source"] = {{"Type", srctype_name(cfg.srctype)}, {"Pos", {cfg.srcpos[0], cfg.srcpos[1], cfg.srcpos[2]}},
-        {"Dir", {cfg.srcdir[0], cfg.srcdir[1], cfg.srcdir[2]}},
-        {"Param1", {cfg.srcparam1[0], cfg.srcparam1[1], cfg.srcparam1[2], cfg.srcparam1[3]}},
-        {"Param2", {cfg.srcparam2[0], cfg.srcparam2[1], cfg.srcparam2[2], cfg.srcparam2[3]}}
-    };
+    d["Optode"]["Source"] = source_json(cfg, false);
     d["Mesh"] = {{"Mode", cfg.is_csg ? "csg" : "mesh"}, {"Nodes", cfg.nodes.size()}, {"Faces", cfg.faces.size()},
         {"Kernel", kernel_variant_name(st.variant)}, {"Curvature", st.has_curvature},
         {"BBoxMin", {cfg.nmin.x, cfg.nmin.y, cfg.nmin.z}}, {"BBoxMax", {cfg.nmax.x, cfg.nmax.y, cfg.nmax.z}}
@@ -705,11 +875,7 @@ static void dump_mesh(const SimConfig& cfg) {
         });
     }
 
-    dump["Optode"]["Source"]["Type"] = srctype_name(cfg.srctype);
-    dump["Optode"]["Source"]["Pos"] = {cfg.srcpos[0], cfg.srcpos[1], cfg.srcpos[2]};
-    dump["Optode"]["Source"]["Dir"] = {cfg.srcdir[0], cfg.srcdir[1], cfg.srcdir[2]};
-    dump["Optode"]["Source"]["Param1"] = {cfg.srcparam1[0], cfg.srcparam1[1], cfg.srcparam1[2], cfg.srcparam1[3]};
-    dump["Optode"]["Source"]["Param2"] = {cfg.srcparam2[0], cfg.srcparam2[1], cfg.srcparam2[2], cfg.srcparam2[3]};
+    dump["Optode"]["Source"] = source_json(cfg, true);
 
     std::vector<float> nd(nn * 3);
 

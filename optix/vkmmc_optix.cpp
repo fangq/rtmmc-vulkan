@@ -98,6 +98,12 @@ struct VKMMCParam {
     int     threadphoton, oddphoton;
     float   minenergy;
     float   roulettesize;
+    CUdeviceptr patternbuf, extrasrcbuf, slotbuf;
+    uint32_t src_num;
+    int     src_id;
+    uint32_t extra_src_len, num_field;
+    float   focal;
+    int     focus_mode;
     Medium_GPU media[MAX_PROP];
 };
 
@@ -465,12 +471,16 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
     CUDABuf curvBuf;
     curvBuf.alloc_upload(gpuCurv);
 
-    /* Output grid: one 64-bit fixed-point sum per voxel and gate */
+    /* Output: one 64-bit fixed-point sum per voxel, gate and field, then the launched energy */
     OutputGrid g = compute_grid(cfg);
-    size_t outSz = g.nelem;
+    size_t outSz = g.nout;
     CUDABuf outBuf;
     outBuf.alloc(outSz * sizeof(uint64_t));
     CUDA_CHECK(cudaMemset(outBuf.ptr, 0, outSz * sizeof(uint64_t)));
+    if (g.nfield > 1) {
+        printf("Fields: %u (%s)\n", g.nfield, cfg.srcnum > 1 ? "patterns" : "sources");
+    }
+
     printf("Grid: %ux%ux%u x %d gates, voxel=%.3f (%.4f mm), origin=[%.2f,%.2f,%.2f]\n",
            g.nx, g.ny, g.nz, g.maxgate, g.vs, g.vs * cfg.unitinmm, g.gmin[0], g.gmin[1], g.gmin[2]);
 
@@ -479,6 +489,13 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
     std::vector<uint32_t> seeds;
     CUDABuf seedBuf;
     seedBuf.alloc((size_t)tt * 4 * sizeof(uint32_t));
+
+    /* source pattern, multi-source list and the per-thread photon slot */
+    std::vector<float> pattern = kernel_pattern(cfg), extrasrc = kernel_extrasrc(cfg);
+    CUDABuf patBuf, srcBuf, slotBuf;
+    patBuf.alloc_upload(pattern);
+    srcBuf.alloc_upload(extrasrc);
+    slotBuf.alloc((size_t)tt * sizeof(uint32_t));
 
     /* Launch params */
     VKMMCParam params;
@@ -499,7 +516,16 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
     params.voxel_scale = 1.0f / g.vs;
     kernel_time_gates(cfg, params.tstart, params.tend, params.inv_timestep);
     params.maxgate = cfg.maxgate;
-    params.initial_medium = cfg.mediumid0;
+    params.initial_medium = kernel_initial_medium(cfg);
+    params.patternbuf = patBuf.d_ptr();
+    params.extrasrcbuf = srcBuf.d_ptr();
+    params.slotbuf = slotBuf.d_ptr();
+    params.src_num = (uint32_t)cfg.srcnum;
+    params.src_id = cfg.srcid;
+    params.extra_src_len = (uint32_t)cfg.extrasrc.size();
+    params.num_field = g.nfield;
+    params.focus_mode = kernel_focus_mode(cfg.srcdir[3]);
+    params.focal = (params.focus_mode == 1) ? cfg.srcdir[3] : 0.0f;
     params.do_reflect = cfg.do_mismatch ? 1u : 0u;
     params.output_type = cfg.output_type;
     params.num_media = (uint32_t)cfg.media.size();
@@ -548,7 +574,7 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
         /* move the batch output into the double accumulator, clear the GPU buffer */
         if (batch_readback && pdone < cfg.nphoton) {
             outBuf.download(raw.data(), outSz * sizeof(uint64_t));
-            accumulate_fixed(acc, raw.data(), g.nelem);
+            accumulate_fixed(acc, raw.data(), g.nout);
             CUDA_CHECK(cudaMemset(outBuf.ptr, 0, outSz * sizeof(uint64_t)));
         }
 
@@ -563,7 +589,7 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
 
     /* Readback, normalization and output */
     outBuf.download(raw.data(), outSz * sizeof(uint64_t));
-    accumulate_fixed(acc, raw.data(), g.nelem);
+    accumulate_fixed(acc, raw.data(), g.nout);
     std::vector<float> vol = finalize_output(cfg, g, acc);
     save_fluence(cfg, g, vol);
 
@@ -572,6 +598,9 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
     outBuf.free();
     seedBuf.free();
     paramBuf.free();
+    patBuf.free();
+    srcBuf.free();
+    slotBuf.free();
     destroy_optix(optix);
 }
 

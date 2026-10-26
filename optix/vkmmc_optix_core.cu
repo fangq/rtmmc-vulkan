@@ -51,6 +51,14 @@ struct VKMMCParam {
     unsigned int has_curvature;
     int threadphoton, oddphoton;
     float minenergy, roulettesize;
+    CUdeviceptr patternbuf;       /* pattern source: src_num intensities per pixel */
+    CUdeviceptr extrasrcbuf;      /* multi-source list: 4 float4 per source */
+    CUdeviceptr slotbuf;          /* per thread: the output field or pattern pixel of its photon */
+    unsigned int src_num;         /* patterns sharing the photons */
+    int src_id;                   /* multi-source: -1 a random source per photon, k > 0 source k */
+    unsigned int extra_src_len, num_field;
+    float focal;                  /* focal length (focus_mode 1) */
+    int focus_mode;               /* 0 none, 1 focused, 2 isotropic, 3 Lambertian */
     Medium media[MAX_PROP];
 };
 
@@ -61,6 +69,7 @@ extern "C" {
 #define INV_C0 3.335640951981520e-12f
 #define SAFETY_DIST 0.001f
 #define TWO_PI 6.28318530717959f
+#define ONE_PI 3.14159265358979f
 #define FEPS 1.19209290E-07f
 #define MEDIUM_UNKNOWN 0xFFFFFFFFu
 #define MEDIUM_DEAD 0xFFFFFFFEu
@@ -356,6 +365,28 @@ __device__ __forceinline__ void atomic_add_out(unsigned int idx, float val) {
     atomicAdd((unsigned long long*)gcfg.outputbuf + idx, (unsigned long long)(val * FIXED_SCALE + 0.5f));
 }
 
+/* the photon's slot: its output field (multi-source) or its pattern pixel (shared patterns) */
+__device__ __forceinline__ unsigned int photon_slot() {
+    return ((unsigned int*)gcfg.slotbuf)[optixGetLaunchIndex().x];
+}
+
+/* a deposit of the current photon at element idx of its field(s); see deposit() in vkmmc_core.comp */
+__device__ __forceinline__ void deposit(unsigned int idx, float val) {
+    if (gcfg.src_num > 1) {
+        const float* pat = (const float*)gcfg.patternbuf + photon_slot() * gcfg.src_num;
+
+        for (unsigned int k = 0; k < gcfg.src_num; k++) {
+            if (pat[k] > 0.f) {
+                atomic_add_out(k * gcfg.grid_stride.w + idx, val * pat[k]);
+            }
+        }
+    } else if (gcfg.extra_src_len > 0 && gcfg.src_id < 0) {
+        atomic_add_out(photon_slot() * gcfg.grid_stride.w + idx, val);
+    } else {
+        atomic_add_out(idx, val);
+    }
+}
+
 /* exact voxel/gate traversal; see accumulate() in vkmmc_core.comp */
 __device__ void accumulate(const Photon& ph, const Medium& prop, float L) {
     if (!(L > 0.f)) {
@@ -383,8 +414,8 @@ __device__ void accumulate(const Photon& ph, const Medium& prop, float L) {
             if (gi >= 0.f && gi < (float)gcfg.maxgate) {
                 float x = prop.mua * L;
                 float frac = (x < 1e-3f) ? x * (1.f - 0.5f * x) : 1.f - expf(-x);
-                atomic_add_out((unsigned int)gi * gs.z + (unsigned int)iv.z * gs.y + (unsigned int)iv.y * gs.x + (unsigned int)iv.x,
-                               (gcfg.output_type == OUT_ENERGY) ? w * frac : w * ((x < 1e-3f) ? L * (1.f - 0.5f * x) : frac / prop.mua));
+                deposit((unsigned int)gi * gs.z + (unsigned int)iv.z * gs.y + (unsigned int)iv.y * gs.x + (unsigned int)iv.x,
+                        (gcfg.output_type == OUT_ENERGY) ? w * frac : w * ((x < 1e-3f) ? L * (1.f - 0.5f * x) : frac / prop.mua));
             }
 
             return;
@@ -414,7 +445,7 @@ __device__ void accumulate(const Photon& ph, const Medium& prop, float L) {
         if (gi >= 0.f) {
             float dep = (gcfg.output_type == OUT_ENERGY) ? w * frac
                         : w * ((x < 1e-3f) ? (te - t) * lscale * (1.f - 0.5f * x) : frac / prop.mua);
-            atomic_add_out((unsigned int)gi * gs.z + (unsigned int)iv.z * gs.y + (unsigned int)iv.y * gs.x + (unsigned int)iv.x, dep);
+            deposit((unsigned int)gi * gs.z + (unsigned int)iv.z * gs.y + (unsigned int)iv.y * gs.x + (unsigned int)iv.x, dep);
         }
 
         w *= 1.f - frac;
@@ -532,7 +563,233 @@ __device__ bool do_reflection(float3 N, float3 Ng, float n1, float n2, uint4& rn
 /*                       Launch photon                              */
 /* ================================================================ */
 
-__device__ void launch_photon(Photon& ph, uint4& rng) {
+/* source types, see vkmmc_core.comp */
+enum {
+    SRC_PENCIL = 0, SRC_ISOTROPIC = 1, SRC_CONE = 2, SRC_GAUSSIAN = 3, SRC_PLANAR = 4,
+    SRC_PATTERN = 5, SRC_FOURIER = 6, SRC_ARCSINE = 7, SRC_DISK = 8, SRC_FOURIERX = 9,
+    SRC_FOURIERX2D = 10, SRC_ZGAUSSIAN = 11, SRC_LINE = 12, SRC_SLIT = 13,
+    SRC_PENCILARRAY = 14, SRC_PATTERN3D = 15, SRC_HYPERBOLOID = 16, SRC_RING = 17
+};
+
+/* rotate v by the zenith (sin, cos) z and azimuth (sin, cos) a */
+__device__ __forceinline__ float3 rotate_dir(float3 v, float2 z, float2 a) {
+    if (v.z > -1 + FEPS && v.z < 1 - FEPS) {
+        float s2 = 1 - v.z * v.z, sc = z.x * rsqrtf(s2);
+        return sc * (a.y * make_float3(v.x * v.z, v.y * v.z, -s2) + a.x * make_float3(-v.y, v.x, 0)) + z.y * v;
+    }
+
+    return make_float3(z.x * a.y, z.x * a.x, v.z > 0 ? z.y : -z.y);
+}
+
+__device__ __forceinline__ float3 rotate_ct(float3 v, float ct, float phi) {
+    float sp, cp;
+    sincosf(phi, &sp, &cp);
+    return rotate_dir(v, make_float2(sqrtf(fmaxf(1.f - ct * ct, 0.f)), ct), make_float2(sp, cp));
+}
+
+/* offset of radius r0 at azimuth phi in the plane perpendicular to sd */
+__device__ __forceinline__ float3 disk_offset(float3 sd, float r0, float phi) {
+    float sp, cp;
+    sincosf(phi, &sp, &cp);
+
+    if (sd.z > -1 + FEPS && sd.z < 1 - FEPS) {
+        float t0 = 1 - sd.z * sd.z, t1 = r0 * rsqrtf(t0);
+        return make_float3(t1 * (sd.x * sd.z * cp - sd.y * sp), t1 * (sd.y * sd.z * cp + sd.x * sp), -t1 * t0 * cp);
+    }
+
+    return make_float3(r0 * cp, r0 * sp, 0);
+}
+
+__device__ __forceinline__ float3 focus_dir(float3 p, float3 d, float3 origin, float f) {
+    float3 o = origin + f * d;
+    return normalize((f < 0) ? p - o : o - p);
+}
+
+/* sample the position, direction and weight of a photon; see sample_source() in vkmmc_core.comp */
+__device__ void sample_source(Photon& ph, uint4& rng, unsigned int& slot) {
+    const float4 p1 = gcfg.srcparam1, p2 = gcfg.srcparam2;
+    float3 v1 = make_float3(p1.x, p1.y, p1.z), v2 = make_float3(p2.x, p2.y, p2.z);
+    slot = 0;
+
+    if (gcfg.extra_src_len > 0) {
+        unsigned int k = (unsigned int)max(gcfg.src_id - 1, 0);
+
+        if (gcfg.src_id < 0) {
+            k = min((unsigned int)(rand01(rng) * gcfg.extra_src_len), gcfg.extra_src_len - 1);
+            slot = k;
+        }
+
+        const float4* es = (const float4*)gcfg.extrasrcbuf + k * 4;
+        float4 sp = es[0], sd = es[1];
+        ph.p0 = make_float3(sp.x, sp.y, sp.z);
+        ph.dir = make_float3(sd.x, sd.y, sd.z);
+        ph.weight = sp.w;
+
+        if (es[2].x > 0) {
+            float phi = TWO_PI * rand01(rng);
+            ph.p0 += disk_offset(ph.dir, sqrtf(rand01(rng)) * es[2].x, phi);
+        }
+
+        if (sd.w != 0) {
+            ph.dir = focus_dir(ph.p0, ph.dir, make_float3(sp.x, sp.y, sp.z), sd.w);
+        }
+
+        return;
+    }
+
+    const int st = gcfg.srctype;
+    float3 origin = ph.p0;
+    bool canfocus = true;
+    float focal = (gcfg.focus_mode == 1) ? gcfg.focal : 0.f;
+
+    if (st == SRC_PLANAR || st == SRC_PATTERN || st == SRC_FOURIER || st == SRC_PENCILARRAY || st == SRC_PATTERN3D) {
+        float rx = rand01(rng), ry = rand01(rng);
+
+        if (st == SRC_PATTERN3D) {
+            float rz = rand01(rng);
+            int nx = (int)p1.x, ny = (int)p1.y, nz = (int)p1.z;
+            ph.p0 = gcfg.srcpos + make_float3(rx * p1.x, ry * p1.y, rz * p1.z);
+            slot = (unsigned int)((min((int)(rz * nz), nz - 1) * ny + min((int)(ry * ny), ny - 1)) * nx + min((int)(rx * nx), nx - 1));
+            ph.weight = (gcfg.src_num > 1) ? 1.f : ((const float*)gcfg.patternbuf)[slot];
+            origin += 0.5f * v1;
+        } else {
+            if (st == SRC_PENCILARRAY) {
+                float ax = (p1.w > 1) ? floorf(rx * p1.w) / (p1.w - 1) : 0.f;
+                float ay = (p2.w > 1) ? floorf(ry * p2.w) / (p2.w - 1) : 0.f;
+                ph.p0 = gcfg.srcpos + ax * v1 + ay * v2;
+            } else {
+                ph.p0 = gcfg.srcpos + rx * v1 + ry * v2;
+            }
+
+            if (st == SRC_PATTERN) {
+                int xs = (int)p1.w, ys = (int)p2.w;
+                slot = (unsigned int)(min((int)(ry * ys), ys - 1) * xs + min((int)(rx * xs), xs - 1));
+                ph.weight = (gcfg.src_num > 1) ? 1.f : ((const float*)gcfg.patternbuf)[slot];
+            } else if (st == SRC_FOURIER) {
+                ph.weight = (cosf((floorf(p1.w) * rx + floorf(p2.w) * ry + p1.w - floorf(p1.w)) * TWO_PI)
+                             * (1.f - p2.w + floorf(p2.w)) + 1.f) * 0.5f;
+            }
+
+            origin += 0.5f * (v1 + v2);
+        }
+    } else if (st == SRC_FOURIERX || st == SRC_FOURIERX2D) {
+        float rx = rand01(rng), ry = rand01(rng);
+        float3 v2x = p1.w * rsqrtf(dot(v1, v1)) * cross(gcfg.srcdir, v1);
+        ph.p0 = gcfg.srcpos + rx * v1 + ry * v2x;
+
+        if (st == SRC_FOURIERX2D) {
+            ph.weight = (sinf((p2.x * rx + p2.z) * TWO_PI) * sinf((p2.y * ry + p2.w) * TWO_PI) + 1.f) * 0.5f;
+        } else {
+            ph.weight = (cosf((p2.x * rx + p2.y * ry + p2.z) * TWO_PI) * (1.f - p2.w) + 1.f) * 0.5f;
+        }
+
+        origin += 0.5f * (v1 + v2x);
+    } else if (st == SRC_DISK || st == SRC_RING || st == SRC_GAUSSIAN) {
+        float phi, r0;
+
+        if (st == SRC_RING && (p1.z > 0 || p1.w > 0)) {
+            phi = fabsf(p1.z - p1.w) * rand01(rng) + fminf(p1.z, p1.w);
+        } else {
+            phi = TWO_PI * rand01(rng);
+        }
+
+        if (st != SRC_GAUSSIAN) {
+            r0 = sqrtf(rand01(rng) * fabsf(p1.x * p1.x - p1.y * p1.y) + p1.y * p1.y);
+        } else if (fabsf(focal) < 1e-5f || fabsf(p1.y) < 1e-5f) {
+            r0 = sqrtf(rand_scatlen(rng)) * p1.x;
+        } else {
+            float z0 = p1.x * p1.x * ONE_PI / p1.y;
+            r0 = sqrtf(rand_scatlen(rng) * (1.f + focal * focal / (z0 * z0))) * p1.x;
+        }
+
+        ph.p0 = gcfg.srcpos + disk_offset(gcfg.srcdir, r0, phi);
+    } else if (st == SRC_CONE || st == SRC_ISOTROPIC || st == SRC_ARCSINE) {
+        float phi = TWO_PI * rand01(rng), ct;
+
+        if (st == SRC_CONE) {
+            ct = (p1.y > 0) ? cosf(rand01(rng) * fminf(p1.x, TWO_PI)) : 1.f - rand01(rng) * (1.f - cosf(fminf(p1.x, ONE_PI)));
+        } else if (st == SRC_ISOTROPIC) {
+            ct = 2.f * rand01(rng) - 1.f;
+        } else {
+            ct = cosf(ONE_PI * rand01(rng));
+        }
+
+        ph.dir = rotate_ct(ph.dir, ct, phi);
+        canfocus = false;
+    } else if (st == SRC_ZGAUSSIAN) {
+        float phi = TWO_PI * rand01(rng);
+        float ang = sqrtf(2.f * rand_scatlen(rng)) * (1.f - 2.f * rand01(rng)) * p1.x;
+        ph.dir = rotate_dir(ph.dir, make_float2(sinf(ang), cosf(ang)), make_float2(sinf(phi), cosf(phi)));
+
+        canfocus = false;
+    } else if (st == SRC_HYPERBOLOID) {
+        float sphi, cphi;
+        sincosf(TWO_PI * rand01(rng), &sphi, &cphi);
+        float r0 = sqrtf(0.5f * rand_scatlen(rng)) * p1.x;
+        float tilt = (p1.z > 0) ? (-p1.y / p1.z) : 0.f;
+        float3 bdir = normalize(make_float3(-r0 * sphi, r0 * cphi, p1.z));
+        float dpx = r0 * (cphi - tilt * sphi), dpy = r0 * (sphi + tilt * cphi);
+        float3 sd = gcfg.srcdir;
+
+        if (sd.z > -1 + FEPS && sd.z < 1 - FEPS) {
+            float stt = sqrtf(1 - sd.z * sd.z), cb = sd.x / stt, sb = sd.y / stt;
+            ph.p0 = gcfg.srcpos + make_float3(dpx * cb * sd.z - dpy * sb, dpx * sb * sd.z + dpy * cb, -dpx * stt);
+            ph.dir = make_float3(bdir.x * cb * sd.z - bdir.y * sb + bdir.z * cb * stt,
+                                 bdir.x * sb * sd.z + bdir.y * cb + bdir.z * sb * stt,
+                                 -bdir.x * stt + bdir.z * sd.z);
+        } else {
+            ph.p0 = gcfg.srcpos + make_float3(dpx, dpy, 0);
+            ph.dir = make_float3(bdir.x, bdir.y, (sd.z > 0) ? bdir.z : -bdir.z);
+        }
+
+        ph.dir = normalize(ph.dir);
+        canfocus = false;
+    } else if (st == SRC_LINE || st == SRC_SLIT) {
+        ph.p0 += rand01(rng) * v1;
+        float3 axis = normalize(v1);
+
+        if (st == SRC_LINE) {
+            float3 dp = ph.dir - dot(ph.dir, axis) * axis;
+
+            if (p2.x > 0 && dot(dp, dp) > 1e-12f) {
+                float sp, cp;
+                sincosf(p2.x * (2.f * rand01(rng) - 1.f), &sp, &cp);
+                dp = normalize(dp);
+                ph.dir = dp * cp + cross(axis, dp) * sp;
+            } else {
+                float sp, cp;
+                sincosf(TWO_PI * rand01(rng), &sp, &cp);
+                ph.dir = rotate_dir(axis, make_float2(1.f, 0.f), make_float2(sp, cp));
+            }
+        } else if (p2.x > 0 || p2.y > 0) {
+            float sp, cp;
+            sincosf(TWO_PI * rand01(rng), &sp, &cp);
+            float r = sqrtf(2.f * rand_scatlen(rng));
+            ph.dir = normalize(ph.dir + (cp * p2.x * r) * normalize(cross(v1, ph.dir)) + (sp * p2.y * r) * axis);
+        }
+
+        origin += 0.5f * v1;
+        canfocus = (st == SRC_SLIT);
+    }
+
+    if (canfocus && gcfg.focus_mode != 0) {
+        if (gcfg.focus_mode == 2) {
+            float phi = TWO_PI * rand01(rng);
+            ph.dir = rotate_ct(ph.dir, 2.f * rand01(rng) - 1.f, phi);
+        } else if (gcfg.focus_mode == 3) {
+            float phi = TWO_PI * rand01(rng), s = sqrtf(rand01(rng));
+            ph.dir = rotate_ct(ph.dir, sqrtf(1.f - s * s), phi);
+        } else {
+            ph.dir = focus_dir(ph.p0, ph.dir, origin, focal);
+        }
+    }
+}
+
+/*
+ * Launch a photon; w0 returns its launch weight. The slot buffer holds the
+ * field or pattern pixel the hit programs deposit to.
+ */
+__device__ void launch_photon(Photon& ph, uint4& rng, float& w0) {
     ph.p0 = gcfg.srcpos;
     ph.dir = gcfg.srcdir;
     ph.weight = 1.0f;
@@ -542,31 +799,29 @@ __device__ void launch_photon(Photon& ph, uint4& rng) {
     ph.pending = 0;
     ph.primid = 0;
 #endif
+    unsigned int slot;
+    sample_source(ph, rng, slot);
+    w0 = ph.weight;
 
-    if (gcfg.srctype == 8) { // disk
-        float r0 = sqrtf(rand01(rng)) * gcfg.srcparam1.x;
-        float phi = TWO_PI * rand01(rng);
-        float cp, sp;
-        sincosf(phi, &sp, &cp);
-        float3 sd = gcfg.srcdir;
-
-        if (sd.z > -1 + FEPS && sd.z < 1 - FEPS) {
-            float t0 = 1 - sd.z * sd.z, t1 = r0 * rsqrtf(t0);
-            ph.p0.x += t1 * (sd.x * sd.z * cp - sd.y * sp);
-            ph.p0.y += t1 * (sd.y * sd.z * cp + sd.x * sp);
-            ph.p0.z -= t1 * t0 * cp;
-        } else {
-            ph.p0.x += r0 * cp;
-            ph.p0.y += r0 * sp;
-        }
-    } else if (gcfg.srctype == 4) { // planar
-        float u = rand01(rng), v = rand01(rng);
-        ph.p0 = gcfg.srcpos + u * make_float3(gcfg.srcparam1.x, gcfg.srcparam1.y, gcfg.srcparam1.z)
-                + v * make_float3(gcfg.srcparam2.x, gcfg.srcparam2.y, gcfg.srcparam2.z);
+    if (gcfg.src_num > 1 || (gcfg.extra_src_len > 0 && gcfg.src_id < 0)) {
+        ((unsigned int*)gcfg.slotbuf)[optixGetLaunchIndex().x] = slot;
     }
 
     ph.slen = rand_scatlen(rng);
     ph.mid = gcfg.initial_medium;
+}
+
+/* launched energy, see tally_launch() in vkmmc_core.comp */
+__device__ __forceinline__ void tally_launch(unsigned long long& lw, float w0) {
+    if (gcfg.src_num > 1) {
+        const float* pat = (const float*)gcfg.patternbuf + photon_slot() * gcfg.src_num;
+
+        for (unsigned int k = 0; k < gcfg.src_num; k++) {
+            atomic_add_out(gcfg.num_field * gcfg.grid_stride.w + k, pat[k]);
+        }
+    } else {
+        lw += (unsigned long long)(w0 * FIXED_SCALE + 0.5f);
+    }
 }
 
 /* closest hit along a ray: distance, triangle and face orientation */
@@ -751,7 +1006,7 @@ __device__ void initial_medium(Photon& ph, uint4& rng, uint2& cache, bool& cache
     if (gcfg.do_csg) {
         uint2 inside = cache;
 
-        if (gcfg.srctype != 0 || !cached) {
+        if (gcfg.srctype != SRC_PENCIL || gcfg.extra_src_len > 0 || !cached) {
             inside = csg_enclosure(ph.p0, ph.dir, rng);
             cache = inside;
             cached = true;
@@ -806,6 +1061,8 @@ __device__ void initial_medium(Photon& ph, uint4& rng, uint2& cache, bool& cache
                 && do_reflection(get_normal(tid, hp, fb[tid * 2]), make_float3(fb[tid * 2]), gcfg.media[0].n, gcfg.media[bm].n, rng, hp, ph)) {
             ph.mid = MEDIUM_DEAD;
         }
+    } else if (!ff && fm == MEDIUM_AMBIENT && hd < SAFETY_DIST) {
+        ph.mid = MEDIUM_DEAD;   /* a source on the mesh surface, pointing out of it */
     }
 }
 
@@ -819,12 +1076,18 @@ extern "C" __global__ void __raygen__rg() {
     uint2 cache = make_uint2(0, 0);
     bool cached = false;
 
-    Photon ph;
-    launch_photon(ph, rng);
-    initial_medium(ph, rng, cache, cached);
-
     int done = 0;
     int maxph = gcfg.threadphoton + (tid < (unsigned int)gcfg.oddphoton ? 1 : 0);
+    unsigned long long lw = 0;
+    float w0;
+
+    Photon ph;
+    launch_photon(ph, rng, w0);
+    initial_medium(ph, rng, cache, cached);
+
+    if (maxph > 0) {
+        tally_launch(lw, w0);
+    }
 
     while (done < maxph) {
 #ifdef USE_CSG
@@ -839,10 +1102,17 @@ extern "C" __global__ void __raygen__rg() {
             float mus = gcfg.media[ph.mid].mus;
             traceRay(ph, rng, mus > 0.0f ? ph.slen / mus : std::numeric_limits<float>::max());
         } else {
-            launch_photon(ph, rng);
+            launch_photon(ph, rng, w0);
             initial_medium(ph, rng, cache, cached);
-            ++done;
+
+            if (++done < maxph) {
+                tally_launch(lw, w0);
+            }
         }
+    }
+
+    if (lw) {
+        atomicAdd((unsigned long long*)gcfg.outputbuf + gcfg.num_field * gcfg.grid_stride.w, lw);
     }
 
     ((uint4*)gcfg.seedbuf)[tid] = rng;

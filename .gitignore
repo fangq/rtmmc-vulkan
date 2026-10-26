@@ -28,3 +28,4 @@ tests/fuzz/findings*/
 *.jdat
 .work/
 __pycache__/
+tests/fuzz/fuzz-*.log

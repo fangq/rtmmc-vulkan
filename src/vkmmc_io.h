@@ -48,6 +48,10 @@ using json = nlohmann::json;
 #define VKMMC_MAX_VOXELS     ((uint64_t)1 << 30)  /* voxels x gates; kernel indexes with uint32 */
 #define VKMMC_MAX_JDATA_DIM  8
 #define VKMMC_MAX_COORD      1e6         /* |coordinates| in length units; float precision */
+#define VKMMC_MAX_SOURCES    1024        /* rows of a multi-source list */
+#define VKMMC_MAX_PATTERNS   1024        /* SrcNum: patterns sharing the photons */
+#define VKMMC_MAX_PATTERN_LEN (1u << 26) /* pattern values (pixels x SrcNum) */
+#define VKMMC_MAX_SRC_WEIGHT 1000.0      /* launch weight; keeps the 64-bit fixed-point sums in range */
 #define VKMMC_MAX_TIME       1.0         /* seconds */
 
 // ============================================================================
@@ -63,10 +67,17 @@ struct FaceData {
     float nx, ny, nz, packed_media;
 };
 
+/* the source types and numbering of MCX/MMC */
 enum SrcType {
     SRC_PENCIL = 0, SRC_ISOTROPIC = 1, SRC_CONE = 2, SRC_GAUSSIAN = 3, SRC_PLANAR = 4,
-    SRC_PATTERN = 5, SRC_FOURIER = 6, SRC_ARCSINE = 7, SRC_DISK = 8, SRC_ZGAUSSIAN = 11,
-    SRC_LINE = 12, SRC_SLIT = 13
+    SRC_PATTERN = 5, SRC_FOURIER = 6, SRC_ARCSINE = 7, SRC_DISK = 8, SRC_FOURIERX = 9,
+    SRC_FOURIERX2D = 10, SRC_ZGAUSSIAN = 11, SRC_LINE = 12, SRC_SLIT = 13, SRC_PENCILARRAY = 14,
+    SRC_PATTERN3D = 15, SRC_HYPERBOLOID = 16, SRC_RING = 17, SRC_TYPE_COUNT = 18
+};
+
+/* one source of a multi-source list: pos (.w = weight), dir (.w = focal length), param1, param2 */
+struct ExtraSrc {
+    float pos[4], dir[4], param1[4], param2[4];
 };
 
 enum OutputType { OT_FLUX = 0, OT_FLUENCE = 1, OT_ENERGY = 2 };
@@ -82,7 +93,11 @@ struct SimConfig {
     float unitinmm;
     std::vector<Medium> media;          /* as given in the input, in 1/mm */
     int srctype;
-    float srcpos[3], srcdir[4], srcparam1[4], srcparam2[4];
+    float srcpos[3], srcdir[4], srcparam1[4], srcparam2[4];   /* srcdir[3]: focal length */
+    int srcnum;                         /* patterns sharing the photons of a pattern source */
+    std::vector<float> srcpattern;      /* pattern intensities, srcnum per pixel (pixel-major) */
+    std::vector<ExtraSrc> extrasrc;     /* multi-source list (Pos with several rows) */
+    int srcid;                          /* multi-source: -1 a field per source, k > 0 source k only */
     std::vector<Vec3> nodes;
     std::vector<std::array<uint32_t, 3> > faces;
     std::vector<FaceData> facedata;
@@ -102,7 +117,7 @@ struct SimConfig {
 
     SimConfig() : session_id("default"), nphoton(1000000), rng_seed(29012391), do_mismatch(true),
         do_normalize(true), output_type(OT_ENERGY), t0(0), t1(5e-9f), dt(5e-9f),
-        maxgate(1), unitinmm(1.0f), srctype(SRC_PENCIL), init_elem(-1),
+        maxgate(1), unitinmm(1.0f), srctype(SRC_PENCIL), srcnum(1), srcid(0), init_elem(-1),
         mediumid0(0xFFFFFFFFu), has_steps(false), is_csg(false), mesh_res(24), minenergy(1e-6f),
         roulettesize(10.0f), debuglevel(0), maxjumpdebug(10000000) {
         memset(srcpos, 0, sizeof(srcpos));
@@ -935,14 +950,21 @@ static void extract_surface_from_tet(const std::vector<Vec3>& nodes, const int32
 // Parse helpers
 // ============================================================================
 
-/* source type id; -1 if unknown */
-static int parse_srctype(const std::string& s) {
-    static const char* names[] = {"pencil", "isotropic", "cone", "gaussian", "planar", "pattern",
-                                  "fourier", "arcsine", "disk", "", "", "zgaussian", "line", "slit"
-                                 };
+static const char* const srctype_names[SRC_TYPE_COUNT] = {
+    "pencil", "isotropic", "cone", "gaussian", "planar", "pattern", "fourier", "arcsine", "disk",
+    "fourierx", "fourierx2d", "zgaussian", "line", "slit", "pencilarray", "pattern3d", "hyperboloid", "ring"
+};
 
-    for (int i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++) {
-        if (names[i][0] && s == names[i]) {
+/* source type id; -1 if unknown */
+static int parse_srctype(const std::string& name) {
+    std::string s(name);
+
+    for (size_t i = 0; i < s.size(); i++) {
+        s[i] = (char)tolower((unsigned char)s[i]);
+    }
+
+    for (int i = 0; i < SRC_TYPE_COUNT; i++) {
+        if (s == srctype_names[i]) {
             return i;
         }
     }
@@ -951,24 +973,13 @@ static int parse_srctype(const std::string& s) {
 }
 
 static const char* srctype_name(int t) {
-    switch (t) {
-        case SRC_PENCIL:
-            return "pencil";
-
-        case SRC_PLANAR:
-            return "planar";
-
-        case SRC_DISK:
-            return "disk";
-
-        default:
-            return "unknown";
-    }
+    return (t >= 0 && t < SRC_TYPE_COUNT) ? srctype_names[t] : "unknown";
 }
 
-/* source types the GPU kernels implement */
-static bool srctype_supported(int t) {
-    return t == SRC_PENCIL || t == SRC_PLANAR || t == SRC_DISK;
+/* output fields: one per pattern of a shared pattern source, or one per source of a
+   multi-source list simulated at once; 1 otherwise */
+static uint32_t src_fields(const SimConfig& cfg) {
+    return (!cfg.extrasrc.empty() && cfg.srcid < 0) ? (uint32_t)cfg.extrasrc.size() : (uint32_t)cfg.srcnum;
 }
 
 /* output type from a name or its first letter: flux, fluence, energy; -1 if unknown */
@@ -1135,6 +1146,305 @@ static size_t max_label(const SimConfig& cfg) {
     return cfg.media.empty() ? 0 : std::min(cfg.media.size() - 1, (size_t)VKMMC_MAX_MESH_LABEL);
 }
 
+
+// ============================================================================
+// Source
+// ============================================================================
+static void normalize_srcdir(float* d, const std::string& ctx) {
+    double l = std::sqrt((double)d[0] * d[0] + (double)d[1] * d[1] + (double)d[2] * d[2]);
+    vkmmc_require(l > 1e-10, ctx + " must be a non-zero vector");
+
+    for (int i = 0; i < 3; i++) {
+        d[i] = (float)(d[i] / l);
+    }
+}
+
+/* a number, or for the focal length (Dir[3]) the JData strings "_NaN_", "_Inf_", "-_Inf_" */
+static double source_num(const json& v, bool special, const std::string& ctx) {
+    if (special && v.is_string()) {
+        std::string t = v.get<std::string>();
+
+        if (t == "_NaN_") {
+            return NAN;
+        } else if (t == "_Inf_") {
+            return INFINITY;
+        } else if (t == "-_Inf_") {
+            return -INFINITY;
+        }
+    }
+
+    vkmmc_require(v.is_number(), ctx + " must be a number" + (special ? " (or \"_NaN_\"/\"_Inf_\"/\"-_Inf_\")" : ""));
+    double d = v.get<double>();
+    vkmmc_require(std::isfinite(d), ctx + " must be finite");
+    return d;
+}
+
+/*
+ * A source vector field: one row [a,b,...] or, for a multi-source list, a 2-D
+ * array of rows. Each row has nmin..4 numbers; absent entries keep def.
+ */
+static std::vector<std::array<float, 4> > source_rows(const json& v, size_t nmin, const float* def, bool special,
+        double maxabs, const std::string& ctx) {
+    vkmmc_require(v.is_array() && !v.empty(), ctx + " must be a non-empty array");
+    bool multi = v[0].is_array();
+    size_t nrow = multi ? v.size() : 1;
+    vkmmc_require(nrow <= VKMMC_MAX_SOURCES, ctx + " has more than " + std::to_string(VKMMC_MAX_SOURCES) + " rows");
+    std::vector<std::array<float, 4> > rows(nrow);
+
+    for (size_t r = 0; r < nrow; r++) {
+        const json& row = multi ? v[r] : v;
+        std::string rc = multi ? ctx + "[" + std::to_string(r) + "]" : ctx;
+        vkmmc_require(row.is_array(), rc + " must be an array");
+        vkmmc_require(row.size() >= nmin, rc + " needs at least " + std::to_string(nmin) + " numbers");
+        vkmmc_require(row.size() <= 4, rc + " has more than 4 numbers");
+
+        for (size_t i = 0; i < 4; i++) {
+            double d = (i < row.size()) ? source_num(row[i], special && i == 3, rc + "[" + std::to_string(i) + "]") : def[i];
+            vkmmc_require(!(std::fabs(d) > maxabs) || (special && i == 3), rc + " is beyond +-1e6");
+            rows[r][i] = (float)d;
+        }
+    }
+
+    return rows;
+}
+
+/*
+ * Optode.Source.Pattern: a JData array (row-major [SrcNum,] Nx, Ny[, Nz], read
+ * with the first index fastest as MMC does), or {"Nx","Ny"[,"Nz"],"Data"} with
+ * Data a flat array or the name of a float32 binary file
+ */
+static void load_pattern(const json& v, SimConfig& cfg) {
+    const std::string ctx = "Optode.Source.Pattern";
+    std::vector<double> data;
+    vkmmc_require(v.is_object(), ctx + " must be a JData array or an object with Nx, Ny and Data");
+
+    if (v.contains("_ArrayType_")) {
+        JDataArray a = jdata_decode_array(v, ctx);
+        size_t n = a.numel();
+        vkmmc_require(a.dims.size() >= 1 && a.dims.size() <= 4, ctx + " must have 1 to 4 dimensions");
+        vkmmc_require(n <= VKMMC_MAX_PATTERN_LEN, ctx + " is too large");
+
+        if (a.dims.size() == 3 && a.dims[0] > 1 && a.dims[2] > 1 && cfg.srctype == SRC_PATTERN) {   /* as MMC */
+            cfg.srcnum = (int)std::min<size_t>(a.dims[0], VKMMC_MAX_PATTERNS + 1);
+        }
+
+        /* row-major -> first index fastest */
+        size_t nd = a.dims.size();
+        std::vector<size_t> idx(nd, 0);
+        data.resize(n);
+
+        for (size_t i = 0; i < n; i++) {
+            size_t o = 0, st = 1;
+
+            for (size_t d = 0; d < nd; d++) {
+                o += idx[d] * st;
+                st *= a.dims[d];
+            }
+
+            data[o] = a.at(i);
+
+            for (size_t d = nd; d-- > 0;) {
+                if (++idx[d] < a.dims[d]) {
+                    break;
+                }
+
+                idx[d] = 0;
+            }
+        }
+    } else {
+        double nx = json_num_range(v, "Nx", 0, 1, 1e7, ctx), ny = json_num_range(v, "Ny", 0, 1, 1e7, ctx);
+        double nz = json_num_range(v, "Nz", 1, 1, 1e7, ctx);
+        double n = nx * ny * nz * cfg.srcnum;
+        vkmmc_require(n <= VKMMC_MAX_PATTERN_LEN, ctx + " is too large");
+        vkmmc_require(v.contains("Data"), ctx + " requires 'Data'");
+        const json& d = v["Data"];
+
+        if (d.is_string()) {
+            std::ifstream f(d.get<std::string>().c_str(), std::ios::binary | std::ios::ate);
+            vkmmc_require((bool)f, ctx + ".Data: cannot open " + d.get<std::string>());
+            vkmmc_require((double)f.tellg() >= n * sizeof(float), ctx + ".Data: the file is too short");
+            f.seekg(0);
+            std::vector<float> buf((size_t)n);
+            f.read(reinterpret_cast<char*>(buf.data()), (std::streamsize)(buf.size() * sizeof(float)));
+            vkmmc_require(f.gcount() == (std::streamsize)(buf.size() * sizeof(float)), ctx + ".Data: the file is too short");
+            data.assign(buf.begin(), buf.end());
+        } else {
+            vkmmc_require(d.is_array() && d.size() == (size_t)n, ctx + ".Data must hold Nx*Ny*Nz*SrcNum numbers");
+            data.resize((size_t)n);
+
+            for (size_t i = 0; i < data.size(); i++) {
+                vkmmc_require(d[i].is_number(), ctx + ".Data must contain only numbers");
+                data[i] = d[i].get<double>();
+            }
+        }
+    }
+
+    vkmmc_require(data.size() <= VKMMC_MAX_PATTERN_LEN, ctx + " is too large");
+    cfg.srcpattern.resize(data.size());
+
+    for (size_t i = 0; i < data.size(); i++) {
+        vkmmc_require(data[i] >= 0 && data[i] <= VKMMC_MAX_SRC_WEIGHT,
+                      ctx + " values must be in [0, " + std::to_string((int)VKMMC_MAX_SRC_WEIGHT) + "]");
+        cfg.srcpattern[i] = (float)data[i];
+    }
+}
+
+/* parameter checks that keep the kernels' source sampling well defined */
+static void check_source(const SimConfig& cfg) {
+    const float* p1 = cfg.srcparam1, *p2 = cfg.srcparam2;
+    const std::string ctx = std::string("Optode.Source (") + srctype_name(cfg.srctype) + ")";
+
+    switch (cfg.srctype) {
+        case SRC_CONE:
+            vkmmc_require(p1[0] > 0, ctx + ": Param1[0] (the cone half angle) must be positive");
+            break;
+
+        case SRC_DISK:
+        case SRC_RING:
+            vkmmc_require(p1[0] >= 0 && p1[1] >= 0, ctx + ": Param1[0..1] (radii) must be non-negative");
+            break;
+
+        case SRC_GAUSSIAN:
+        case SRC_ZGAUSSIAN:
+            vkmmc_require(p1[0] >= 0, ctx + ": Param1[0] (the width) must be non-negative");
+            break;
+
+        case SRC_HYPERBOLOID:
+            vkmmc_require(p1[0] >= 0 && p1[2] >= 0, ctx + ": Param1[0] (waist) and Param1[2] (Rayleigh range) must be non-negative");
+            break;
+
+        case SRC_PENCILARRAY:
+            vkmmc_require(p1[3] >= 1 && p2[3] >= 1 && p1[3] <= 1e6 && p2[3] <= 1e6 && p1[3] == std::floor(p1[3]) && p2[3] == std::floor(p2[3]),
+                          ctx + ": Param1[3] and Param2[3] (the beam counts) must be positive integers");
+            break;
+
+        case SRC_LINE:
+        case SRC_SLIT:
+            vkmmc_require(p1[0] * p1[0] + p1[1] * p1[1] + p1[2] * p1[2] > 0, ctx + ": Param1[0..2] (the segment) must be a non-zero vector");
+            vkmmc_require(p2[0] >= 0 && p2[1] >= 0, ctx + ": Param2[0..1] must be non-negative");
+            break;
+
+        case SRC_FOURIERX:
+        case SRC_FOURIERX2D:
+            vkmmc_require(p1[0] * p1[0] + p1[1] * p1[1] + p1[2] * p1[2] > 0, ctx + ": Param1[0..2] must be a non-zero vector");
+            vkmmc_require(cfg.srctype == SRC_FOURIERX2D || (p2[3] >= 0 && p2[3] <= 2),
+                          ctx + ": Param2[3] (the modulation depth M) must be in [0, 2]");
+            break;
+
+        case SRC_PATTERN:
+        case SRC_PATTERN3D: {
+            double nx = (cfg.srctype == SRC_PATTERN) ? p1[3] : p1[0], ny = (cfg.srctype == SRC_PATTERN) ? p2[3] : p1[1];
+            double nz = (cfg.srctype == SRC_PATTERN) ? 1 : p1[2];
+            vkmmc_require(nx >= 1 && ny >= 1 && nz >= 1 && nx == std::floor(nx) && ny == std::floor(ny) && nz == std::floor(nz),
+                          ctx + ((cfg.srctype == SRC_PATTERN) ? ": Param1[3] and Param2[3] (the pattern size)" : ": Param1[0..2] (the pattern size)")
+                          + " must be positive integers");
+            vkmmc_require(!cfg.srcpattern.empty(), ctx + " requires Optode.Source.Pattern");
+            vkmmc_require((double)cfg.srcpattern.size() == nx * ny * nz * cfg.srcnum,
+                          ctx + ": Optode.Source.Pattern must hold " + std::to_string((uint64_t)(nx * ny * nz)) + " x SrcNum values");
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    vkmmc_require(cfg.srcnum == 1 || cfg.srctype == SRC_PATTERN || cfg.srctype == SRC_PATTERN3D,
+                  "Optode.Source.SrcNum > 1 requires a pattern or pattern3d source");
+    vkmmc_require(cfg.srcnum == 1 || cfg.extrasrc.empty(),
+                  "Optode.Source.SrcNum > 1 (shared patterns) and multiple sources cannot be combined");
+}
+
+static void load_source(const json& src, SimConfig& cfg) {
+    vkmmc_require(src.is_object(), "Optode.Source must be an object");
+    std::string tname = json_str(src, "Type", "pencil", "Optode.Source");
+    cfg.srctype = parse_srctype(tname);
+    vkmmc_require(cfg.srctype >= 0, "Optode.Source.Type '" + tname + "' is not a known source type");
+
+    static const float zero[4] = {0, 0, 0, 0}, one_w[4] = {0, 0, 0, 1}, zdir[4] = {0, 0, 1, 0};
+    std::vector<std::array<float, 4> > pos(1), dir(1), p1(1), p2(1);
+    memcpy(pos[0].data(), one_w, sizeof(one_w));
+    memcpy(dir[0].data(), cfg.srcdir, sizeof(zdir));
+    memcpy(p1[0].data(), cfg.srcparam1, sizeof(zero));
+    memcpy(p2[0].data(), cfg.srcparam2, sizeof(zero));
+
+    if (src.contains("Pos")) {
+        pos = source_rows(src["Pos"], 3, one_w, false, VKMMC_MAX_COORD, "Optode.Source.Pos");
+    }
+
+    if (src.contains("Dir")) {
+        dir = source_rows(src["Dir"], 3, zdir, true, 1e30, "Optode.Source.Dir");
+    }
+
+    if (src.contains("Param1")) {
+        p1 = source_rows(src["Param1"], 1, zero, false, VKMMC_MAX_COORD, "Optode.Source.Param1");
+    }
+
+    if (src.contains("Param2")) {
+        p2 = source_rows(src["Param2"], 1, zero, false, VKMMC_MAX_COORD, "Optode.Source.Param2");
+    }
+
+    /* multi-source: any field with several rows; a single row applies to every source */
+    size_t nsrc = std::max(std::max(pos.size(), dir.size()), std::max(p1.size(), p2.size()));
+    bool multi = src.contains("Pos") && src["Pos"].is_array() && !src["Pos"].empty() && src["Pos"][0].is_array();
+    std::vector<std::array<float, 4> >* fields[4] = {&pos, &dir, &p1, &p2};
+
+    for (int f = 0; f < 4; f++) {
+        vkmmc_require(fields[f]->size() == 1 || fields[f]->size() == nsrc,
+                      "Optode.Source: Pos, Dir, Param1 and Param2 must have the same number of rows");
+        fields[f]->resize(nsrc, (*fields[f])[0]);
+    }
+
+    for (size_t r = 0; r < nsrc; r++) {
+        std::string rc = "Optode.Source.Dir" + (nsrc > 1 ? "[" + std::to_string(r) + "]" : std::string());
+        normalize_srcdir(dir[r].data(), rc);
+    }
+
+    for (int i = 0; i < 4; i++) {
+        if (i < 3) {
+            cfg.srcpos[i] = pos[0][i];
+        }
+
+        cfg.srcdir[i] = dir[0][i];
+        cfg.srcparam1[i] = p1[0][i];
+        cfg.srcparam2[i] = p2[0][i];
+    }
+
+    cfg.extrasrc.clear();
+
+    if (multi || nsrc > 1) {
+        cfg.extrasrc.resize(nsrc);
+
+        for (size_t r = 0; r < nsrc; r++) {
+            ExtraSrc& e = cfg.extrasrc[r];
+            vkmmc_require(pos[r][3] >= 0 && pos[r][3] <= VKMMC_MAX_SRC_WEIGHT,
+                          "Optode.Source.Pos[" + std::to_string(r) + "][3] (the source weight) must be in [0, "
+                          + std::to_string((int)VKMMC_MAX_SRC_WEIGHT) + "]");
+            vkmmc_require(p1[r][0] >= 0, "Optode.Source.Param1[" + std::to_string(r) + "][0] (the disk radius) must be non-negative");
+            memcpy(e.pos, pos[r].data(), sizeof(e.pos));
+            memcpy(e.dir, dir[r].data(), sizeof(e.dir));
+            memcpy(e.param1, p1[r].data(), sizeof(e.param1));
+            memcpy(e.param2, p2[r].data(), sizeof(e.param2));
+        }
+    }
+
+    /* the source of a multi-source run: 0 or -1 a field per source, k > 0 source k only */
+    double id = json_num(src, "ID", 0, "Optode.Source");
+    vkmmc_require(id == std::floor(id) && id >= -1 && id <= VKMMC_MAX_SOURCES, "Optode.Source.ID must be -1, 0 or a source number");
+    vkmmc_require(id <= (double)cfg.extrasrc.size() || cfg.extrasrc.empty(), "Optode.Source.ID is larger than the number of sources");
+    cfg.srcid = cfg.extrasrc.empty() ? 0 : ((id <= 0) ? -1 : (int)id);
+
+    cfg.srcnum = (int)json_num_range(src, "SrcNum", 1, 1, VKMMC_MAX_PATTERNS, "Optode.Source");
+    cfg.srcpattern.clear();
+
+    if (src.contains("Pattern") && (cfg.srctype == SRC_PATTERN || cfg.srctype == SRC_PATTERN3D)) {
+        load_pattern(src["Pattern"], cfg);
+        vkmmc_require(cfg.srcnum <= VKMMC_MAX_PATTERNS, "Optode.Source.Pattern has more than "
+                      + std::to_string(VKMMC_MAX_PATTERNS) + " patterns");
+    }
+
+    check_source(cfg);
+}
+
 static SimConfig load_json_config(const json& j) {
     SimConfig cfg;
 
@@ -1237,62 +1547,9 @@ static SimConfig load_json_config(const json& j) {
 
     // Optode / Source
     if (j.contains("Optode") && j["Optode"].is_object() && j["Optode"].contains("Source")) {
-        const json& src = j["Optode"]["Source"];
-        vkmmc_require(src.is_object(), "Optode.Source must be an object");
-        std::string tname = json_str(src, "Type", "pencil", "Optode.Source");
-        cfg.srctype = parse_srctype(tname);
-        vkmmc_require(cfg.srctype >= 0, "Optode.Source.Type '" + tname + "' is not a known source type");
-        vkmmc_require(srctype_supported(cfg.srctype),
-                      "Optode.Source.Type '" + tname + "' is not supported yet (use pencil, planar or disk)");
-
-        if (src.contains("Pos")) {
-            std::vector<double> p = json_vec(src["Pos"], 3, 3, "Optode.Source.Pos");
-
-            for (int i = 0; i < 3; i++) {
-                vkmmc_require(std::fabs(p[i]) <= VKMMC_MAX_COORD, "Optode.Source.Pos is beyond +-1e6 length units");
-                cfg.srcpos[i] = (float)p[i];
-            }
-        }
-
-        if (src.contains("Dir")) {
-            std::vector<double> p = json_vec(src["Dir"], 3, 4, "Optode.Source.Dir");
-
-            for (size_t i = 0; i < p.size(); i++) {
-                cfg.srcdir[i] = (float)p[i];
-            }
-        }
-
-        if (src.contains("Param1")) {
-            std::vector<double> p = json_vec(src["Param1"], 1, 4, "Optode.Source.Param1");
-
-            for (size_t i = 0; i < p.size(); i++) {
-                vkmmc_require(std::fabs(p[i]) <= VKMMC_MAX_COORD, "Optode.Source.Param1 is beyond +-1e6");
-                cfg.srcparam1[i] = (float)p[i];
-            }
-        }
-
-        if (src.contains("Param2")) {
-            std::vector<double> p = json_vec(src["Param2"], 1, 4, "Optode.Source.Param2");
-
-            for (size_t i = 0; i < p.size(); i++) {
-                vkmmc_require(std::fabs(p[i]) <= VKMMC_MAX_COORD, "Optode.Source.Param2 is beyond +-1e6");
-                cfg.srcparam2[i] = (float)p[i];
-            }
-        }
-
-        if (cfg.srctype == SRC_DISK) {
-            vkmmc_require(cfg.srcparam1[0] >= 0, "Optode.Source.Param1[0] (disk radius) must be non-negative");
-        }
-    }
-
-    {
-        double l = std::sqrt((double)cfg.srcdir[0] * cfg.srcdir[0] + (double)cfg.srcdir[1] * cfg.srcdir[1] +
-                             (double)cfg.srcdir[2] * cfg.srcdir[2]);
-        vkmmc_require(l > 1e-10, "Optode.Source.Dir must be a non-zero vector");
-
-        for (int i = 0; i < 3; i++) {
-            cfg.srcdir[i] = (float)(cfg.srcdir[i] / l);
-        }
+        load_source(j["Optode"]["Source"], cfg);
+    } else {
+        normalize_srcdir(cfg.srcdir, "Optode.Source.Dir");
     }
 
     // Shapes
