@@ -53,6 +53,13 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set(VKMMC_WARNINGS -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 endif()
 
+if(MSVC)
+    # the JSON library needs more object sections; silence the "unsafe CRT" notes
+    add_compile_options(/bigobj /utf-8)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE NOMINMAX)
+    set(VKMMC_WARNINGS /W3)
+endif()
+
 # ---------------------------------------------------------------
 # zmat (zlib/gzip only) with miniz or the system zlib
 # ---------------------------------------------------------------
@@ -212,7 +219,7 @@ if(BUILD_OPTIX)
     add_executable(vkmmc_optix ${PROJECT_SOURCE_DIR}/optix/vkmmc_optix.cpp ${GEN}/vkmmc_optix_ptx.h)
     target_include_directories(vkmmc_optix PRIVATE ${GEN} ${OPTIX_INCLUDE_DIR})
     target_link_libraries(vkmmc_optix PRIVATE vkmmc_host CUDA::cudart_static ${CMAKE_DL_LIBS})
-    target_compile_options(vkmmc_optix PRIVATE -Wall -Wno-missing-field-initializers)
+    target_compile_options(vkmmc_optix PRIVATE ${VKMMC_WARNINGS})
     vkmmc_static_runtime(vkmmc_optix)
     install(TARGETS vkmmc_optix RUNTIME DESTINATION bin)
 endif()

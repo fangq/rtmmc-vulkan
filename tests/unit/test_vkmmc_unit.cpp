@@ -29,9 +29,26 @@
 #include <string>
 #include <vector>
 #include <fcntl.h>
-#include <ftw.h>
 #include <sys/stat.h>
-#include <unistd.h>
+
+#ifdef _WIN32
+    #include <direct.h>
+    #include <io.h>
+    #define dup _dup
+    #define dup2 _dup2
+    #define close _close
+    #define open _open
+    #define VKMMC_DEVNULL "NUL"
+#else
+    #include <ftw.h>
+    #include <unistd.h>
+    #define VKMMC_DEVNULL "/dev/null"
+    #define O_BINARY 0
+#endif
+
+#ifndef M_PI
+    #define M_PI 3.14159265358979323846
+#endif
 
 // ============================================================================
 // Minimal test framework
@@ -300,23 +317,65 @@ static double lens_volume(double R, double Df, double Rf, double Db, double Rb) 
 /* temporary directory for file-writing tests, removed at exit */
 static std::string g_tmpdir;
 
+#ifdef _WIN32
+/* the tests only write plain files into the temporary directory */
+static void remove_tmpdir(const std::string& dir) {
+    struct _finddata_t fd;
+    intptr_t h = _findfirst((dir + "/*").c_str(), &fd);
+
+    if (h != -1) {
+        do {
+            if (!(fd.attrib & _A_SUBDIR)) {
+                remove((dir + "/" + fd.name).c_str());
+            }
+        } while (_findnext(h, &fd) == 0);
+
+        _findclose(h);
+    }
+
+    _rmdir(dir.c_str());
+}
+#else
 static int rm_entry(const char* path, const struct stat*, int, struct FTW*) {
     return remove(path);
 }
 
+static void remove_tmpdir(const std::string& dir) {
+    nftw(dir.c_str(), rm_entry, 16, FTW_DEPTH | FTW_PHYS);
+}
+#endif
+
 static const std::string& tmpdir() {
     if (g_tmpdir.empty()) {
+#ifdef _WIN32
+        const char* base = getenv("TEMP");
+        base = (base && *base) ? base : ".";
+        std::random_device rd;
+
+        for (int k = 0; k < 100 && g_tmpdir.empty(); k++) {
+            std::string p = std::string(base) + "/vkmmc_unit." + std::to_string(rd());
+
+            if (_mkdir(p.c_str()) == 0) {
+                g_tmpdir = p;
+            }
+        }
+
+#else
         const char* base = getenv("TMPDIR");
         std::string tpl = std::string(base && *base ? base : "/tmp") + "/vkmmc_unit.XXXXXX";
         std::vector<char> buf(tpl.begin(), tpl.end());
         buf.push_back('\0');
 
-        if (!mkdtemp(buf.data())) {
+        if (mkdtemp(buf.data())) {
+            g_tmpdir = buf.data();
+        }
+
+#endif
+
+        if (g_tmpdir.empty()) {
             fprintf(stderr, "cannot create a temporary directory\n");
             exit(2);
         }
-
-        g_tmpdir = buf.data();
     }
 
     return g_tmpdir;
@@ -345,7 +404,7 @@ template<class F> static std::string capture_stdout(F fn) {
     std::string path = tmpfile_path("stdout_capture.txt");
     fflush(stdout);
     int saved = dup(1);
-    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0600);
     dup2(fd, 1);
     close(fd);
 
@@ -2940,7 +2999,7 @@ int main(int argc, char** argv) {
     setvbuf(g_out, NULL, _IONBF, 0);
 
     if (!verbose) {
-        int devnull = open("/dev/null", O_WRONLY);
+        int devnull = open(VKMMC_DEVNULL, O_WRONLY);
         fflush(stdout);
         dup2(devnull, 1);
         close(devnull);
@@ -2978,7 +3037,7 @@ int main(int argc, char** argv) {
             g_checks, g_checks - g_failed_checks, g_failed_checks);
 
     if (!g_tmpdir.empty()) {
-        nftw(g_tmpdir.c_str(), rm_entry, 16, FTW_DEPTH | FTW_PHYS);
+        remove_tmpdir(g_tmpdir);
     }
 
     fflush(stdout);

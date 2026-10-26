@@ -325,8 +325,8 @@ void list_vulkan_gpus() {
 
         printf("============ GPU device ID %d [%zu of %zu]: %s %s============\n", ok ? did : 0, j + 1, pds.size(),
                pr.deviceName, ok ? "" : "(not usable) ");
-        printf(" Vendor ID      :\t0x%04x\n Device type    :\t%s\n Global memory  :\t%lu B\n", pr.vendorID,
-               dt[pr.deviceType < 5 ? pr.deviceType : 0], (unsigned long)tm);
+        printf(" Vendor ID      :\t0x%04x\n Device type    :\t%s\n Global memory  :\t%llu B\n", pr.vendorID,
+               dt[pr.deviceType < 5 ? pr.deviceType : 0], (unsigned long long)tm);
         printf(" Ray query      :\t%s\n Accel structure:\t%s\n Int64 atomics  :\t%s\n", rq ? "Yes" : "No",
                as ? "Yes" : "No", af ? "Yes" : "No");
     }
@@ -729,7 +729,7 @@ static AccelStruct build_blas(VulkanCtx& ctx, const SimConfig& cfg) {
     destroy_buf(ctx, scratch);
     destroy_buf(ctx, vb);
     destroy_buf(ctx, ib);
-    printf("BLAS: %u triangles, %lu KB\n", pc, (unsigned long)(sz.accelerationStructureSize / 1024));
+    printf("BLAS: %u triangles, %llu KB\n", pc, (unsigned long long)(sz.accelerationStructureSize / 1024));
     return blas;
 }
 
@@ -885,7 +885,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
     bool batch_readback = (outBytes <= VKMMC_BATCH_READBACK_BYTES);
     std::vector<double> acc;
     std::vector<uint64_t> raw(g.nelem);
-    printf("Threads: %u (%u x 64), batch: %lu photons\n", tt, wg, (unsigned long)batchsz);
+    printf("Threads: %u (%u x 64), batch: %llu photons\n", tt, wg, (unsigned long long)batchsz);
 
     typedef std::chrono::high_resolution_clock Clk;
     double kms = 0;
@@ -918,7 +918,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
             end_submit(ctx, zcmd);
         }
 
-        printf("  batch %d: %lu photons (%lu/%lu)\n", batch, (unsigned long)bp, (unsigned long)pdone, (unsigned long)cfg.nphoton);
+        printf("  batch %d: %llu photons (%llu/%llu)\n", batch, (unsigned long long)bp, (unsigned long long)pdone, (unsigned long long)cfg.nphoton);
     }
 
     double tms = std::chrono::duration<double, std::milli>(Clk::now() - t0sim).count();

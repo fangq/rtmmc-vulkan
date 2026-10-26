@@ -546,10 +546,10 @@ static std::vector<float> finalize_output(const SimConfig& cfg, const OutputGrid
     }
 
     if (cfg.output_type == OT_ENERGY) {
-        printf("simulated %lu photons, absorbed: %.5f%%\n", (unsigned long)cfg.nphoton,
+        printf("simulated %llu photons, absorbed: %.5f%%\n", (unsigned long long)cfg.nphoton,
                total / (double)cfg.nphoton * 100.0);
     } else {
-        printf("simulated %lu photons\n", (unsigned long)cfg.nphoton);
+        printf("simulated %llu photons\n", (unsigned long long)cfg.nphoton);
     }
 
     if (absorbed_out) {

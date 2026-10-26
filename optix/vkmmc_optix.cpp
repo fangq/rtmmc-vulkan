@@ -400,8 +400,8 @@ void build_gas(OptixState& st, const std::vector<Vec3>& nodes,
     vertBuf.free();
     idxBuf.free();
 
-    printf("GAS: %u triangles, %lu KB (compacted)\n",
-           (unsigned)faces.size(), (unsigned long)(compactSize / 1024));
+    printf("GAS: %u triangles, %llu KB (compacted)\n",
+           (unsigned)faces.size(), (unsigned long long)(compactSize / 1024));
 }
 
 /* ================================================================ */
@@ -523,7 +523,7 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
     bool batch_readback = (outSz * sizeof(uint64_t) <= VKMMC_BATCH_READBACK_BYTES);
     std::vector<double> acc;
     std::vector<uint64_t> raw(outSz);
-    printf("Threads: %u, batch: %lu photons\n", tt, (unsigned long)batchsz);
+    printf("Threads: %u, batch: %llu photons\n", tt, (unsigned long long)batchsz);
 
     typedef std::chrono::high_resolution_clock Clk;
     double kms = 0;
@@ -552,8 +552,8 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
             CUDA_CHECK(cudaMemset(outBuf.ptr, 0, outSz * sizeof(uint64_t)));
         }
 
-        printf("  batch %d: %lu photons (%lu/%lu)\n",
-               batch, (unsigned long)bp, (unsigned long)pdone, (unsigned long)cfg.nphoton);
+        printf("  batch %d: %llu photons (%llu/%llu)\n",
+               batch, (unsigned long long)bp, (unsigned long long)pdone, (unsigned long long)cfg.nphoton);
     }
 
     double tms = std::chrono::duration<double, std::milli>(Clk::now() - t0).count();
