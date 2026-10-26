@@ -1,6 +1,10 @@
 Change Log
 
 == vkmmc 0.5.0 (Kylin, beta), Qianqian Fang <q.fang at neu.edu> ==
+ 2026-10-26 [a67ecc5] [doc] README: dynamic load balancing, auto batches, deposit buffering, --atomic float
+ 2026-10-26 [72283af] [test] batch size and thread count invariance, auto batches, --atomic float
+ 2026-10-26 [abba6ee] [speed] dynamic photon claiming, per-photon RNG seeds, auto batch sizes, deposit buffering, --atomic float
+ 2026-10-26 [e42923c] [doc] update ChangeLog
  2026-10-26 [c6a1bba] [doc] README: entry conventions of outside sources, sources on a surface, DoSpecular, multi-source rows
  2026-10-26 [0909da7] [test] tests for sources outside or on a surface, DoSpecular and typed multi-source rows
  2026-10-26 [f9315db] [feature] MCX source conventions: air time, relaunch, DoSpecular, sources on a surface, typed multi-source rows
