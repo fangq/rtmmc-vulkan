@@ -245,13 +245,63 @@ The input is an MMC/MCX-style JSON file:
   rows, `mua`/`mus` in 1/mm; up to 256 media, medium 0 is the background and its
   `n` is used outside the domain), `LengthUnit`, `Step` (output voxel size in
   length units, default 1), `MeshRes`
-* `Optode.Source`: `Type` (`pencil`, `planar`, `disk`), `Pos`, `Dir` (normalized
-  internally), `Param1`/`Param2` (planar: the two edge vectors of the
-  quadrilateral; disk: `Param1[0]` is the radius)
+* `Optode.Source`: `Type`, `Pos`, `Dir` (normalized internally; `Dir[3]` is
+  the focal length), `Param1`, `Param2`, `Pattern`, `SrcNum`, `ID`, see
+  [Sources](#sources)
 * `Shapes`: a list of CSG shapes, or a mesh object (see below)
 
 A source outside the domain launches photons toward it; they enter at the
 first surface they hit, with Fresnel reflection when the indices differ.
+
+### Sources
+
+All 18 MCX/MMC source types are implemented and sampled as in MMC, with the
+same `Param1`/`Param2` conventions (see the MCX documentation for details):
+
+| `Type` | launch | `Param1` / `Param2` |
+|--------|--------|---------------------|
+| `pencil` | from `Pos` along `Dir` | |
+| `isotropic` | uniform over 4pi | |
+| `cone` | uniform within a cone around `Dir` | `[half angle (rad), 0: uniform in solid angle, >0: in angle]` |
+| `arcsine` | zenith angle uniform in [0, pi] around `Dir` | |
+| `zgaussian` | Gaussian zenith angle around `Dir` | `[sigma (rad)]` |
+| `gaussian` | Gaussian beam profile | `[waist radius]`; with a focal length `[waist, wavelength]` |
+| `disk`, `ring` | uniform disk / annulus perpendicular to `Dir` | `[outer radius, inner radius, phi0, phi1]` (ring: optional arc) |
+| `hyperboloid` | hyperboloid Gaussian beam | `[waist radius, distance to the waist, Rayleigh range]` |
+| `planar` | uniform over the parallelogram `Pos + u Param1 + v Param2` | edge vectors |
+| `pattern` | `planar` weighted by an image | edge vectors; `Param1[3]` x `Param2[3]` pixels |
+| `pattern3d` | box `Pos + Param1[0..2]` weighted by a volume | `[nx, ny, nz]`: the size and the pattern dimensions |
+| `fourier` | `planar` weighted by (1+cos(2pi (kx u + ky v) + phi))/2 | `Param1[3] = kx + phi/2pi`, `Param2[3] = ky + M` |
+| `fourierx`, `fourierx2d` | as `fourier`, the 2nd edge is `Dir x Param1` | `[edge1, |edge2|]` / `[kx, ky, phi0, M]` or `[kx, ky, phix, phiy]` |
+| `pencilarray` | `Param1[3]` x `Param2[3]` pencil beams over the parallelogram | edge vectors and beam counts |
+| `line` | a segment from `Pos` along `Param1`, emitting perpendicular to `Dir` | segment vector |
+| `slit` | the same segment, emitting along `Dir` | segment vector |
+
+* Focal length `Dir[3]`: wide-field beams (planar, pattern, fourier, disk,
+  slit, ...) converge to (>0) or diverge from (<0) the point at that distance
+  from the source center; `"_NaN_"` launches each photon isotropically and
+  `"-_Inf_"` with a Lambertian (cosine) distribution.
+* `Pattern`: a JData array `[Nx, Ny]` (`[Nx, Ny, Nz]` for `pattern3d`), read
+  with the first index fastest as MMC does, or `{"Nx", "Ny", "Nz", "Data"}`
+  with `Data` a flat array or a float32 file name. Values are in [0, 1000].
+* Shared patterns (photon sharing): a `[SrcNum, Nx, Ny]` pattern, or
+  `SrcNum` > 1, simulates SrcNum patterns with the same photons; the output has
+  one field per pattern.
+* Multiple sources: `Pos`, `Dir`, `Param1`, `Param2` given as lists of rows
+  (a single row applies to all); `Pos[3]` is the source weight (default 1) and
+  `Param1[0]` an optional disk radius. `ID` 0 (or -1) launches each photon
+  from a random source and saves one field per source, `ID` k simulates
+  source k only.
+* The output is normalized by the launched energy (the sum of the launch
+  weights; per pattern for shared patterns), and the printed absorbed
+  fraction is relative to it.
+* `InitElem` gives the initial medium of a single source with a fixed launch
+  direction; otherwise the medium is found per photon, so a source on the
+  surface loses the photons that point out of it.
+
+Differences to mmc's OptiX backend: the `cone`, `arcsine` and `zgaussian`
+directions are rotated to `Dir` (as in mmc's CPU and MCX; mmc-optix leaves
+them around +z), and `cone` is sampled directly instead of by rejection.
 
 ### CSG shapes
 
@@ -290,6 +340,10 @@ does not reproduce the CSG overlap rules.
   points out of the region of its label.
 * `InitElem`: optional 1-based element that contains the source (`MeshElem` only)
 
+Negative labels (MMC's wide-field source and detector domains, -1/-2) are the
+background (medium 0); the surfaces of the tissue are extracted from the rest.
+The implicit MMC (`MeshROI`) is not supported.
+
 Arrays may be inline JSON arrays or JData objects with any `_ArrayType_`
 (`single`, `double`, `int8`-`uint64`), compressed by `zlib`, `gzip` or stored as
 `base64` or plain `_ArrayData_`, in row- or column-major (`_ArrayOrder_: "c"`)
@@ -308,8 +362,10 @@ voxel of margin; `Domain.Origin` in the output gives the corner of voxel
 `<session>.jdat` is a JSON file with `Session`, `Forward`, `Domain` (`Dim`,
 `VoxelSize`, `Origin`, `LengthUnit`) and `Fluence`: a JData array of
 `[nx, ny, nz(, nt)]` single-precision values stored x-fastest
-(`_ArrayOrder_: "c"`). It loads directly with `jd.load()` (pyjdata) or
-`loadjd()` (JSONLab). With `DoNormalize`, the values are per launched photon:
+(`_ArrayOrder_: "c"`), `[nx, ny, nz, nt, nfield]` for several fields (shared
+patterns, multiple sources). It loads directly with `jd.load()` (pyjdata) or
+`loadjd()` (JSONLab). With `DoNormalize`, the values are per unit of launched
+energy (per launched photon for unit-weight sources):
 
 | OutputType | quantity | unit |
 |------------|----------|------|
@@ -379,14 +435,13 @@ builds the release package in manylinux2014.
 Known issues and limitations
 ----------------------------
 
-* source types: only `pencil`, `planar` and `disk` are implemented; other
-  MCX/MMC source types are rejected
 * CSG: Tags 1-64 and at most 8 nested shapes enclosing one point; coincident
   flat faces (adjacent layers, boxes flush with the Grid) are handled exactly,
   coincident curved surfaces (e.g. two identical spheres) are not
 * coordinates are limited to +-1e6 length units, times to 1e-15-1 s
 * trajectories (`-D M`) are saved by the Vulkan backend only
-* detected photons/detectors, replay and multiple sources are not implemented
+* detected photons/detectors, replay, the adjoint outputs and implicit MMC
+  (`MeshROI`) are not implemented
 * the voxel grid starts half a voxel below the mesh bounding box, so voxel
   centers lie on the box minimum plus multiples of the voxel size (for a
   `Grid` from 0, at integer coordinates); MCX voxel centers are offset by half
