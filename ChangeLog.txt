@@ -1,6 +1,11 @@
 Change Log
 
 == vkmmc 0.5.0 (Kylin, beta), Qianqian Fang <q.fang at neu.edu> ==
+ 2026-10-26 [c6a1bba] [doc] README: entry conventions of outside sources, sources on a surface, DoSpecular, multi-source rows
+ 2026-10-26 [0909da7] [test] tests for sources outside or on a surface, DoSpecular and typed multi-source rows
+ 2026-10-26 [f9315db] [feature] MCX source conventions: air time, relaunch, DoSpecular, sources on a surface, typed multi-source rows
+ 2026-10-26 [6f1a99d] [speed] compile only the source code a run uses: specialization constants and bound values
+ 2026-10-26 [796dd4f] [doc] update ChangeLog
  2026-10-26 [5604903] [doc] README: the source types, patterns, multiple sources and the launched-energy normalization
  2026-10-26 [074a738] [test] unit, functional and fuzz tests for the source types
  2026-10-26 [16332d2] [feature] all 18 MCX/MMC source types, shared patterns and multiple sources
