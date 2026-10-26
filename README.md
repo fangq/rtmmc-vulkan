@@ -6,6 +6,8 @@ Ray-Tracing Mesh-based Monte Carlo (RT-MMC) - Vulkan and OptiX
 -   Version: 0.5.0 (Kylin, beta)
 -   URL: <https://github.com/fangq/rtmmc-vulkan>
 
+![Build and test](https://github.com/fangq/rtmmc-vulkan/actions/workflows/build.yml/badge.svg)
+
 Table of Content:
 
   * [What's New](#whats-new)
@@ -87,16 +89,30 @@ later/higher-tagged shapes override the ones they overlap, as in MCX.
 Requirements
 ------------
 
-* Vulkan backend (`vkmmc`): a GPU and driver with `VK_KHR_ray_query` and
-  `VK_KHR_acceleration_structure` (NVIDIA RTX 20xx or newer, AMD RX 6000 or newer
-  with RADV, Intel Arc); the Vulkan headers and loader (`libvulkan-dev`) and
-  `glslangValidator` (`glslang-tools`); 64-bit shader atomics are used when
-  available and emulated otherwise
-* OptiX backend (`vkmmc_optix`): an NVIDIA GPU, the CUDA toolkit and the OptiX 7
-  SDK (`OPTIX_DIR`, default `/usr/local/optix`)
-* a C++11 compiler, GNU make and `xxd`
+Building:
+
+* a C++11 compiler, and GNU make or CMake 3.17 or newer
+* Vulkan backend (`vkmmc`): the Vulkan headers and loader (`libvulkan-dev`) and
+  `glslangValidator` (`glslang-tools`); `xxd` for the Makefile build
+* OptiX backend (`vkmmc_optix`): the CUDA toolkit (11.7 or newer; only `nvcc`,
+  the runtime and cccl are used) and the OptiX 7 headers only, e.g.
+  `git clone -b v7.5.0 https://github.com/NVIDIA/optix-dev`; no OptiX SDK
+  installation is needed
 * optional: GLFW 3 for the `--show` viewer; zlib (otherwise the bundled miniz is
   used); python3 for the tests; clang for the fuzzers
+
+Running:
+
+* `vkmmc`: `libvulkan.so.1` (the Vulkan loader) and a driver with
+  `VK_KHR_ray_query` and `VK_KHR_acceleration_structure`: NVIDIA RTX 20xx or
+  newer, AMD RX 6000 or newer with RADV, Intel Arc, or Mesa's CPU driver
+  lavapipe (tested with Mesa 25.0 and 26.0); 64-bit shader atomics are used
+  when available and emulated otherwise
+* `vkmmc_optix`: an NVIDIA GPU and driver; OptiX comes with the driver and the
+  CUDA runtime is linked statically. A binary built with the OptiX 7.5 headers
+  needs driver R515 or newer; newer headers need newer drivers
+* both: glibc and, unless built with `STATIC=1`, libstdc++; the kernels are
+  embedded, so no other files are needed
 
 `vkmmc -L` lists the Vulkan devices and whether each can run vkmmc.
 
@@ -104,22 +120,39 @@ Requirements
 Download and Compile
 --------------------
 
+With make:
+
 ```
 git clone https://github.com/fangq/rtmmc-vulkan.git
 cd rtmmc-vulkan
-make -C src              # builds bin/vkmmc
-make -C optix            # builds bin/vkmmc_optix (needs CUDA and OptiX)
+make -C src                                  # builds bin/vkmmc
+make -C optix OPTIX_DIR=/path/to/optix-dev   # builds bin/vkmmc_optix
 ```
 
-Build options (for `make -C src`, and `HAVE_ZLIB`/`DEBUG` also for `optix`):
+Build options (for `make -C src`, and `STATIC`/`HAVE_ZLIB`/`DEBUG` also for `optix`):
 
 | option          | effect                                                       |
 |-----------------|--------------------------------------------------------------|
 | `SHOW=1`        | add the interactive `--show` viewer (needs GLFW 3)           |
+| `STATIC=1`      | link libstdc++ and libgcc statically (for releases)          |
 | `HAVE_ZLIB=yes` | link the system zlib instead of the bundled miniz            |
 | `DEBUG=1`       | debug build                                                  |
+| `CUDA_DIR=`, `OPTIX_DIR=` | CUDA toolkit and OptiX headers (`optix` only)      |
 | `make asan`     | AddressSanitizer/UBSan build `bin/vkmmc_asan`                |
 | `make pretty`   | format the sources with astyle                               |
+
+With CMake (both backends; the OptiX one when CUDA and the OptiX headers are
+found):
+
+```
+cmake -S . -B build -DOPTIX_ROOT=/path/to/optix-dev
+cmake --build build -j
+ctest --test-dir build -LE gpu     # tests that need no GPU; drop -LE gpu for all
+```
+
+CMake options: `VKMMC_BUILD_VULKAN` (ON), `VKMMC_BUILD_OPTIX` (AUTO/ON/OFF),
+`OPTIX_ROOT`, `CUDAToolkit_ROOT`, `VKMMC_SHOW`, `VKMMC_USE_SYSTEM_ZLIB`,
+`VKMMC_STATIC_RUNTIME` and `VKMMC_BUILD_TESTS` (ON).
 
 No build option selects the simulation mode: the mesh, CSG and
 CSG+curvature kernels are all compiled and embedded, and the one matching the
@@ -318,6 +351,12 @@ python3 tests/fuzz/fuzz_vkmmc.py bin/vkmmc --gpu -n 1000        # ... on the GPU
   they cover 98.9% of the lines of the Vulkan front-end `vkmmc.cpp`
 * `tests/fuzz`: libFuzzer harnesses for the input pipeline, the JData decoder
   and the command line, and a JSON-aware mutation fuzzer for the binaries
+
+The GitHub Actions workflow (`.github/workflows/build.yml`) builds both
+backends with make and CMake on Ubuntu 22.04 and 24.04, runs the unit tests
+(also under ASan/UBSan), runs the complete functional suite on the CPU with
+Mesa's lavapipe Vulkan driver, builds the OptiX backend against the CUDA 11.7
+redistributables and the optix-dev headers, and replays and runs the fuzzers.
 
 
 Known issues and limitations
