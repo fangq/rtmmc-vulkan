@@ -1,7 +1,10 @@
 Change Log
 
 == vkmmc 0.5.0 (Kylin, beta), Qianqian Fang <q.fang at neu.edu> ==
+ 2026-10-27 [5a2796a] [test] add MCX, MMC and CSG benchmark inputs checked against references
+ 2026-10-26 [83b5f8b] [doc] update ChangeLog
  2026-10-26 [81e0309] [speed] remove --atomic float: the 64-bit fixed-point sums are exact and faster
+ 2026-10-26 [65ab66a] [doc] update ChangeLog
  2026-10-26 [a67ecc5] [doc] README: dynamic load balancing, auto batches, deposit buffering, --atomic float
  2026-10-26 [72283af] [test] batch size and thread count invariance, auto batches, --atomic float
  2026-10-26 [abba6ee] [speed] dynamic photon claiming, per-photon RNG seeds, auto batch sizes, deposit buffering, --atomic float
