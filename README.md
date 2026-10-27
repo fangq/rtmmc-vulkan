@@ -36,7 +36,7 @@ vkmmc 0.5.0 (Kylin) is the first, beta release of the ray-tracing (RT) accelerat
 Monte Carlo (MMC) photon transport simulator. It brings the RT-MMC algorithm,
 previously available in MMC through NVIDIA OptiX, to any GPU that supports the
 Vulkan ray-query extension (NVIDIA RTX, AMD RDNA2 and newer, Intel Arc), and
-adds shape-based (CSG) domains with curvature-corrected surface normals.
+adds shape-based (CSG) domains with curvature-corrected surface normals [Yen2026].
 
 Key features of this release
 
@@ -72,9 +72,9 @@ Introduction
 
 Mesh-based Monte Carlo (MMC) [Fang2010] models light transport in complex media
 whose boundaries are described by a triangle surface mesh. Instead of walking
-the photon from tetrahedron to tetrahedron, RT-MMC uses the GPU's ray-tracing
-hardware to find the next boundary a photon crosses along its path: the
-surface triangles are stored in a bounding volume hierarchy (BVH), each
+the photon from tetrahedron to tetrahedron, RT-MMC [Yan2026] uses the GPU's
+ray-tracing hardware to find the next boundary a photon crosses along its path:
+the surface triangles are stored in a bounding volume hierarchy (BVH), each
 propagation step is a single ray query, and the media on the two sides of each
 triangle tell the photon which medium it enters.
 
@@ -497,16 +497,24 @@ Acknowledgement
 Reference
 ---------
 
-* [Fang2010] Qianqian Fang, "Mesh-based Monte Carlo method using fast
-  ray-tracing in Plücker coordinates," Biomed. Opt. Express 1(1), 165-175 (2010),
-  https://opg.optica.org/boe/abstract.cfm?uri=boe-1-1-165
 * [Fang2026] Qianqian Fang, Fan-Yu Yen, "How 'vibe-coding' helps build a
   new-generation Monte Carlo simulator over a weekend," Finnish-French
   Workshop on Biomedical Optical Tomography, Mar. 2026, Kuopio, Finland
+* [Yen2026] Fan-Yu Yen and Qianqian Fang, "Principal-curvature-informed
+  mesh-based Monte Carlo for accurate photon transport modeling across curved
+  boundaries," Optical Tomography and Spectroscopy (OT&S), OS3D.7 (2026),
+  https://doi.org/10.1364/OTS.2026.OS3D.7
+* [Yan2026] Shijie Yan, Douglas Dwyer, David R. Kaeli and Qianqian Fang,
+  "Accelerating mesh-based Monte Carlo simulations using contemporary graphics
+  ray-tracing hardware," J. Biomed. Opt. 31(3), 035002 (2026),
+  https://doi.org/10.1117/1.JBO.31.3.035002
 * [Yan2020] Shijie Yan and Qianqian Fang, "Hybrid mesh and voxel based Monte
   Carlo algorithm for accurate and efficient photon transport modeling in
   complex bio-tissues," Biomed. Opt. Express 11(11), 6262-6270 (2020),
   https://opg.optica.org/boe/abstract.cfm?uri=boe-11-11-6262
+* [Fang2010] Qianqian Fang, "Mesh-based Monte Carlo method using fast
+  ray-tracing in Plücker coordinates," Biomed. Opt. Express 1(1), 165-175 (2010),
+  https://opg.optica.org/boe/abstract.cfm?uri=boe-1-1-165
 
-If you use vkmmc in your research, please cite [Fang2026], [Yan2020] and
-[Fang2010].
+If you use vkmmc in your research, please cite [Fang2026], [Yen2026],
+[Yan2026], [Yan2020] and [Fang2010].
