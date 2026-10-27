@@ -243,8 +243,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y glslang-tools xxd
-      - name: Compile the SPIR-V kernels on the host
-        run: make -C src vkmmc_core_spv.h
+      - name: Compile the SPIR-V kernels and viewer shaders on the host
+        run: make -C src spvheaders
       - name: Cache the Vulkan loader, CUDA and OptiX headers
         uses: actions/cache@v4
         with:

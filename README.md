@@ -132,11 +132,13 @@ backends) are attached to the GitHub releases and to every CI run. They are
 built in the manylinux2014 image (CentOS 7), link libstdc++, libgcc and the
 CUDA runtime statically, and run on any x86-64 Linux with glibc 2.17 or newer
 (tested on CentOS 7, Ubuntu 16.04 and 22.04); `vkmmc` also needs the
-distribution's Vulkan loader (`libvulkan1` or `vulkan-loader`). To build them
-locally:
+distribution's Vulkan loader (`libvulkan1` or `vulkan-loader`). `vkmmc`
+includes the `--show` viewer with GLFW linked statically; it loads libX11
+only when a window is opened, so simulations run on headless machines. To
+build them locally:
 
 ```
-make -C src vkmmc_core_spv.h      # SPIR-V needs a recent glslang, on the host
+make -C src spvheaders            # SPIR-V needs a recent glslang, on the host
 docker run --rm -e HOST_UID=$(id -u) -v $PWD:/src -w /src \
     quay.io/pypa/manylinux2014_x86_64 bash .github/ci/manylinux_build.sh
 ```

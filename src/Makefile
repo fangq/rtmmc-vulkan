@@ -6,6 +6,7 @@
 #  make HAVE_ZLIB=yes link the system zlib instead of the bundled miniz
 #  make DEBUG=1       debug build (-g -O0)
 #  make STATIC=1      link libstdc++/libgcc statically (for releases)
+#  make spvheaders    compile the embedded kernels and viewer shaders only
 #  make test          run the functional tests (needs a ray-query GPU)
 #  make unittest      build and run the host-side unit tests (no GPU needed)
 #  make fuzz          build the libFuzzer harnesses (needs clang)
@@ -74,12 +75,12 @@ ifdef SHOW
     HEADERS   += vkmmc_show.h $(SHOW_DEPS)
 endif
 
-.PHONY: all clean test unittest fuzz asan listgpu help pretty
+.PHONY: all clean test unittest fuzz asan listgpu help pretty spvheaders
 
 all: $(BINARY)
 
 help:
-	@sed -n '2,17p' Makefile
+	@sed -n '2,18p' Makefile
 
 $(BINARY): $(SOURCES) $(HEADERS) $(SHADER_HEADER) $(ZMATOBJS)
 	@mkdir -p $(BINDIR)
@@ -115,6 +116,10 @@ vkmmc_show_vol_vert.spv: vkmmc_show_vol.vert
 
 vkmmc_show_vol_frag.spv: vkmmc_show_vol.frag
 	$(GLSLC) $(GLSLFLAGS) -S frag -o $@ $<
+
+# the SPIR-V headers for builds without glslang, e.g. in manylinux2014
+spvheaders: $(SHADER_HEADER) vkmmc_show_vert_spv.h vkmmc_show_frag_spv.h \
+            vkmmc_show_vol_vert_spv.h vkmmc_show_vol_frag_spv.h
 
 %_spv.h: %.spv
 	$(XXD) -i $< | sed 's/^unsigned char/alignas(4) unsigned char/' > $@
