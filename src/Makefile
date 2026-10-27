@@ -61,7 +61,7 @@ VARIANT_mesh    :=
 VARIANT_csg     := -DUSE_CSG
 VARIANT_curv    := -DUSE_CSG -DUSE_CURVATURE
 VARIANTS        := mesh csg curv
-SPVS            := $(foreach v,$(VARIANTS),vkmmc_core_$(v).spv vkmmc_core_$(v)_i64.spv vkmmc_core_$(v)_f32.spv)
+SPVS            := $(foreach v,$(VARIANTS),vkmmc_core_$(v).spv vkmmc_core_$(v)_i64.spv)
 
 # Interactive viewer support
 ifdef SHOW
@@ -92,12 +92,9 @@ zmat/zmatlib.o: zmat/zmatlib.c zmat/zmatlib.h
 zmat/miniz/miniz.o: zmat/miniz/miniz.c zmat/miniz/miniz.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# one SPIR-V per variant; *_i64 variants use native 64-bit integer atomics, *_f32 float atomics
+# one SPIR-V per variant; *_i64 variants use native 64-bit integer atomics
 vkmmc_core_%_i64.spv: $(COMP_SRC)
 	$(GLSLC) $(GLSLFLAGS) $(VARIANT_$*) -DUSE_ATOMIC_INT64 -o $@ $<
-
-vkmmc_core_%_f32.spv: $(COMP_SRC)
-	$(GLSLC) $(GLSLFLAGS) $(VARIANT_$*) -DUSE_ATOMIC_FLOAT -o $@ $<
 
 vkmmc_core_%.spv: $(COMP_SRC)
 	$(GLSLC) $(GLSLFLAGS) $(VARIANT_$*) -o $@ $<

@@ -55,7 +55,7 @@ Key features of this release
   time-gate boundaries, and sums are accumulated as 64-bit fixed-point integers,
   so results do not lose precision with the photon count and runs are
   bit-reproducible for a given seed and GPU, whatever the thread count and
-  batch size (`--atomic float` trades this for speed)
+  batch size
 * dynamic load balancing: GPU threads claim photons from a shared counter, and
   kernel launches are sized automatically
 * time-resolved energy, fluence and flux output, saved as JData (`.jdat`) files
@@ -225,7 +225,6 @@ The run prints the absorbed fraction and the speed, and saves the volume to
 | `-U/--normalize 0\|1` | normalize the output | `Session.DoNormalize` |
 | `-t/--thread num` | total GPU threads, rounded up to a multiple of 64 | 131072 |
 | `-B/--batch num` | photons per kernel launch (0: all at once) | auto |
-| `--atomic fixed\|float` | output sums: exact 64-bit fixed point, or float (faster on large grids, not bit-reproducible) | fixed |
 | `-G/--gpuid id` | Vulkan: 1-based index among usable devices (0: auto, prefers a discrete GPU); OptiX: CUDA device | 0 |
 | `-m/--meshres num` | tessellation of curved shapes, 4-2048 | `Domain.MeshRes`, 24 |
 | `-c/--curv -1\|0\|1` | curvature-corrected normals (-1: on for curved shapes) | -1 |
@@ -427,12 +426,11 @@ Accuracy and reproducibility
 * deposits are summed in registers while a photon stays in one voxel and time
   gate and written when it leaves, which saves most atomic additions in
   scattering media with voxels larger than the scattering length
-* `--atomic float` accumulates float sums instead (as MCX does): half the
-  memory traffic, up to 2-3 times faster on grids that do not fit in the GPU
-  cache, but the order of the additions changes the last digits from run to
-  run. The Vulkan backend needs `VK_EXT_shader_atomic_float`
-  (`shaderBufferFloat32AtomicAdd`, shown by `-L`) and otherwise falls back to
-  fixed point with a warning
+* float atomics were tried and dropped: a plain float sum stops absorbing
+  small deposits once it is large (the source voxel of a pencil beam lost over
+  half its value in a 1e8-photon launch), and a compensated float pair, as
+  accurate as needed, was slower than the 64-bit integer sums on every GPU
+  tested (RTX 2080 SUPER, 4090, 5090)
 * straight-path absorption, Fresnel transmission and time of flight agree
   with the analytic values to within the float precision of the geometry
 * the Vulkan and OptiX backends use the same algorithms and agree within the

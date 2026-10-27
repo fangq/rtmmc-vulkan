@@ -63,7 +63,6 @@ struct VKMMCParam {
     int focus_mode;               /* 0 none, 1 focused, 2 isotropic, 3 Lambertian */
     unsigned int do_tally;        /* tally the launched energy (sources with varying weights) */
     unsigned int do_specular;     /* Fresnel reflection where a photon from outside enters */
-    unsigned int float_atomic;    /* --atomic float: float sums instead of 64-bit fixed point */
     Medium media[MAX_PROP];
 };
 
@@ -410,13 +409,9 @@ __device__ __forceinline__ float3 get_normal(int primid, float3 hit_pos, float4 
 
 #define FIXED_SCALE 4294967296.f
 
-/* add a deposit as an unsigned 64-bit fixed-point sum, or a float (--atomic float), see vkmmc_core.comp */
+/* add a deposit as an unsigned 64-bit fixed-point sum, see vkmmc_core.comp */
 __device__ __forceinline__ void atomic_add_out(unsigned int idx, float val) {
-    if (gcfg.float_atomic) {
-        atomicAdd((float*)gcfg.outputbuf + idx, val);
-    } else {
-        atomicAdd((unsigned long long*)gcfg.outputbuf + idx, (unsigned long long)(val * FIXED_SCALE + 0.5f));
-    }
+    atomicAdd((unsigned long long*)gcfg.outputbuf + idx, (unsigned long long)(val * FIXED_SCALE + 0.5f));
 }
 
 /* the photon's slot: its output field (multi-source) or its pattern pixel (shared patterns) */

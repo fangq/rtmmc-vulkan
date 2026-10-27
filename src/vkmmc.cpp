@@ -90,7 +90,6 @@ struct VulkanCtx {
     PFN_vkCmdBuildAccelerationStructuresKHR pfnCmdBuildAS;
     PFN_vkGetAccelerationStructureDeviceAddressKHR pfnGetASAddr;
     bool atomic64;              /* native 64-bit integer atomics on storage buffers */
-    bool atomicf;               /* float atomic add on storage buffers, enabled (--atomic float) */
     uint32_t max_wg_count;      /* maxComputeWorkGroupCount[0] */
 };
 struct Buffer {
@@ -269,19 +268,6 @@ static bool device_usable(VkPhysicalDevice pd) {
     return true;
 }
 
-/* does the device support float atomic add on storage buffers (--atomic float)? */
-static bool device_atomicf(VkPhysicalDevice pd) {
-    if (!has_extension(device_extensions(pd), VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
-        return false;
-    }
-
-    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT af = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
-    VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    f2.pNext = &af;
-    vkGetPhysicalDeviceFeatures2(pd, &f2);
-    return af.shaderBufferFloat32AtomicAdd == VK_TRUE;
-}
-
 /* does the device support 64-bit integer atomics on storage buffers? */
 static bool device_atomic64(VkPhysicalDevice pd) {
     VkPhysicalDeviceShaderAtomicInt64Features i64 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
@@ -331,7 +317,7 @@ void list_vulkan_gpus() {
         bool rq = has_extension(exts, VK_KHR_RAY_QUERY_EXTENSION_NAME);
         bool as = has_extension(exts, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         bool ok = device_usable(pds[j]);
-        bool af = device_atomic64(pds[j]), aff = device_atomicf(pds[j]);
+        bool af = device_atomic64(pds[j]);
         uint64_t tm = 0;
 
         for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
@@ -347,16 +333,15 @@ void list_vulkan_gpus() {
                pr.deviceName, ok ? "" : "(not usable) ");
         printf(" Vendor ID      :\t0x%04x\n Device type    :\t%s\n Global memory  :\t%llu B\n", pr.vendorID,
                dt[pr.deviceType < 5 ? pr.deviceType : 0], (unsigned long long)tm);
-        printf(" Ray query      :\t%s\n Accel structure:\t%s\n Int64 atomics  :\t%s\n Float atomics  :\t%s\n",
-               rq ? "Yes" : "No", as ? "Yes" : "No", af ? "Yes" : "No", aff ? "Yes" : "No");
+        printf(" Ray query      :\t%s\n Accel structure:\t%s\n Int64 atomics  :\t%s\n", rq ? "Yes" : "No",
+               as ? "Yes" : "No", af ? "Yes" : "No");
     }
 
     vkDestroyInstance(inst, NULL);
 }
 
-/* gpuid: 1-based index among usable devices (as listed by -L), 0 = auto (prefer discrete);
-   floatatomic enables float atomics if the device has them */
-VulkanCtx init_vulkan(int gpuid, bool floatatomic = false) {
+/* gpuid: 1-based index among usable devices (as listed by -L), 0 = auto (prefer discrete) */
+VulkanCtx init_vulkan(int gpuid) {
     VulkanCtx c;
     memset(&c, 0, sizeof(c));
     c.instance = create_instance();
@@ -426,15 +411,9 @@ VulkanCtx init_vulkan(int gpuid, bool floatatomic = false) {
     qci.pQueuePriorities = &prio;
     /* VKMMC_NO_ATOMIC64=1 forces the portable 32-bit atomic kernels (for testing) */
     c.atomic64 = device_atomic64(c.physDev) && getenv("VKMMC_NO_ATOMIC64") == NULL;
-    c.atomicf = floatatomic && device_atomicf(c.physDev);
-
-    if (floatatomic && !c.atomicf) {
-        fprintf(stderr, "vkmmc WARNING: the GPU has no float atomics on storage buffers; using fixed-point sums\n");
-    }
 
     const char* devExts[] = {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, VK_KHR_RAY_QUERY_EXTENSION_NAME,
-                             VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
-                             VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME
+                             VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME
                             };
     VkPhysicalDeviceFeatures f10 = {};
     f10.shaderInt64 = c.atomic64 ? VK_TRUE : VK_FALSE;
@@ -442,10 +421,7 @@ VulkanCtx init_vulkan(int gpuid, bool floatatomic = false) {
     i64.shaderBufferInt64Atomics = VK_TRUE;
     VkPhysicalDeviceBufferDeviceAddressFeatures bda = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
     bda.bufferDeviceAddress = VK_TRUE;
-    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT aff = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
-    aff.shaderBufferFloat32AtomicAdd = VK_TRUE;
-    i64.pNext = c.atomicf ? (void*)&aff : NULL;
-    bda.pNext = c.atomic64 ? (void*)&i64 : (c.atomicf ? (void*)&aff : NULL);
+    bda.pNext = c.atomic64 ? (void*)&i64 : NULL;
     VkPhysicalDeviceAccelerationStructureFeaturesKHR asf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     asf.accelerationStructure = VK_TRUE;
     asf.pNext = &bda;
@@ -455,7 +431,7 @@ VulkanCtx init_vulkan(int gpuid, bool floatatomic = false) {
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = c.atomicf ? 5 : 4;
+    dci.enabledExtensionCount = 4;
     dci.ppEnabledExtensionNames = devExts;
     dci.pEnabledFeatures = &f10;
     dci.pNext = &rqf;
@@ -703,20 +679,14 @@ struct SpirvBlob {
     unsigned int len;
 };
 
-/* [variant][32-bit pair, native 64-bit, float atomics] — see the Makefile */
-static SpirvBlob embedded_kernel(int variant, bool atomic64, bool atomicf) {
-    static const SpirvBlob k[KV_COUNT][3] = {
-        {   {vkmmc_core_mesh_spv, vkmmc_core_mesh_spv_len}, {vkmmc_core_mesh_i64_spv, vkmmc_core_mesh_i64_spv_len},
-            {vkmmc_core_mesh_f32_spv, vkmmc_core_mesh_f32_spv_len}
-        },
-        {   {vkmmc_core_csg_spv, vkmmc_core_csg_spv_len}, {vkmmc_core_csg_i64_spv, vkmmc_core_csg_i64_spv_len},
-            {vkmmc_core_csg_f32_spv, vkmmc_core_csg_f32_spv_len}
-        },
-        {   {vkmmc_core_curv_spv, vkmmc_core_curv_spv_len}, {vkmmc_core_curv_i64_spv, vkmmc_core_curv_i64_spv_len},
-            {vkmmc_core_curv_f32_spv, vkmmc_core_curv_f32_spv_len}
-        }
+/* [variant][native 64-bit atomics] — see the Makefile */
+static SpirvBlob embedded_kernel(int variant, bool atomic64) {
+    static const SpirvBlob k[KV_COUNT][2] = {
+        {{vkmmc_core_mesh_spv, vkmmc_core_mesh_spv_len}, {vkmmc_core_mesh_i64_spv, vkmmc_core_mesh_i64_spv_len}},
+        {{vkmmc_core_csg_spv, vkmmc_core_csg_spv_len}, {vkmmc_core_csg_i64_spv, vkmmc_core_csg_i64_spv_len}},
+        {{vkmmc_core_curv_spv, vkmmc_core_curv_spv_len}, {vkmmc_core_curv_i64_spv, vkmmc_core_curv_i64_spv_len}}
     };
-    return k[variant][atomicf ? 2 : (atomic64 ? 1 : 0)];
+    return k[variant][atomic64 ? 1 : 0];
 }
 
 static std::vector<uint32_t> load_spirv(const std::string& path) {
@@ -861,7 +831,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
 
     /* Output: one 64-bit fixed-point sum per voxel, gate and field, then the launched energy */
     OutputGrid g = compute_grid(cfg);
-    VkDeviceSize outBytes = g.nout * (ctx.atomicf ? sizeof(float) : sizeof(uint64_t));
+    VkDeviceSize outBytes = g.nout * sizeof(uint64_t);
     Buffer outBuf = create_device_buffer(ctx, outBytes, ssbo);
     {
         VkCommandBuffer cmd = begin_cmd(ctx);
@@ -946,7 +916,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
     }
 
     /* Kernel: embedded variant, or a user-supplied .spv */
-    SpirvBlob blob = embedded_kernel(st.variant, ctx.atomic64, ctx.atomicf);
+    SpirvBlob blob = embedded_kernel(st.variant, ctx.atomic64);
     std::vector<uint32_t> usercode;
     const uint32_t* code = reinterpret_cast<const uint32_t*>(blob.data);
     size_t codesize = blob.len;
@@ -957,8 +927,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
         codesize = usercode.size() * 4;
         printf("Kernel: %s (user supplied)\n", ovr.kernelfile.c_str());
     } else {
-        printf("Kernel: %s, %s atomics\n", kernel_variant_name(st.variant),
-               ctx.atomicf ? "float" : (ctx.atomic64 ? "64-bit" : "32-bit pair"));
+        printf("Kernel: %s, %s atomics\n", kernel_variant_name(st.variant), ctx.atomic64 ? "64-bit" : "32-bit pair");
     }
 
     SourceSpec spec = {params.srctype, params.src_num, params.src_id, params.extra_src_len, params.focus_mode, params.do_tally,
@@ -1005,7 +974,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
         /* move the batch output into the double accumulator, clear the GPU buffer */
         if (batch_readback && pdone < cfg.nphoton) {
             download_from_device(ctx, outBuf, raw.data(), outBytes);
-            add_batch_output(acc, raw, g.nout, ctx.atomicf);
+            accumulate_fixed(acc, raw.data(), g.nout);
             VkCommandBuffer zcmd = begin_cmd(ctx);
             vkCmdFillBuffer(zcmd, outBuf.buf, 0, outBytes, 0);
             end_submit(ctx, zcmd);
@@ -1021,7 +990,7 @@ static TrajData run_mc_simulation(VulkanCtx& ctx, const SimConfig& cfg, const Si
 
     /* Readback, normalization and output */
     download_from_device(ctx, outBuf, raw.data(), outBytes);
-    add_batch_output(acc, raw, g.nout, ctx.atomicf);
+    accumulate_fixed(acc, raw.data(), g.nout);
     std::vector<float> vol = finalize_output(cfg, g, acc);
     save_fluence(cfg, g, vol);
 
@@ -1361,7 +1330,7 @@ static void run_show(const SimConfig& cfg, const SimSetup& st, const CmdOverride
                     show_ovr.batch_size = 100000;
                 }
 
-                VulkanCtx compute_ctx = init_vulkan(ovr.gpuid, ovr.floatatomic);
+                VulkanCtx compute_ctx = init_vulkan(ovr.gpuid);
                 TrajData td = run_mc_simulation(compute_ctx, cfg, st, show_ovr);
                 destroy_vulkan(compute_ctx);
                 ShowTraj result;
@@ -1403,7 +1372,7 @@ int main(int argc, char** argv) {
 
 #endif
 
-        VulkanCtx ctx = init_vulkan(ovr.gpuid, ovr.floatatomic);
+        VulkanCtx ctx = init_vulkan(ovr.gpuid);
         run_mc_simulation(ctx, cfg, st, ovr);
         destroy_vulkan(ctx);
     } catch (const std::exception& e) {

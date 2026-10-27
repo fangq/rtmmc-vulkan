@@ -15,9 +15,7 @@
  *   USE_CURVATURE   — enable curvature-corrected normals (requires USE_CSG)
  *   USE_ATOMIC_INT64 — native 64-bit integer atomics (GL_EXT_shader_atomic_int64);
  *                      without it the 64-bit sums use pairs of 32-bit atomics
- *   USE_ATOMIC_FLOAT — 32-bit float sums (GL_EXT_shader_atomic_float, --atomic float):
- *                      faster, but not bit-reproducible
- * The Makefile builds all nine combinations and embeds them in vkmmc; the host
+ * The Makefile builds all six combinations and embeds them in vkmmc; the host
  * picks one per input and device.
  *
  * Optimizations for curvature mode:
@@ -33,9 +31,7 @@
 #version 460
 #extension GL_EXT_ray_query : require
 
-#if defined(USE_ATOMIC_FLOAT)
-    #extension GL_EXT_shader_atomic_float : require
-#elif defined(USE_ATOMIC_INT64)
+#ifdef USE_ATOMIC_INT64
     #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
     #extension GL_EXT_shader_atomic_int64 : require
 #endif
@@ -61,11 +57,8 @@ struct Medium {
 };
 layout(std430, set = 0, binding = 2) readonly buffer MediaBuffer { Medium media[]; };
 
-// output: one unsigned 64-bit fixed-point sum (FIXED_SCALE units) per element,
-// or one float sum (USE_ATOMIC_FLOAT)
-#if defined(USE_ATOMIC_FLOAT)
-layout(std430, set = 0, binding = 3) buffer OutputBuffer { float output_data[]; };
-#elif defined(USE_ATOMIC_INT64)
+// output: one unsigned 64-bit fixed-point sum (FIXED_SCALE units) per element
+#ifdef USE_ATOMIC_INT64
 layout(std430, set = 0, binding = 3) buffer OutputBuffer { uint64_t output_data[]; };
 #else
 layout(std430, set = 0, binding = 3) buffer OutputBuffer { uint output_data[]; };
@@ -394,19 +387,15 @@ uvec2 ms_leave(uvec2 ms, uint back_id) {
  * bit-reproducible and its precision does not degrade with the photon count,
  * unlike float atomics. Without native 64-bit atomics the sum is a (low, high)
  * pair of 32-bit words with an explicit carry; both layouts are identical in
- * memory. USE_ATOMIC_FLOAT adds floats instead: half the memory traffic, much
- * faster on large grids, but the sums depend on the order of the additions.
+ * memory.
  */
 const float FIXED_SCALE = 4294967296.0;
 
 void atomic_add_float(uint idx, float val) {
-#if defined(USE_ATOMIC_FLOAT)
-    atomicAdd(output_data[idx], val);
-#elif defined(USE_ATOMIC_INT64)
     float v = val * FIXED_SCALE + 0.5;   // round to nearest
+#ifdef USE_ATOMIC_INT64
     atomicAdd(output_data[idx], uint64_t(v));
 #else
-    float v = val * FIXED_SCALE + 0.5;
     uint hi = uint(v * (1.0 / FIXED_SCALE));
     uint lo = uint(v - float(hi) * FIXED_SCALE);
     uint old = atomicAdd(output_data[2u * idx], lo);

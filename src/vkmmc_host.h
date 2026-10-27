@@ -49,14 +49,12 @@ struct CmdOverrides {
     int debuglevel;     // -1 = not set
     int64_t maxjumpdebug;   // -1 = not set
     bool show;          // launch interactive viewer
-    bool floatatomic;   // --atomic float: float sums instead of 64-bit fixed point
     std::string traj_file;  // optional _traj.jdat to display without simulating
     std::string session_id, json_str, inputfile;
     std::string kernelfile; // optional .spv/.ptx kernel overriding the embedded one
     CmdOverrides(): nphoton(0), batch_size(UINT64_MAX), rng_seed(0), totalthread(0), has_seed(false), unitinmm(0),
         outputtype(-1), isreflect(-1), isspecular(-1), isnormalize(-1), gpuid(-1), listgpu(false), dumpjson(false), dumpmesh(false),
-        meshres(0), docurv(-1), debugcurv(false), debuglevel(-1), maxjumpdebug(-1), show(false),
-        floatatomic(false) {}
+        meshres(0), docurv(-1), debugcurv(false), debuglevel(-1), maxjumpdebug(-1), show(false) {}
 };
 
 static void print_version(const char* prog, const char* backend) {
@@ -80,7 +78,6 @@ static void printhelp(const char* prog, const char* backend, int defgpu) {
            " -U/--normalize 0|1  normalize the output [1]\n"
            " -t/--thread num     total GPU threads, a multiple of 64 [131072]\n"
            " -B/--batch  num     photons per kernel launch [auto: about 0.5 s each, 0: all at once]\n"
-           " --atomic fixed|float output sums: exact 64-bit fixed point, or faster float [fixed]\n"
            " -G/--gpuid  id      GPU device [%d]; -L lists them\n"
            " -m/--meshres num    shape mesh resolution [24], %d-%d\n"
            " -c/--curv   -1|0|1  curvature-corrected normals [-1: auto, on for curved shapes]\n"
@@ -193,10 +190,6 @@ static bool parse_cmdline(int argc, char** argv, CmdOverrides& ovr, const char* 
             const char* darg = val();
             ovr.debuglevel = isalpha((unsigned char)darg[0]) ? (int)parse_debugopt(darg, "option -D")
                              : parse_int_arg("-D", darg, 0, INT_MAX);
-        } else if (a == "--atomic") {
-            std::string v = val();
-            vkmmc_require(v == "fixed" || v == "float", "option --atomic expects fixed or float");
-            ovr.floatatomic = (v == "float");
         } else if (a == "--maxjumpdebug") {
             ovr.maxjumpdebug = (int64_t)parse_num_arg(a.c_str(), val(), 0, 1e9);
         } else if (a == "--show") {
@@ -632,24 +625,6 @@ static void accumulate_fixed(std::vector<double>& acc, const uint64_t* raw, uint
 
     for (uint64_t i = 0; i < nelem; i++) {
         acc[i] += (double)raw[i] * (1.0 / VKMMC_FIXED_SCALE);
-    }
-}
-
-/* the same for float sums (--atomic float) */
-static void accumulate_float(std::vector<double>& acc, const float* raw, uint64_t nelem) {
-    acc.resize(nelem, 0.0);
-
-    for (uint64_t i = 0; i < nelem; i++) {
-        acc[i] += raw[i];
-    }
-}
-
-/* add one batch of kernel output, nelem fixed-point sums or (isfloat) float sums, to acc */
-static void add_batch_output(std::vector<double>& acc, const std::vector<uint64_t>& raw, uint64_t nelem, bool isfloat) {
-    if (isfloat) {
-        accumulate_float(acc, reinterpret_cast<const float*>(raw.data()), nelem);
-    } else {
-        accumulate_fixed(acc, raw.data(), nelem);
     }
 }
 

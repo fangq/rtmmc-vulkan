@@ -108,7 +108,6 @@ struct VKMMCParam {
     int     focus_mode;
     uint32_t do_tally;
     uint32_t do_specular;
-    uint32_t float_atomic;
     Medium_GPU media[MAX_PROP];
 };
 
@@ -247,7 +246,6 @@ static std::vector<OptixModuleCompileBoundValueEntry> source_bound_values(const 
     VKMMC_BIND(do_tally);
     VKMMC_BIND(do_specular);
     VKMMC_BIND(initial_medium);
-    VKMMC_BIND(float_atomic);
 #undef VKMMC_BIND
     return b;
 }
@@ -486,7 +484,6 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
     VKMMCParam params;
     memset(&params, 0, sizeof(params));
     source_params(params, cfg);
-    params.float_atomic = ovr.floatatomic ? 1u : 0u;
 
     OptixState optix;
     setup_optix(optix, ovr.gpuid, st.variant, ovr.kernelfile, params);
@@ -525,9 +522,9 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
     CUDABuf curvBuf;
     curvBuf.alloc_upload(gpuCurv);
 
-    /* Output: one 64-bit fixed-point (--atomic float: float) sum per voxel, gate and field, then the launched energy */
+    /* Output: one 64-bit fixed-point sum per voxel, gate and field, then the launched energy */
     OutputGrid g = compute_grid(cfg);
-    size_t outSz = g.nout, outBytes = outSz * (params.float_atomic ? sizeof(float) : sizeof(uint64_t));
+    size_t outSz = g.nout, outBytes = outSz * sizeof(uint64_t);
     CUDABuf outBuf;
     outBuf.alloc(outBytes);
     CUDA_CHECK(cudaMemset(outBuf.ptr, 0, outBytes));
@@ -619,7 +616,7 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
         /* move the batch output into the double accumulator, clear the GPU buffer */
         if (batch_readback && pdone < cfg.nphoton) {
             outBuf.download(raw.data(), outBytes);
-            add_batch_output(acc, raw, g.nout, params.float_atomic != 0);
+            accumulate_fixed(acc, raw.data(), g.nout);
             CUDA_CHECK(cudaMemset(outBuf.ptr, 0, outBytes));
         }
 
@@ -634,7 +631,7 @@ static void run_simulation(const SimConfig& cfg, const SimSetup& st, const CmdOv
 
     /* Readback, normalization and output */
     outBuf.download(raw.data(), outBytes);
-    add_batch_output(acc, raw, g.nout, params.float_atomic != 0);
+    accumulate_fixed(acc, raw.data(), g.nout);
     std::vector<float> vol = finalize_output(cfg, g, acc);
     save_fluence(cfg, g, vol);
 

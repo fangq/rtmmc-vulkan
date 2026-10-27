@@ -2583,14 +2583,14 @@ TEST(cmdline_defaults_and_options) {
     CHECK(o.nphoton == 0 && o.batch_size == UINT64_MAX && !o.has_seed && o.unitinmm == 0);
     CHECK(o.outputtype == -1 && o.isreflect == -1 && o.isspecular == -1 && o.isnormalize == -1);
     CHECK(o.meshres == 0 && o.docurv == -1 && o.debuglevel == -1 && o.maxjumpdebug == -1);
-    CHECK(!o.listgpu && !o.dumpjson && !o.dumpmesh && !o.debugcurv && !o.show && !o.floatatomic);
+    CHECK(!o.listgpu && !o.dumpjson && !o.dumpmesh && !o.debugcurv && !o.show);
     CHECK(o.kernelfile.empty() && o.json_str.empty() && o.session_id.empty());
 
     CmdOverrides a;
     CHECK(run_cmdline({"vkmmc", "-f", "x.json", "-n", "1e7", "-s", "sess", "-u", "0.5", "-E", "123", "-O", "l",
                        "-b", "0", "-V", "1", "-U", "0", "-t", "128", "-B", "1000", "-G", "2", "-j", "{\"a\":1}", "--dumpjson",
                        "--dumpmesh", "--debugcurv", "-m", "16", "-c", "1", "-D", "M", "--maxjumpdebug", "100",
-                       "--atomic", "float", "kern.spv"
+                       "kern.spv"
                       }, a));
     CHECK(a.inputfile == "x.json");
     CHECK(a.nphoton == 10000000ull);
@@ -2605,7 +2605,6 @@ TEST(cmdline_defaults_and_options) {
     CHECK(a.meshres == 16 && a.docurv == 1);
     CHECK(a.debuglevel == (int)VKMMC_DEBUG_TRAJ);
     CHECK(a.maxjumpdebug == 100);
-    CHECK(a.floatatomic);
     CHECK(a.kernelfile == "kern.spv");
 
     CmdOverrides l;
@@ -2623,9 +2622,6 @@ TEST(cmdline_defaults_and_options) {
     CmdOverrides d;
     CHECK(run_cmdline({"vkmmc", "in.json", "-D", "mx"}, d));
     CHECK(d.debuglevel == (int)((1u << 13) | (1u << 7)));
-    CmdOverrides fx;
-    CHECK(run_cmdline({"vkmmc", "in.json", "--atomic", "float", "--atomic", "fixed"}, fx));
-    CHECK(!fx.floatatomic);
     CmdOverrides g;
     CHECK(run_cmdline({"vkmmc", "-L"}, g));    /* listing GPUs needs no input */
     CHECK(g.listgpu && g.inputfile.empty());
@@ -2640,7 +2636,6 @@ TEST(cmdline_defaults_and_options) {
 #define CHECK_CMD_THROWS(substr, ...) do { CmdOverrides o_; CHECK_THROWS(run_cmdline(__VA_ARGS__, o_), substr); } while (0)
 
 TEST(cmdline_errors) {
-    CHECK_CMD_THROWS("option --atomic expects fixed or float", {"vkmmc", "in.json", "--atomic", "double"});
     CHECK_CMD_THROWS("option -n expects a number, got 'abc'", {"vkmmc", "in.json", "-n", "abc"});
     CHECK_CMD_THROWS("option -n expects a number, got '1e7x'", {"vkmmc", "in.json", "-n", "1e7x"});
     CHECK_CMD_THROWS("option -n expects a number", {"vkmmc", "in.json", "-n", ""});

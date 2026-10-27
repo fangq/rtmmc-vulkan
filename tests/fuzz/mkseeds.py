@@ -107,7 +107,7 @@ def main():
         open(os.path.join(cjd, "jd%02d" % i), "wb").write(hdr + body)
 
     cmds = ["in.json", "in.json\n-n\n1e5\n-E\n7", "-f\nin.json\n-b\n0\n-U\n1\n-O\nl", "in.json\n-m\n12\n-c\n1\n-D\nM",
-            "in.json\n--maxjumpdebug\n1000\n-t\n4096\n-B\n0", "in.json\n--atomic\nfloat", "in.json\n-u\n0.5\n-s\nabc\n-G\n1", "-L", "-v", "-h",
+            "in.json\n--maxjumpdebug\n1000\n-t\n4096\n-B\n0", "in.json\n-u\n0.5\n-s\nabc\n-G\n1", "-L", "-v", "-h",
             "in.json\n-j\n{\"Session\":{\"Photons\":10}}", "in.json\n--dumpjson\n--dumpmesh", "in.json\nk.spv",
             "in.json\n-D\n8192\n-O\nflux", "in.json\n-E\n-5\n-n\n9e18", "in.json\n-V\n1\n-b\n1"]
     for i, c in enumerate(cmds):
