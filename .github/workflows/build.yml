@@ -104,11 +104,25 @@ jobs:
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
           for exe in build/bin/Release/vkmmc.exe build/bin/vkmmc; do [ -f "$exe" ] && break; done
           bash .github/ci/package.sh "$tag" "$exe"
+      # the artifact service times out now and then (macos-14 runners);
+      # retry once after a pause instead of failing the job
       - name: Upload the package
+        id: upload_package
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: all-vkmmc-packages-${{ env.RELEASE_TAG }}
           path: packages/vkmmc-${{ env.RELEASE_TAG }}.zip
+      - name: Wait before retrying the upload
+        if: steps.upload_package.outcome == 'failure'
+        run: sleep 60
+      - name: Upload the package (retry)
+        if: steps.upload_package.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-vkmmc-packages-${{ env.RELEASE_TAG }}
+          path: packages/vkmmc-${{ env.RELEASE_TAG }}.zip
+          overwrite: true
       - name: Functional tests on lavapipe (Windows, experimental)
         if: runner.os == 'Windows'
         continue-on-error: true
