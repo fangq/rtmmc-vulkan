@@ -20,7 +20,7 @@
 
 #define VKMMC_VERSION    "0.5.0"
 #define VKMMC_CODENAME   "Kylin"
-#define VKMMC_URL        "https://github.com/fangq/rtmmc-vulkan"
+#define VKMMC_URL        "https://github.com/fangq/vkmmc"
 
 #define VKMMC_DEBUG_TRAJ 8192u      /* -D M: save photon trajectories */
 #define VKMMC_C0         299792458000.0   /* speed of light in vacuum, mm/s */

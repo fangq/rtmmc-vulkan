@@ -1,5 +1,5 @@
 /*
- * vkmmc_show.h — Interactive Vulkan viewer for rtmmc-vulkan
+ * vkmmc_show.h — Interactive Vulkan viewer for vkmmc
  * Included only when USE_SHOW is defined (build with: make SHOW=1)
  * Activated at runtime with --show flag.
  *
@@ -758,7 +758,7 @@ static void init_viewer(ShowCtx& sc, GLFWwindow* win, uint32_t w, uint32_t h) {
     const char** glfwExts = glfwGetRequiredInstanceExtensions(&glfwExtCnt);
 
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    app.pApplicationName = "rtmmc-vulkan-show";
+    app.pApplicationName = "vkmmc-show";
     app.apiVersion       = VK_API_VERSION_1_2;
 
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -2135,8 +2135,8 @@ void run_viewer(const ShowMesh& mesh, std::function<ShowTraj()> simulate,
      * Returns false → user closed the window normally. */
     auto open_window = [&](bool allow_sim) -> bool {
         const char* title = (state == 2)
-            ? "rtmmc-vulkan | Trajectory viewer - rotate to inspect"
-            : "rtmmc-vulkan | SPACE = Start Simulation";
+            ? "vkmmc | Trajectory viewer - rotate to inspect"
+            : "vkmmc | SPACE = Start Simulation";
 
         GLFWwindow* win = glfwCreateWindow(WIN_W, WIN_H, title, nullptr, nullptr);
 
@@ -2229,8 +2229,8 @@ void run_viewer(const ShowMesh& mesh, std::function<ShowTraj()> simulate,
                 use_mip = !use_mip;
                 inp.toggleMip = false;
                 glfwSetWindowTitle(win, use_mip
-                    ? "rtmmc-vulkan | Volume MIP (M=toggle)"
-                    : "rtmmc-vulkan | Volume compositing (M=toggle)");
+                    ? "vkmmc | Volume MIP (M=toggle)"
+                    : "vkmmc | Volume compositing (M=toggle)");
             }
 
             /* Handle toolbar button clicks */

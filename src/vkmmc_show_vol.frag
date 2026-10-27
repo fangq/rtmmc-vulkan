@@ -1,6 +1,6 @@
 #version 450
 /*
- * Volume ray-marcher for rtmmc-vulkan viewer.
+ * Volume ray-marcher for the vkmmc viewer.
  * Renders a 3D texture (log10-normalised fluence) using front-to-back
  * alpha compositing (default) or Maximum Intensity Projection (use_mip!=0).
  * Colormap: "hot" — black → red → orange/yellow → white.

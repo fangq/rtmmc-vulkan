@@ -4,9 +4,9 @@ Ray-Tracing Mesh-based Monte Carlo (RT-MMC) - Vulkan and OptiX
 -   Author: Qianqian Fang (q.fang at neu.edu)
 -   License: GNU General Public License version 3 (GPL v3), see LICENSE.txt
 -   Version: 0.5.0 (Kylin, beta)
--   URL: <https://github.com/fangq/rtmmc-vulkan>
+-   URL: <https://github.com/fangq/vkmmc>
 
-![Build and test](https://github.com/fangq/rtmmc-vulkan/actions/workflows/build.yml/badge.svg)
+![Build and test](https://github.com/fangq/vkmmc/actions/workflows/build.yml/badge.svg)
 
 Table of Content:
 
@@ -144,8 +144,8 @@ docker run --rm -e HOST_UID=$(id -u) -v $PWD:/src -w /src \
 To build from source with make:
 
 ```
-git clone https://github.com/fangq/rtmmc-vulkan.git
-cd rtmmc-vulkan
+git clone https://github.com/fangq/vkmmc.git
+cd vkmmc
 make -C src                                  # builds bin/vkmmc
 make -C optix OPTIX_DIR=/path/to/optix-dev   # builds bin/vkmmc_optix
 ```
