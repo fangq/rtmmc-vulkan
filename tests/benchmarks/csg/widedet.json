@@ -1,0 +1,84 @@
+{
+    "Comment": "mmc examples/widedet (latticegrid z=[0 5 10]); the wide-field detector is not modeled",
+    "Session": {
+        "ID": "widedet",
+        "Photons": 1000000,
+        "RNGSeed": 12345678,
+        "DoMismatch": true
+    },
+    "Forward": {
+        "T0": 0,
+        "T1": 2e-09,
+        "Dt": 4e-11
+    },
+    "Domain": {
+        "LengthUnit": 1,
+        "Media": [
+            {
+                "mua": 0,
+                "mus": 0,
+                "g": 1,
+                "n": 1
+            },
+            {
+                "mua": 0.01,
+                "mus": 1.0,
+                "g": 0.01,
+                "n": 1.37
+            },
+            {
+                "mua": 0.05,
+                "mus": 10.0,
+                "g": 0.9,
+                "n": 1.37
+            }
+        ]
+    },
+    "Optode": {
+        "Source": {
+            "Type": "pencil",
+            "Pos": [
+                25,
+                35,
+                10
+            ],
+            "Dir": [
+                0,
+                0,
+                -1
+            ]
+        }
+    },
+    "Shapes": [
+        {
+            "Box": {
+                "Tag": 1,
+                "O": [
+                    0,
+                    0,
+                    0
+                ],
+                "Size": [
+                    60,
+                    60,
+                    5
+                ]
+            }
+        },
+        {
+            "Box": {
+                "Tag": 2,
+                "O": [
+                    0,
+                    0,
+                    5
+                ],
+                "Size": [
+                    60,
+                    60,
+                    5
+                ]
+            }
+        }
+    ]
+}

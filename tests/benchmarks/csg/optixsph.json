@@ -1,0 +1,75 @@
+{
+    "Comment": "mmc examples/optix (meshasphere R25 + box, mergemesh/surf2mesh)",
+    "Session": {
+        "ID": "optixsph",
+        "Photons": 1000000,
+        "RNGSeed": 1648335518,
+        "DoMismatch": true
+    },
+    "Forward": {
+        "T0": 0,
+        "T1": 5e-09,
+        "Dt": 5e-10
+    },
+    "Domain": {
+        "LengthUnit": 1,
+        "Media": [
+            {
+                "mua": 0,
+                "mus": 0,
+                "g": 1,
+                "n": 1
+            },
+            {
+                "mua": 0.005,
+                "mus": 1,
+                "g": 0,
+                "n": 1.37
+            },
+            {
+                "mua": 0.01,
+                "mus": 10,
+                "g": 0,
+                "n": 1.0
+            }
+        ]
+    },
+    "Optode": {
+        "Source": {
+            "Type": "pencil",
+            "Pos": [
+                30,
+                30,
+                0.01
+            ],
+            "Dir": [
+                0,
+                0,
+                1
+            ]
+        }
+    },
+    "Shapes": [
+        {
+            "Grid": {
+                "Tag": 1,
+                "Size": [
+                    60,
+                    60,
+                    60
+                ]
+            }
+        },
+        {
+            "Sphere": {
+                "Tag": 2,
+                "O": [
+                    30,
+                    30,
+                    30
+                ],
+                "R": 25
+            }
+        }
+    ]
+}

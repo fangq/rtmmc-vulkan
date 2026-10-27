@@ -1,0 +1,112 @@
+{
+    "Comment": "mmc examples/skinvessel (latticegrid + meshacylinder, surfboolean/s2m); media 1/2/3 = mmc labels 4/3/2",
+    "Session": {
+        "ID": "skinvessel",
+        "Photons": 1000000,
+        "RNGSeed": 1648335518,
+        "DoMismatch": false
+    },
+    "Forward": {
+        "T0": 0,
+        "T1": 5e-08,
+        "Dt": 5e-08
+    },
+    "Domain": {
+        "LengthUnit": 1,
+        "Media": [
+            {
+                "mua": 0,
+                "mus": 0,
+                "g": 1,
+                "n": 1
+            },
+            {
+                "mua": 1.6572,
+                "mus": 37.594,
+                "g": 0.9,
+                "n": 1.37
+            },
+            {
+                "mua": 0.0458,
+                "mus": 35.6541,
+                "g": 0.9,
+                "n": 1.37
+            },
+            {
+                "mua": 23.0543,
+                "mus": 9.3985,
+                "g": 0.9,
+                "n": 1.37
+            }
+        ]
+    },
+    "Optode": {
+        "Source": {
+            "Type": "disk",
+            "Pos": [
+                0.5,
+                0.5,
+                -0.005
+            ],
+            "Dir": [
+                0,
+                0,
+                1
+            ],
+            "Param1": [
+                0.3,
+                0,
+                0,
+                0
+            ]
+        }
+    },
+    "Shapes": [
+        {
+            "Box": {
+                "Tag": 1,
+                "O": [
+                    0,
+                    0,
+                    0.1
+                ],
+                "Size": [
+                    1,
+                    1,
+                    0.06
+                ]
+            }
+        },
+        {
+            "Box": {
+                "Tag": 2,
+                "O": [
+                    0,
+                    0,
+                    0.16
+                ],
+                "Size": [
+                    1,
+                    1,
+                    0.84
+                ]
+            }
+        },
+        {
+            "Cylinder": {
+                "Tag": 3,
+                "C0": [
+                    0,
+                    0.4975,
+                    0.4975
+                ],
+                "C1": [
+                    1,
+                    0.4975,
+                    0.4975
+                ],
+                "R": 0.1
+            }
+        }
+    ]
+}

@@ -1,0 +1,109 @@
+{
+    "Comment": "mmc examples/sphshells (3 meshasphere + box, mergemesh/surf2mesh)",
+    "Session": {
+        "ID": "sphshells",
+        "Photons": 1000000,
+        "RNGSeed": 1648335518,
+        "DoMismatch": true
+    },
+    "Forward": {
+        "T0": 0,
+        "T1": 5e-09,
+        "Dt": 5e-10
+    },
+    "Domain": {
+        "LengthUnit": 1,
+        "Media": [
+            {
+                "mua": 0,
+                "mus": 0,
+                "g": 1,
+                "n": 1
+            },
+            {
+                "mua": 0.02,
+                "mus": 7.0,
+                "g": 0.89,
+                "n": 1.37
+            },
+            {
+                "mua": 0.004,
+                "mus": 0.009,
+                "g": 0.89,
+                "n": 1.37
+            },
+            {
+                "mua": 0.02,
+                "mus": 9.0,
+                "g": 0.89,
+                "n": 1.37
+            },
+            {
+                "mua": 0.05,
+                "mus": 0.0,
+                "g": 1.0,
+                "n": 1.37
+            }
+        ]
+    },
+    "Optode": {
+        "Source": {
+            "Type": "pencil",
+            "Pos": [
+                30,
+                30.1,
+                0
+            ],
+            "Dir": [
+                0,
+                0,
+                1
+            ]
+        }
+    },
+    "Shapes": [
+        {
+            "Grid": {
+                "Tag": 1,
+                "Size": [
+                    60,
+                    60,
+                    60
+                ]
+            }
+        },
+        {
+            "Sphere": {
+                "Tag": 2,
+                "O": [
+                    30,
+                    30,
+                    30
+                ],
+                "R": 25
+            }
+        },
+        {
+            "Sphere": {
+                "Tag": 3,
+                "O": [
+                    30,
+                    30,
+                    30
+                ],
+                "R": 23
+            }
+        },
+        {
+            "Sphere": {
+                "Tag": 4,
+                "O": [
+                    30,
+                    30,
+                    30
+                ],
+                "R": 10
+            }
+        }
+    ]
+}

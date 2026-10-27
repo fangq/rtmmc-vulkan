@@ -1,0 +1,91 @@
+{
+    "Comment": "mmclab demo_compare_mmc_mcx (two meshabox, mergemesh/surf2mesh)",
+    "Session": {
+        "ID": "boxinbox_planar",
+        "Photons": 1000000,
+        "RNGSeed": 1648335518,
+        "DoMismatch": true
+    },
+    "Forward": {
+        "T0": 0,
+        "T1": 5e-09,
+        "Dt": 1e-10
+    },
+    "Domain": {
+        "LengthUnit": 1,
+        "Media": [
+            {
+                "mua": 0,
+                "mus": 0,
+                "g": 1,
+                "n": 1
+            },
+            {
+                "mua": 0.005,
+                "mus": 1.0,
+                "g": 0.01,
+                "n": 1.0
+            },
+            {
+                "mua": 0.01,
+                "mus": 0.2,
+                "g": 0.01,
+                "n": 1.37
+            }
+        ]
+    },
+    "Optode": {
+        "Source": {
+            "Type": "planar",
+            "Pos": [
+                10,
+                10,
+                -10
+            ],
+            "Dir": [
+                0,
+                0,
+                1
+            ],
+            "Param1": [
+                40,
+                0,
+                0,
+                0
+            ],
+            "Param2": [
+                0,
+                40,
+                0,
+                0
+            ]
+        }
+    },
+    "Shapes": [
+        {
+            "Grid": {
+                "Tag": 1,
+                "Size": [
+                    60,
+                    60,
+                    60
+                ]
+            }
+        },
+        {
+            "Box": {
+                "Tag": 2,
+                "O": [
+                    20,
+                    20,
+                    20
+                ],
+                "Size": [
+                    20,
+                    20,
+                    20
+                ]
+            }
+        }
+    ]
+}

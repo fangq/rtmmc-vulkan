@@ -1,0 +1,71 @@
+{
+    "Comment": "mmc examples/sphere (meshasphere R24, mmcaddsrc/mmcadddet); the planar detector is not modeled",
+    "Session": {
+        "ID": "sphere24",
+        "Photons": 1000000,
+        "RNGSeed": 1648335518,
+        "DoMismatch": false
+    },
+    "Forward": {
+        "T0": 0,
+        "T1": 5e-09,
+        "Dt": 1e-10
+    },
+    "Domain": {
+        "LengthUnit": 1,
+        "Media": [
+            {
+                "mua": 0,
+                "mus": 0,
+                "g": 1,
+                "n": 1
+            },
+            {
+                "mua": 0.002,
+                "mus": 1.0,
+                "g": 0.01,
+                "n": 1.37
+            }
+        ]
+    },
+    "Optode": {
+        "Source": {
+            "Type": "planar",
+            "Pos": [
+                -5,
+                -5,
+                25
+            ],
+            "Dir": [
+                0,
+                0,
+                -1
+            ],
+            "Param1": [
+                10,
+                0,
+                0,
+                0
+            ],
+            "Param2": [
+                0,
+                10,
+                0,
+                0
+            ]
+        }
+    },
+    "Shapes": [
+        {
+            "Sphere": {
+                "Tag": 1,
+                "O": [
+                    0,
+                    0,
+                    0
+                ],
+                "R": 24
+            }
+        }
+    ]
+}

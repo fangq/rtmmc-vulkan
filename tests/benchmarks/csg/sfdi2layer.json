@@ -1,0 +1,96 @@
+{
+    "Comment": "mmc examples/sfdi2layer (latticegrid z=[0 25 30], mmcaddsrc)",
+    "Session": {
+        "ID": "sfdi2layer",
+        "Photons": 1000000,
+        "RNGSeed": 1648335518,
+        "DoMismatch": false
+    },
+    "Forward": {
+        "T0": 0,
+        "T1": 5e-09,
+        "Dt": 1e-10
+    },
+    "Domain": {
+        "LengthUnit": 1,
+        "Media": [
+            {
+                "mua": 0,
+                "mus": 0,
+                "g": 1,
+                "n": 1
+            },
+            {
+                "mua": 0.02,
+                "mus": 9.0,
+                "g": 0.89,
+                "n": 1.37
+            },
+            {
+                "mua": 0.019,
+                "mus": 7.8,
+                "g": 0.89,
+                "n": 1.37
+            }
+        ]
+    },
+    "Optode": {
+        "Source": {
+            "Type": "fourier",
+            "Pos": [
+                10,
+                10,
+                35
+            ],
+            "Dir": [
+                0,
+                0,
+                -1
+            ],
+            "Param1": [
+                40,
+                0,
+                0,
+                3.1666666666666665
+            ],
+            "Param2": [
+                0,
+                40,
+                0,
+                0
+            ]
+        }
+    },
+    "Shapes": [
+        {
+            "Box": {
+                "Tag": 1,
+                "O": [
+                    0,
+                    0,
+                    0
+                ],
+                "Size": [
+                    60,
+                    60,
+                    25
+                ]
+            }
+        },
+        {
+            "Box": {
+                "Tag": 2,
+                "O": [
+                    0,
+                    0,
+                    25
+                ],
+                "Size": [
+                    60,
+                    60,
+                    5
+                ]
+            }
+        }
+    ]
+}
